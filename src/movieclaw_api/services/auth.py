@@ -64,6 +64,7 @@ from movieclaw_api.exceptions import (
     NotFoundException,
     UnauthorizedException,
 )
+from movieclaw_api.services import demo as demo_service
 from movieclaw_api.services import login_devices
 from movieclaw_api.settings import (
     AdminAccountSetting,
@@ -248,6 +249,19 @@ class LoginThrottle:
         self._locked_until = 0.0
 
 
+class _PublicAccountThrottle(LoginThrottle):
+    """公开演示站的公布账号专用：不计失败、从不锁定（见 ``authenticate``）。"""
+
+    def ensure_allowed(self) -> None:
+        return None
+
+    def record_failure(self) -> None:
+        return None
+
+
+_PUBLIC_ACCOUNT_THROTTLE = _PublicAccountThrottle()
+
+
 # 桶上限：防止攻击者用海量随机用户名注水内存。淘汰规则是安全关键：
 # 绝不能无差别 LRU——否则攻击者交替"猜一次目标账号 + 128 个随机用户名"
 # 即可把目标账号的锁定桶挤出去，让按账号锁定形同虚设。因此：
@@ -353,7 +367,13 @@ async def authenticate(username: str, password: str) -> AdminAccountSetting | Me
     非得重启服务"的困惑。登录本就是低频操作且已被限速，多一次按主键的
     SQLite 读取可忽略。
     """
-    throttle = _throttle_for(username)
+    # 公开演示站登录页公布的账号不限速：密码本就是公开的，防爆破无意义；按用户名
+    # 锁定反而让一个故意输错密码的访客把全体访客锁在门外（docs/design/demo-site.md）
+    throttle = (
+        _PUBLIC_ACCOUNT_THROTTLE
+        if demo_service.is_public_account(username)
+        else _throttle_for(username)
+    )
     throttle.ensure_allowed()
 
     admin = await _load_admin_fresh()
@@ -1116,3 +1136,4 @@ def reset_auth_state() -> None:
     _throttles.clear()
     _device_challenges.clear()
     login_devices.reset_state()
+    demo_service.reset_demo_state()

@@ -54,6 +54,8 @@ from movieclaw_api.schemas.auth import (
     BootstrapRequest,
     BootstrapStatus,
     ChangePasswordRequest,
+    DemoAccountView,
+    DemoSiteView,
     DeviceAuthorizeRequest,
     DeviceAuthorizeView,
     DeviceBrief,
@@ -74,6 +76,7 @@ from movieclaw_api.schemas.auth import (
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services import auth as auth_service
 from movieclaw_api.services import avatar as avatar_media
+from movieclaw_api.services import demo as demo_service
 from movieclaw_api.services import login_devices
 from movieclaw_api.services import members as members_service
 from movieclaw_api.services.auth import Principal, SavedAccount
@@ -115,6 +118,7 @@ def _session_view(account: AdminAccountSetting) -> SessionView:
         avatar_url=_avatar_url(),
         role="admin",
         capabilities=SessionCapabilities(),
+        demo=demo_service.is_demo_mode(),
     )
 
 
@@ -130,6 +134,7 @@ def _member_session_view(member: Member) -> SessionView:
             allow_search=member.allow_search,
             allow_direct_download=member.allow_direct_download,
         ),
+        demo=demo_service.is_demo_mode(),
     )
 
 
@@ -280,8 +285,19 @@ def _find_account(accounts: list[SavedAccount], username: str) -> SavedAccount |
     operation_id="auth.bootstrap.status",
 )
 async def bootstrap_status() -> ApiResponse[BootstrapStatus]:
-    """公开接口：仅返回布尔状态，供前端决定进 /setup 还是 /login。"""
-    return ok(BootstrapStatus(initialized=await auth_service.is_admin_initialized()))
+    """公开接口：仅返回布尔状态，供前端决定进 /setup 还是 /login。
+
+    公开演示站（docs/design/demo-site.md）额外带上只读说明与演示账号——这些
+    账号密码本来就是要贴在登录页上给访客用的，放进公开接口不算泄露。
+    """
+    demo = None
+    if demo_service.is_demo_mode():
+        accounts = demo_service.demo_accounts()
+        demo = DemoSiteView(
+            notice=accounts.notice,
+            accounts=[DemoAccountView(**a.model_dump()) for a in accounts.accounts],
+        )
+    return ok(BootstrapStatus(initialized=await auth_service.is_admin_initialized(), demo=demo))
 
 
 @router.post(
@@ -1052,6 +1068,21 @@ async def list_devices(
         _jellyfin_view(row, owners=owners) for row in (await session.execute(stmt)).scalars()
     )
     views.sort(key=_sort_key)
+    if demo_service.is_demo_mode():
+        # 公开演示站：同一个账号被许多访客共用，别人的设备名（可能是真名）、
+        # 来源 IP 与机型都不该出现在你的列表里；只有当前这台保持原样
+        views = [
+            view
+            if view.current
+            else view.model_copy(
+                update={
+                    "name": demo_service.anonymous_device_name(view.kind),
+                    "last_seen_ip": None,
+                    "platform": None,
+                }
+            )
+            for view in views
+        ]
     return ok(views)
 
 

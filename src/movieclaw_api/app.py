@@ -1,6 +1,7 @@
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
 from movieclaw_api import __version__
+from movieclaw_api.api.deps import demo_guard
 from movieclaw_api.api.router import api_router
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.core.logging import configure_logging
@@ -28,7 +29,11 @@ def create_app() -> FastAPI:
 
     register_exception_handlers(app)
     register_middlewares(app, settings)
-    app.include_router(api_router, prefix=settings.api_v1_prefix)
+    # 公开演示站的只读守卫（docs/design/demo-site.md）：挂在全部业务路由上，
+    # 按请求实时读 MOVIECLAW_DEMO_MODE，未开启时直接放行
+    app.include_router(
+        api_router, prefix=settings.api_v1_prefix, dependencies=[Depends(demo_guard)]
+    )
 
     # Jellyfin 兼容播放接口（docs/design/jellyfin-compat.md）：根路径命名空间，
     # 不进业务 OpenAPI，自带 token 体系与错误形态

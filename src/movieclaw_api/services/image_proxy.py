@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import BadRequestException, UpstreamServiceException
 from movieclaw_net import browser_tls_context, egress_transport, resolve_proxy_url
 
@@ -59,7 +60,14 @@ class ImageProxy:
         max_redirects: int = 3,
         transport: httpx.AsyncBaseTransport | None = None,
         resolver: Resolver | None = None,
+        allowed_host_suffixes: tuple[str, ...] | None = None,
     ) -> None:
+        # 域名白名单（仅公开演示站启用，见 get_image_proxy）：None = 开放域名
+        self._allowed_host_suffixes = (
+            tuple(s.lower().lstrip("*. ") for s in allowed_host_suffixes)
+            if allowed_host_suffixes is not None
+            else None
+        )
         self._headers_by_host = {
             host.lower().lstrip("*. "): dict(headers)
             for host, headers in (headers_by_host or {}).items()
@@ -91,6 +99,10 @@ class ImageProxy:
             pass
         else:
             raise BadRequestException("图片地址不允许直接使用 IP")
+        if self._allowed_host_suffixes is not None and not any(
+            host == suffix or host.endswith(f".{suffix}") for suffix in self._allowed_host_suffixes
+        ):
+            raise BadRequestException("演示站只代理 TMDB 与豆瓣图床的图片")
         # 图片回源走代理时跳过本地 DNS 校验：被墙域名在本地可能解析失败或被
         # 污染，而实际连接由代理端发起（CONNECT 隧道按域名转发），本地解析
         # 结果既不可靠也不参与连接；内网防护责任随出口转移到用户的代理上
@@ -185,12 +197,29 @@ class ImageProxy:
 _proxy: ImageProxy | None = None
 
 
+def _demo_allowed_hosts() -> tuple[str, ...] | None:
+    """公开演示站的图片代理域名白名单；正常部署返回 None（开放域名）。
+
+    演示站的账号是公开的，开放域名的图片代理等于给全网送一个免费的图片中转站；
+    而演示站用得上的远程图片只有发现页的 TMDB 与豆瓣图床（docs/design/demo-site.md）。
+    """
+    settings = get_settings()
+    if not settings.demo_mode:
+        return None
+    hosts = ["tmdb.org", "doubanio.com"]
+    mirror = urlsplit(settings.tmdb_image_base_url).hostname
+    if mirror:
+        hosts.append(mirror)
+    return tuple(hosts)
+
+
 def get_image_proxy() -> ImageProxy:
     """取得进程级代理单例；需要特殊请求头的图床在此按域名注入。"""
     global _proxy
     if _proxy is None:
         _proxy = ImageProxy(
             headers_by_host={"doubanio.com": {"Referer": "https://m.douban.com/"}},
+            allowed_host_suffixes=_demo_allowed_hosts(),
             # 统一出口：服务标签 image，代理路由/熔断由 movieclaw_net 按配置接管。
             # TLS 用浏览器特征上下文：豆瓣图床的 EdgeOne 边缘按 TLS 指纹拦
             # Python 默认配置（返回 JS 挑战页），详见 browser_tls_context 注释。

@@ -18,7 +18,7 @@ import { reloadAfterAccountChange } from "@/lib/account-reload";
 import { usePageTitle } from "@/lib/use-page-title";
 import { HttpError } from "@/lib/http";
 import { accessiblePathFor } from "@/lib/permissions";
-import type { SessionView } from "@/lib/api/auth";
+import type { DemoAccount, DemoSite, SessionView } from "@/lib/api/auth";
 
 /**
  * 登录成功 / 已登录后要跳回的目标地址：取自 ?next= 参数（会话过期时由 http.ts 写入）。
@@ -27,13 +27,15 @@ import type { SessionView } from "@/lib/api/auth";
  */
 function resolveNext(session?: SessionView): string {
   if (typeof window === "undefined") return "/";
+  // 公开演示站先落在媒体库：访客第一眼看到海报墙，AI 助手在侧栏里
+  const home = session?.demo ? "/library" : "/";
   const raw = new URLSearchParams(window.location.search).get("next");
-  if (!raw) return session ? accessiblePathFor(session, "/") : "/";
+  if (!raw) return session ? accessiblePathFor(session, home) : "/";
   const next = decodeURIComponent(raw);
   if (next.startsWith("/") && !next.startsWith("//")) {
     return session ? accessiblePathFor(session, next) : next;
   }
-  return session ? accessiblePathFor(session, "/") : "/";
+  return session ? accessiblePathFor(session, home) : "/";
 }
 
 /** 是否处于"添加账号"形态（用户菜单里点「添加账号」带 ?add=1 进来）。 */
@@ -67,6 +69,8 @@ export default function LoginPage() {
   const [adding, setAdding] = useState(false);
   const [returning, setReturning] = useState(false);
   const [ready, setReady] = useState(false);
+  // 公开演示站（docs/design/demo-site.md）：登录卡片里列出可一键填入的演示账号
+  const [demo, setDemo] = useState<DemoSite | null>(null);
   useEffect(() => {
     setAdding(isAddingAccount());
     setReturning(isReturning());
@@ -80,6 +84,7 @@ export default function LoginPage() {
       try {
         const status = await getBootstrapStatus();
         if (cancelled) return;
+        setDemo(status.demo ?? null);
         if (!status.initialized) {
           router.replace("/setup");
           return;
@@ -111,6 +116,7 @@ export default function LoginPage() {
         <LoginCard
           adding={adding}
           autoFocus={autoFocus}
+          demo={demo}
           onClose={adding ? () => router.replace("/") : close}
         />
       )}
@@ -121,10 +127,12 @@ export default function LoginPage() {
 function LoginCard({
   adding,
   autoFocus,
+  demo,
   onClose,
 }: {
   adding: boolean;
   autoFocus: boolean;
+  demo: DemoSite | null;
   onClose: () => void;
 }) {
   const [username, setUsername] = useState("");
@@ -165,7 +173,9 @@ function LoginCard({
       subtitle={
         adding
           ? "登录另一个账号；之后可在用户菜单里一键切换，不用再输密码。"
-          : "使用你在这台服务器上的账号进入。"
+          : demo
+            ? demo.notice || "这是公开演示站，点下方任一演示账号即可填入。"
+            : "使用你在这台服务器上的账号进入。"
       }
       onClose={onClose}
     >
@@ -208,6 +218,63 @@ function LoginCard({
           {busy ? "正在登录…" : adding ? "添加并切换" : "登录"}
         </WelcomeSubmit>
       </form>
+      {demo && demo.accounts.length > 0 && (
+        <DemoAccountList
+          accounts={demo.accounts}
+          selected={username.trim()}
+          onPick={(account) => {
+            setUsername(account.username);
+            setPassword(account.password);
+            setError(null);
+          }}
+        />
+      )}
     </WelcomeCard>
+  );
+}
+
+/**
+ * 公开演示站的账号清单：点一行把账号密码填进表单（不自动提交，访客看得见自己用的是
+ * 哪个角色）。账号密码本就公开在这里，所以直接明文展示，方便在 App 里照着输。
+ */
+function DemoAccountList({
+  accounts,
+  selected,
+  onPick,
+}: {
+  accounts: DemoAccount[];
+  selected: string;
+  onPick: (account: DemoAccount) => void;
+}) {
+  return (
+    <div className="mt-5">
+      <p className="mb-2 px-1 text-sub text-[var(--text-muted)]">演示账号 · 点一下自动填入</p>
+      <ul className="divide-y divide-white/[0.08] overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.05]">
+        {accounts.map((account) => (
+          <li key={account.username}>
+            <button
+              type="button"
+              onClick={() => onPick(account)}
+              aria-pressed={selected === account.username}
+              className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left transition-colors hover:bg-white/[0.06] aria-pressed:bg-white/[0.08]"
+            >
+              <span className="min-w-0 flex-1">
+                <span className="block text-body text-[var(--text)]">{account.label}</span>
+                {account.description && (
+                  <span className="line-clamp-2 block text-sub text-[var(--text-faint)]">
+                    {account.description}
+                  </span>
+                )}
+              </span>
+              <span className="shrink-0 text-right font-mono text-sub leading-snug text-[var(--text-muted)]">
+                {account.username}
+                <br />
+                {account.password}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }

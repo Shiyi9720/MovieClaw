@@ -181,6 +181,8 @@ _ADMIN_VIEW_EXTRAS = {
     },
     # 登录 / 建号的响应不带当前设备（客户端要看就调 /auth/me）
     "device": None,
+    # 不是公开演示站（docs/design/demo-site.md）
+    "demo": False,
 }
 
 

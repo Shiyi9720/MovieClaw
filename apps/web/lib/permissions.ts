@@ -18,11 +18,14 @@ export interface AppPermissions {
 
 export function permissionsFor(session: SessionView): AppPermissions {
   const isAdmin = session.role === "admin";
+  // 公开演示站（docs/design/demo-site.md）不接 PT 站点：资源站搜索与一键下载对谁都
+  // 不开放，超管也一样。订阅入口照常显示，确认订阅时由后端说明演示站不会真的下载
+  const demo = session.demo === true;
   return {
     isAdmin,
     canSubscribe: isAdmin || session.capabilities.allow_subscribe,
-    canSearch: isAdmin || session.capabilities.allow_search,
-    canDirectDownload: isAdmin || session.capabilities.allow_direct_download,
+    canSearch: !demo && (isAdmin || session.capabilities.allow_search),
+    canDirectDownload: !demo && (isAdmin || session.capabilities.allow_direct_download),
     canManageLibraries: isAdmin,
     canManageSubscriptions: isAdmin,
   };

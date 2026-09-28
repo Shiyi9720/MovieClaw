@@ -141,6 +141,15 @@ def build_lifespan(settings: Settings):
         )
 
         await load_remote_transcode_config()
+        # 公开演示站：按今天重建订阅与观看数据（统计窗口相对当前时间，建站时造一次
+        # 几天后就过期；每日还原会重启容器，于是每天都是新的，见 demo-site.md §6）
+        if settings.demo_mode:
+            from movieclaw_api.services.demo_activity import seed_demo_data
+
+            try:
+                await seed_demo_data()
+            except Exception:
+                logger.exception("演示站数据生成失败，活动页与订阅页会是空的，不影响启动")
         # 加载站点目录（内置 sites/configs/*.yaml + 用户自定义 data/site-configs/
         # → registry），供"可选项"接口使用；用户目录同 site_id 覆盖内置配置
         load_all_sites(settings.site_configs_dir)

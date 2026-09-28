@@ -30,11 +30,31 @@ export interface SessionView {
   role: "admin" | "member";
   /** 能力开关快照；管理员恒为全开 */
   capabilities: SessionCapabilities;
+  /** 是否是公开演示站（全站只读，docs/design/demo-site.md）；老服务器没有这个字段 */
+  demo?: boolean;
+}
+
+/** 公开演示站在登录页公布的一个账号（见 schemas.auth.DemoAccountView）。 */
+export interface DemoAccount {
+  username: string;
+  password: string;
+  /** 角色名，如「超级管理员」「家庭成员」 */
+  label: string;
+  /** 一句话说明这个角色能看到什么 */
+  description: string;
+}
+
+/** 公开演示站的说明与演示账号（见 schemas.auth.DemoSiteView）。 */
+export interface DemoSite {
+  notice: string;
+  accounts: DemoAccount[];
 }
 
 /** 首次初始化状态：未初始化时前端应进 /setup 引导页。 */
 export interface BootstrapStatus {
   initialized: boolean;
+  /** 公开演示站模式下的说明与演示账号；正常部署为空（老服务器没有这个字段） */
+  demo?: DemoSite | null;
 }
 
 /** 查询系统是否已完成首次初始化（公开接口）。 */

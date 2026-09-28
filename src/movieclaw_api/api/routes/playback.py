@@ -29,6 +29,7 @@ from movieclaw_api.exceptions import (
 from movieclaw_api.schemas.base import utc_isoformat
 from movieclaw_api.schemas.library import LibraryGalleryGroupView, SeasonEpisodesView
 from movieclaw_api.schemas.playback import (
+    ActivePlaybackSessionView,
     FavoritesView,
     HwBackendStatusView,
     HwProbeView,
@@ -61,7 +62,8 @@ from movieclaw_api.schemas.playback import (
     UpNextView,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
-from movieclaw_api.services import media_scrape
+from movieclaw_api.services import demo as demo_service
+from movieclaw_api.services import demo_activity, media_scrape
 from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.library import chapters as chapters_mod
 from movieclaw_api.services.library.access import (
@@ -136,7 +138,7 @@ from movieclaw_api.services.playback_up_next import up_next_items
 from movieclaw_api.settings import PlaybackPolicySetting
 from movieclaw_api.settings.store import get_setting_store
 from movieclaw_db.engine import get_database, get_session
-from movieclaw_db.models import LibraryFile, MediaItem, PlaybackMetric, PlaybackState
+from movieclaw_db.models import LibraryFile, MediaItem, PlaybackLog, PlaybackMetric, PlaybackState
 from movieclaw_db.models.base import utcnow
 from movieclaw_db.repositories.media_repo import MediaItemRepository
 from movieclaw_playback import activity
@@ -492,13 +494,27 @@ async def get_media_activity(
     不出片名；``scope=all`` 是管控视角的全量口径——``admin_visible`` 是超管
     给自己设的浏览过滤而非安全边界，管理员有权看到所有人的全部播放活动。
     """
-    return ok(
-        await media_activity_overview(
-            session,
-            browsable_library_ids=await visible_library_ids(session, principal),
-            fold_hidden=scope == "visible",
-        )
+    demo = demo_service.is_demo_mode()
+    overview = await media_activity_overview(
+        session,
+        browsable_library_ids=await visible_library_ids(session, principal),
+        fold_hidden=scope == "visible",
+        extra_sessions=demo_activity.live_sessions() if demo else None,
     )
+    if demo:
+        for row in (*overview.sessions, *overview.downloads):
+            if demo_activity.is_seeded_device(row.device_id):
+                # 演示数据的「正在播放」没有真实取流：速率按已传输折算
+                if isinstance(row, ActivePlaybackSessionView):
+                    row.rate_bytes_per_second = demo_activity.live_rate(
+                        row.device_id, row.bytes_sent, row.position_ms
+                    )
+                continue
+            # 公开演示站：其他访客的第三方播放器自报的客户端名 / 设备名不原样展示
+            row.client, row.device_name = demo_service.anonymous_playback_client(
+                row.client, row.device_name
+            )
+    return ok(overview)
 
 
 @router.post(
@@ -556,17 +572,33 @@ async def list_playback_history(
     翻页用 ``before`` 接上一页最后一行的 id（响应里的 ``next_cursor``），
     而不是页码：这样翻页期间新产生的记录不会把同一行挤到两页里各出现一次。
     可见范围口径（``scope``）与 playback.activity 相同。"""
-    return ok(
-        await playback_history(
-            session,
-            limit=limit,
-            before=before,
-            days=days,
-            member_id=member_id,
-            browsable_library_ids=await visible_library_ids(session, principal),
-            fold_hidden=scope == "visible",
-        )
+    history = await playback_history(
+        session,
+        limit=limit,
+        before=before,
+        days=days,
+        member_id=member_id,
+        browsable_library_ids=await visible_library_ids(session, principal),
+        fold_hidden=scope == "visible",
     )
+    if demo_service.is_demo_mode():
+        # 同活动页：演示站不原样展示访客自报的客户端名 / 设备名（演示数据除外）
+        seeded_ids = set(
+            (
+                await session.execute(
+                    select(PlaybackLog.id).where(
+                        PlaybackLog.id.in_([e.id for e in history.entries]),
+                        PlaybackLog.device_id.like(f"{demo_activity.SEEDED_DEVICE_PREFIX}%"),
+                    )
+                )
+            ).scalars()
+        )
+        for entry in history.entries:
+            if entry.id not in seeded_ids:
+                entry.client, entry.device_name = demo_service.anonymous_playback_client(
+                    entry.client, entry.device_name
+                )
+    return ok(history)
 
 
 @router.get(
@@ -595,16 +627,21 @@ async def get_watch_stats(
     UTC 分天——服务端不猜调用方在哪个时区。
 
     作品榜走可见范围折叠，其余是不出片名的聚合数。"""
-    return ok(
-        await playback_stats(
-            session,
-            days=days,
-            tz_offset_minutes=tz_offset,
-            member_id=member_id,
-            browsable_library_ids=await visible_library_ids(session, principal),
-            fold_hidden=scope == "visible",
-        )
+    stats = await playback_stats(
+        session,
+        days=days,
+        tz_offset_minutes=tz_offset,
+        member_id=member_id,
+        browsable_library_ids=await visible_library_ids(session, principal),
+        fold_hidden=scope == "visible",
     )
+    if demo_service.is_demo_mode():
+        # 同活动页：访客的第三方播放器自报的客户端名不原样展示（演示数据的除外）
+        seeded = demo_activity.seeded_client_names()
+        for row in stats.by_client:
+            if row.client not in seeded:
+                row.client = demo_service.anonymous_playback_client(row.client, "")[0]
+    return ok(stats)
 
 
 @router.delete(

@@ -1,0 +1,262 @@
+{
+  "film:caminandes-llama-drama": {
+    "sha256": "90cbebdd3ce684a7f8716d45dee1f52d2b1608fd22966637b4d26af1a6db0ebf",
+    "url": "https://archive.org/download/Caminandes1LlamaDrama/01_llama_drama_1080p.mp4"
+  },
+  "film:coffee-run": {
+    "sha256": "314243812998fb5b8c237273f08539c86589e91dff71ab319df88cbdb2798b9e",
+    "url": "https://archive.org/download/coffee-run/Coffee%20Run.mp4"
+  },
+  "film:tears-of-steel": {
+    "sha256": "efa9062d9cdb7a338e40ad530dfdf234806743f29ae6a1a136b97ece4e588e8f",
+    "url": "https://download.blender.org/demo/movies/ToS/tears_of_steel_720p.mov"
+  },
+  "film:the-daily-dweebs": {
+    "sha256": "c68845fe300818a36a277afe6043820ccfc5b2306522e17773b8be2a1e8575d3",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/b/b2/The_Daily_Dweebs_-_Blender_Open_Movie-full_movie.webm"
+  },
+  "photo:File:Aegina sunset.jpg": {
+    "sha1": "b03632063b574ff01d45d5d4f0ec4e8997084f70",
+    "url": "https://commons.wikimedia.org/wiki/File:Aegina_sunset.jpg"
+  },
+  "photo:File:Among the branches of a potted jade plant.jpg": {
+    "sha1": "6947d95311cb8af1b5f0477adbee63df5cf922fb",
+    "url": "https://commons.wikimedia.org/wiki/File:Among_the_branches_of_a_potted_jade_plant.jpg"
+  },
+  "photo:File:Apple cake with vanilla ice cream 2.jpg": {
+    "sha1": "574263abdb03d2359a9c40af51d7f986fb8c450f",
+    "url": "https://commons.wikimedia.org/wiki/File:Apple_cake_with_vanilla_ice_cream_2.jpg"
+  },
+  "photo:File:Ardea cinerea in flight.jpg": {
+    "sha1": "145a7e542f20e8e66e197a2c826c9f4575d4387c",
+    "url": "https://commons.wikimedia.org/wiki/File:Ardea_cinerea_in_flight.jpg"
+  },
+  "photo:File:Beech and ferns in Gullmarsskogen.jpg": {
+    "sha1": "1b5ed657f778c4631ed35d29a278205f7200ae21",
+    "url": "https://commons.wikimedia.org/wiki/File:Beech_and_ferns_in_Gullmarsskogen.jpg"
+  },
+  "photo:File:Bombus impatiens on Zinnia elegans at Jardin botanique Roger-Van den Hende.jpg": {
+    "sha1": "e7f489def995a086d68b4ff19de86093c545df85",
+    "url": "https://commons.wikimedia.org/wiki/File:Bombus_impatiens_on_Zinnia_elegans_at_Jardin_botanique_Roger-Van_den_Hende.jpg"
+  },
+  "photo:File:Butorides striata striata in Petrópolis, Rio de Janeiro, Brazil 08.jpg": {
+    "sha1": "ced83c941868c8030bbba2484ab77c93fc703ab2",
+    "url": "https://commons.wikimedia.org/wiki/File:Butorides_striata_striata_in_Petr%C3%B3polis,_Rio_de_Janeiro,_Brazil_08.jpg"
+  },
+  "photo:File:Callithrix jacchus in Parque Bondinho Pão de Açúcar, Rio de Janeiro.jpg": {
+    "sha1": "4e1729dcaa5ba6ea92f7cc28274efbcbd6b0330f",
+    "url": "https://commons.wikimedia.org/wiki/File:Callithrix_jacchus_in_Parque_Bondinho_P%C3%A3o_de_A%C3%A7%C3%BAcar,_Rio_de_Janeiro.jpg"
+  },
+  "photo:File:Cardamom buns.jpg": {
+    "sha1": "da8578418c74b057b8e117464fad31a86c167e8a",
+    "url": "https://commons.wikimedia.org/wiki/File:Cardamom_buns.jpg"
+  },
+  "photo:File:Chateau Frontenac illuminated at night in Quebec City.jpg": {
+    "sha1": "33eeec7b58edbddcf174335d0d214a5b66f9bc02",
+    "url": "https://commons.wikimedia.org/wiki/File:Chateau_Frontenac_illuminated_at_night_in_Quebec_City.jpg"
+  },
+  "photo:File:Chess game Staunton No. 6 perfil view 8.jpg": {
+    "sha1": "1cab936b0bf51f2122363c9aba41a4748c690037",
+    "url": "https://commons.wikimedia.org/wiki/File:Chess_game_Staunton_No._6_perfil_view_8.jpg"
+  },
+  "photo:File:Chlosyne lacinia.jpg": {
+    "sha1": "a221b3bdbd2cf81b5fe9bff34577e98fe905288d",
+    "url": "https://commons.wikimedia.org/wiki/File:Chlosyne_lacinia.jpg"
+  },
+  "photo:File:Coccinella in Parc du Bois-de-Coulonge uncut version.jpg": {
+    "sha1": "00293f4543b0aa6a342fc3b61b85274e7ba3a0bb",
+    "url": "https://commons.wikimedia.org/wiki/File:Coccinella_in_Parc_du_Bois-de-Coulonge_uncut_version.jpg"
+  },
+  "photo:File:Common Jezebel Delias eucharis by kadavoor 3.jpg": {
+    "sha1": "9a5fed1aef4c0ed6b57bdeaec76d6815f2949f01",
+    "url": "https://commons.wikimedia.org/wiki/File:Common_Jezebel_Delias_eucharis_by_kadavoor_3.jpg"
+  },
+  "photo:File:Drymona water fall and pool north Euboea Greece.jpg": {
+    "sha1": "10f5163aa05b7fd08f5627e133142c6015ce5ad6",
+    "url": "https://commons.wikimedia.org/wiki/File:Drymona_water_fall_and_pool_north_Euboea_Greece.jpg"
+  },
+  "photo:File:Elymnias hypermnestra male by kadavoor.jpg": {
+    "sha1": "5f07868ace18ffde727118d151a6a6baa5270039",
+    "url": "https://commons.wikimedia.org/wiki/File:Elymnias_hypermnestra_male_by_kadavoor.jpg"
+  },
+  "photo:File:Erechtheum Acropolis Athens.jpg": {
+    "sha1": "a2bd0e7cba302061955b09bba265ba2478ebcd19",
+    "url": "https://commons.wikimedia.org/wiki/File:Erechtheum_Acropolis_Athens.jpg"
+  },
+  "photo:File:Frozen soap bubble behind fir twigs (Unsplash BojuZpqw4zM).jpg": {
+    "sha1": "89d7d59cf545b3268ab0b050cd1b68747647878c",
+    "url": "https://commons.wikimedia.org/wiki/File:Frozen_soap_bubble_behind_fir_twigs_(Unsplash_BojuZpqw4zM).jpg"
+  },
+  "photo:File:Gimbap (pixabay).jpg": {
+    "sha1": "e0414adfa03a76078e85d85450f7bfec3f8ede6d",
+    "url": "https://commons.wikimedia.org/wiki/File:Gimbap_(pixabay).jpg"
+  },
+  "photo:File:Grand Canyon South Rim at Sunset.jpg": {
+    "sha1": "1e01a2c1e4bf11db33848992cf94b5d44618e216",
+    "url": "https://commons.wikimedia.org/wiki/File:Grand_Canyon_South_Rim_at_Sunset.jpg"
+  },
+  "photo:File:Great egret (great egret (Ardea alba) at Federsee, Germany) at Federsee.jpg": {
+    "sha1": "5ea76dbb3086e90d2d9940f35493456738017582",
+    "url": "https://commons.wikimedia.org/wiki/File:Great_egret_(great_egret_(Ardea_alba)_at_Federsee,_Germany)_at_Federsee.jpg"
+  },
+  "photo:File:Hydrochoeris hydrochaeris in Brazil in Petrópolis, Rio de Janeiro, Brazil 09.jpg": {
+    "sha1": "906fe7f5a5717ed3c3830e1fc76ee7e818e0c62f",
+    "url": "https://commons.wikimedia.org/wiki/File:Hydrochoeris_hydrochaeris_in_Brazil_in_Petr%C3%B3polis,_Rio_de_Janeiro,_Brazil_09.jpg"
+  },
+  "photo:File:Lady fern at Myrstigen trail 1.jpg": {
+    "sha1": "54aecb9c2d59f3623c649f3fa702241744c8ec5f",
+    "url": "https://commons.wikimedia.org/wiki/File:Lady_fern_at_Myrstigen_trail_1.jpg"
+  },
+  "photo:File:Laranjas-pera.jpg": {
+    "sha1": "4a0b24ae00334c2ca847c3897f9033c8814ba09b",
+    "url": "https://commons.wikimedia.org/wiki/File:Laranjas-pera.jpg"
+  },
+  "photo:File:Lofoten, Norway (Unsplash).jpg": {
+    "sha1": "b996e2a6c909c8b9cd672df044c2abd7a24a65a3",
+    "url": "https://commons.wikimedia.org/wiki/File:Lofoten,_Norway_(Unsplash).jpg"
+  },
+  "photo:File:Mamões.jpg": {
+    "sha1": "8a5f839f2119268c8e90f262451d79940d55ac94",
+    "url": "https://commons.wikimedia.org/wiki/File:Mam%C3%B5es.jpg"
+  },
+  "photo:File:Marmolada, Italy.jpg": {
+    "sha1": "d557c8ec714758c85a11a65500841762da3af891",
+    "url": "https://commons.wikimedia.org/wiki/File:Marmolada,_Italy.jpg"
+  },
+  "photo:File:Melanistic Sciurus carolinensis at Jardin botanique Roger-Van den Hende.jpg": {
+    "sha1": "9c0a9c03a7e884bb3f2fa534c218fe584729c5d4",
+    "url": "https://commons.wikimedia.org/wiki/File:Melanistic_Sciurus_carolinensis_at_Jardin_botanique_Roger-Van_den_Hende.jpg"
+  },
+  "photo:File:Mixed-breed dogs in Serles.jpg": {
+    "sha1": "c3a4d59b4e5b0b7760dfd12e552a8606eec12404",
+    "url": "https://commons.wikimedia.org/wiki/File:Mixed-breed_dogs_in_Serles.jpg"
+  },
+  "photo:File:Monument Valley Arizona Panoramic.jpg": {
+    "sha1": "00d46bc574f491bbce1419f5190ac982241b2abd",
+    "url": "https://commons.wikimedia.org/wiki/File:Monument_Valley_Arizona_Panoramic.jpg"
+  },
+  "photo:File:Neuschwanstein Castle 2024.jpg": {
+    "sha1": "4e1033bb1df2b3ff41f892e62e5617f2604c55d7",
+    "url": "https://commons.wikimedia.org/wiki/File:Neuschwanstein_Castle_2024.jpg"
+  },
+  "photo:File:Orange buoy in water.jpg": {
+    "sha1": "1f60bc1f51b138505214b405a6bf7d027182d27c",
+    "url": "https://commons.wikimedia.org/wiki/File:Orange_buoy_in_water.jpg"
+  },
+  "photo:File:Overview of Les Menuires and the Belleville valley.jpg": {
+    "sha1": "62ae7129be7edc2c5d0638171facbbe95a283c78",
+    "url": "https://commons.wikimedia.org/wiki/File:Overview_of_Les_Menuires_and_the_Belleville_valley.jpg"
+  },
+  "photo:File:Parc de la Chute-Montmorency 001.jpg": {
+    "sha1": "ad3e4326b5124580adb02e26c6c7f36df637decd",
+    "url": "https://commons.wikimedia.org/wiki/File:Parc_de_la_Chute-Montmorency_001.jpg"
+  },
+  "photo:File:Parc national de la Jacques-Cartier, Quebec, Canada 22.jpg": {
+    "sha1": "24783f0fc8a2e8767526dacbbbe8db541971106c",
+    "url": "https://commons.wikimedia.org/wiki/File:Parc_national_de_la_Jacques-Cartier,_Quebec,_Canada_22.jpg"
+  },
+  "photo:File:Pavo Real Venezolano.jpg": {
+    "sha1": "a9fa92d44b0784ee2fa1e41fbe1814e7489a31eb",
+    "url": "https://commons.wikimedia.org/wiki/File:Pavo_Real_Venezolano.jpg"
+  },
+  "photo:File:Peppers in water.jpg": {
+    "sha1": "1fae17c2dcc1bff8620a66d39477a8496669bb79",
+    "url": "https://commons.wikimedia.org/wiki/File:Peppers_in_water.jpg"
+  },
+  "photo:File:Phoenicopterus ruber in São Paulo Zoo.jpg": {
+    "sha1": "a287ea0e97e7bb1deff8b2f943da15560c04c6d9",
+    "url": "https://commons.wikimedia.org/wiki/File:Phoenicopterus_ruber_in_S%C3%A3o_Paulo_Zoo.jpg"
+  },
+  "photo:File:Piece of chocolate cake on a white plate decorated with chocolate sauce.jpg": {
+    "sha1": "579c1a3c8a28032c618a45a20a98e46c9a5f7940",
+    "url": "https://commons.wikimedia.org/wiki/File:Piece_of_chocolate_cake_on_a_white_plate_decorated_with_chocolate_sauce.jpg"
+  },
+  "photo:File:Playing with water, light and leaves.jpg": {
+    "sha1": "bf800a94c97f1af80abebe99afa637078d7deaac",
+    "url": "https://commons.wikimedia.org/wiki/File:Playing_with_water,_light_and_leaves.jpg"
+  },
+  "photo:File:Pont de Bercy, Paris 23 December 2021.jpg": {
+    "sha1": "44659e3472f53727274e5ff2f850d2ffe374c2ca",
+    "url": "https://commons.wikimedia.org/wiki/File:Pont_de_Bercy,_Paris_23_December_2021.jpg"
+  },
+  "photo:File:Portrait of a Carpathian Lynx.jpg": {
+    "sha1": "c3cf1605b3b0ddf9fc3c2ac40edd81da8c5b89a9",
+    "url": "https://commons.wikimedia.org/wiki/File:Portrait_of_a_Carpathian_Lynx.jpg"
+  },
+  "photo:File:Red Panda (24986761703).jpg": {
+    "sha1": "99418c1f98aca8ffc9f7c96dc4957d8e5400e48b",
+    "url": "https://commons.wikimedia.org/wiki/File:Red_Panda_(24986761703).jpg"
+  },
+  "photo:File:Rio de Janeiro skyline and Sugarloaf Mountain at sunset, Brazil 3.jpg": {
+    "sha1": "3fb858c9b7ebc692ddfca4d93d0eff3e067adb0e",
+    "url": "https://commons.wikimedia.org/wiki/File:Rio_de_Janeiro_skyline_and_Sugarloaf_Mountain_at_sunset,_Brazil_3.jpg"
+  },
+  "photo:File:Rocks El Torcal de Antequera karst Andalusia Spain.jpg": {
+    "sha1": "d8a2c67f74d8cb60bef4bb3dc77c9d61eb655a9a",
+    "url": "https://commons.wikimedia.org/wiki/File:Rocks_El_Torcal_de_Antequera_karst_Andalusia_Spain.jpg"
+  },
+  "photo:File:Sant'Angelo bridge, dusk, Rome, Italy.jpg": {
+    "sha1": "a492e323bf5ff21efe7157f1e308950f4d79a2cc",
+    "url": "https://commons.wikimedia.org/wiki/File:Sant%27Angelo_bridge,_dusk,_Rome,_Italy.jpg"
+  },
+  "photo:File:Sheep lounging in the shade of a tree at Röe Castle.jpg": {
+    "sha1": "b68ae37691c83e58bfc75db7e37b3546c9cfc400",
+    "url": "https://commons.wikimedia.org/wiki/File:Sheep_lounging_in_the_shade_of_a_tree_at_R%C3%B6e_Castle.jpg"
+  },
+  "photo:File:Snow-covered Quebec City skyline in fog.jpg": {
+    "sha1": "93779c5653cb4271d6e85e3f09c6a3e6716b0e89",
+    "url": "https://commons.wikimedia.org/wiki/File:Snow-covered_Quebec_City_skyline_in_fog.jpg"
+  },
+  "photo:File:Steam-boiling green asparagus.jpg": {
+    "sha1": "40f02ef3e0dca568958c2e4b75de30ab27462d6a",
+    "url": "https://commons.wikimedia.org/wiki/File:Steam-boiling_green_asparagus.jpg"
+  },
+  "photo:File:Struthio camelus (captive) in Jardim Zoológico de Curitiba.jpg": {
+    "sha1": "831da00e41b8470a046886133116cc8daa07462f",
+    "url": "https://commons.wikimedia.org/wiki/File:Struthio_camelus_(captive)_in_Jardim_Zool%C3%B3gico_de_Curitiba.jpg"
+  },
+  "photo:File:Sunset Key and Sailboats, Florida, 2025.jpg": {
+    "sha1": "a2405601c7590569b9eea5a1207c270c0084ec61",
+    "url": "https://commons.wikimedia.org/wiki/File:Sunset_Key_and_Sailboats,_Florida,_2025.jpg"
+  },
+  "photo:File:The Green and Golden Bell Frog.jpg": {
+    "sha1": "665c2af435cea4b65957ec9351dcfa2798643078",
+    "url": "https://commons.wikimedia.org/wiki/File:The_Green_and_Golden_Bell_Frog.jpg"
+  },
+  "photo:File:The dunnock (Prunella modularis).jpg": {
+    "sha1": "0228e774c78e1e78e40b64fd65188e9f5973259d",
+    "url": "https://commons.wikimedia.org/wiki/File:The_dunnock_(Prunella_modularis).jpg"
+  },
+  "photo:File:The juvenile greater flamingo.jpg": {
+    "sha1": "6c30ca7ab8b41ba58c35f0c998522b5b31a357c9",
+    "url": "https://commons.wikimedia.org/wiki/File:The_juvenile_greater_flamingo.jpg"
+  },
+  "photo:File:Trees along the Hald Sø Viborg Commune Danemark.jpg": {
+    "sha1": "7c6e5b9cb2960d6c8a8b33acf69308940987f22c",
+    "url": "https://commons.wikimedia.org/wiki/File:Trees_along_the_Hald_S%C3%B8_Viborg_Commune_Danemark.jpg"
+  },
+  "photo:File:Tschanüff gegen Piz Spadla.jpg": {
+    "sha1": "ac53c51e0ebfd0e5a2bae1ca3f3b6e95a32ebcd3",
+    "url": "https://commons.wikimedia.org/wiki/File:Tschan%C3%BCff_gegen_Piz_Spadla.jpg"
+  },
+  "photo:File:Wetterspitzen (Stubaier Alpen).jpg": {
+    "sha1": "d04ca4e2a844a70f318429c435da0c10d70c6231",
+    "url": "https://commons.wikimedia.org/wiki/File:Wetterspitzen_(Stubaier_Alpen).jpg"
+  },
+  "photo:File:Yellow-billed stork (Mycteria ibis).jpg": {
+    "sha1": "1923e78622acdb480d0bfa02ef0288ed512f5fbc",
+    "url": "https://commons.wikimedia.org/wiki/File:Yellow-billed_stork_(Mycteria_ibis).jpg"
+  },
+  "subtitle:tears-of-steel:en": {
+    "sha256": "ce9578f6fe098a5821045a38884b229160f9e7ba27890448a92f5be330c6e6fe",
+    "url": "https://download.blender.org/demo/movies/ToS/subtitles/TOS-en.srt"
+  },
+  "subtitle:tears-of-steel:简体中文.chs": {
+    "sha256": "456152557f85f5874ec7c96c99a68ff05c325013972ca059b193f0d93f036d45",
+    "url": "https://download.blender.org/demo/movies/ToS/subtitles/TOS-CH.srt"
+  },
+  "subtitle:tears-of-steel:繁體中文.cht": {
+    "sha256": "ae2a9ffb2ae2f60762f77ffb1b03bd7246b6bc71cb42d8b30955fcfe66ad0c50",
+    "url": "https://download.blender.org/demo/movies/ToS/subtitles/TOS-CH-traditional.srt"
+  }
+}

@@ -336,10 +336,12 @@ async def media_activity_overview(
     *,
     browsable_library_ids: set[int] | None = None,
     fold_hidden: bool = True,
+    extra_sessions: list[activity.PlaySession] | None = None,
 ) -> MediaActivityView:
     """装配活动页「观看」视角的实时快照：正在播放与正在下载。
 
     ``browsable_library_ids``：当前超管的可浏览库集合（None = 内部流程不受限）。
+    ``extra_sessions``：额外并入快照的会话（公开演示站的演示数据）。
     ``fold_hidden`` 为真是「我的浏览范围」口径：落在范围外的正在播放与正在下载
     统一折叠成计数（``hidden_*_count``），不出片名与海报——活动页是管理视角，
     但「不可见就彻底不可见」对超管自己摘掉的库同样成立。为假是「全部」口径：
@@ -351,6 +353,9 @@ async def media_activity_overview(
     与全表设备行，已一并去掉——历史看播放记录（/playback/history）。
     """
     play_sessions, meters = activity.snapshot()
+    # 公开演示站按时间算出来的「正在播放」（services/demo_activity.live_sessions），
+    # 与真实会话同形，走同一套装配
+    play_sessions = [*play_sessions, *(extra_sessions or [])]
     play_meters = [m for m in meters if m.kind == activity.STREAM_KIND_PLAY]
     download_meters = [m for m in meters if m.kind == activity.STREAM_KIND_DOWNLOAD]
 

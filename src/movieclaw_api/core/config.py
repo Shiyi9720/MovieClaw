@@ -284,6 +284,16 @@ class Settings(BaseSettings):
     # 任务执行历史的保留天数，超期由内置清理任务归档，避免 task_run 无限增长。
     task_run_retention_days: int = Field(default=30, alias="TASK_RUN_RETENTION_DAYS")
 
+    # ------------------------------------------------------------------
+    # 公开演示站模式（docs/design/demo-site.md）
+    # ------------------------------------------------------------------
+    # 开启后全站只读：写接口默认拒绝（只放行登录与播放链路），账号密码公开在
+    # 登录页，访客之间的设备名 / IP 脱敏。只给公开演示站用，自托管部署不要开。
+    demo_mode: bool = Field(default=False, alias="MOVIECLAW_DEMO_MODE")
+    # 登录页公布的演示账号清单（JSON，格式见 demo/accounts.json）；留空则只提示
+    # 「演示站只读」而不列账号。放在 data/ 之外，由部署时只读挂载进容器
+    demo_accounts_file: str = Field(default="", alias="MOVIECLAW_DEMO_ACCOUNTS_FILE")
+
     @field_validator("tmdb_api_base_url")
     @classmethod
     def _normalize_tmdb_api_base_url(cls, value: str) -> str:

@@ -12,6 +12,8 @@ from movieclaw_api.schemas.llm import (
     LlmProviderView,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
+from movieclaw_api.services import demo as demo_service
+from movieclaw_api.services import demo_agent
 from movieclaw_api.services.llm_config import LlmConfigService, verify_llm_provider
 from movieclaw_db.engine import get_session
 from movieclaw_llm.providers import list_presets
@@ -44,6 +46,8 @@ async def list_llm_models(
     有时 ref 是裸 id；出现在多个实例里时 ref 为「实例名/模型id」、label 带括号
     标注实例名。把 ref 原样填进 session.start 的 model 或 AI 设定即可；
     is_default 标记智能体默认模型。"""
+    if demo_service.is_demo_mode():
+        return ok(demo_agent.model_options())
     return ok(await LlmConfigService(session).list_model_options())
 
 
@@ -58,6 +62,8 @@ async def get_llm_defaults(
 ) -> ApiResponse[LlmDefaultsView]:
     """agent_model / subtitle_model 首次接入供应商时自动设为其目录第一个模型，之后
     由用户改；一个实例都没有时为 null。effective_* 为实际生效值，正常与之一致。"""
+    if demo_service.is_demo_mode():
+        return ok(demo_agent.defaults_view())
     return ok(await LlmConfigService(session).get_defaults())
 
 
@@ -88,6 +94,9 @@ async def list_llm_providers(
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[LlmProviderView]]:
     """按添加顺序；一个都没接入时 data 为空数组，设置页据此渲染空态。"""
+    if demo_service.is_demo_mode():
+        # 演示站不接真实模型：只报一个预设回复的演示模型（services/demo_agent.py）
+        return ok(demo_agent.provider_views())
     rows = await LlmConfigService(session).list_all()
     return ok([LlmProviderView.from_model(r) for r in rows])
 

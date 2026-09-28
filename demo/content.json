@@ -1,0 +1,796 @@
+{
+  "_comment": "演示站内容清单（docs/design/demo-site.md）。只收开放授权作品：影片为 CC BY，图片为 CC0。fetch_content.py 按此下载、校验、整理成媒体库目录；provision.py 按 libraries 建库；CREDITS.md 由 fetch_content.py --credits 生成。",
+  "libraries": [
+    {
+      "name": "电影",
+      "kind": "movie",
+      "dir": "电影"
+    },
+    {
+      "name": "动画短片",
+      "kind": "movie",
+      "dir": "动画短片"
+    },
+    {
+      "name": "图片",
+      "kind": "photo",
+      "dir": "图片",
+      "exclude_from_home": true
+    }
+  ],
+  "films": [
+    {
+      "id": "elephants-dream",
+      "title": "Elephants Dream",
+      "year": 2006,
+      "tmdb_id": 9761,
+      "library": "电影",
+      "license": "CC BY 2.5",
+      "license_url": "https://creativecommons.org/licenses/by/2.5/",
+      "attribution": "© 2006 Blender Foundation / Netherlands Media Art Institute · www.elephantsdream.org",
+      "homepage": "https://orange.blender.org/",
+      "source": {
+        "url": "https://download.blender.org/ED/elephantsdream-1024-h264-st-aac.mov",
+        "mirror_of": "Blender 官方下载站"
+      },
+      "plot": "两个古怪的人物在一台反复无常、仿佛无穷无尽的巨大机器里穿行：年长的普罗格当向导，热心地介绍机器里的奇观与危险；年轻的伊莫起初好奇，后来越来越怀疑。这是 Blender 基金会的第一部开放电影，完全用开源软件制作。"
+    },
+    {
+      "id": "big-buck-bunny",
+      "title": "Big Buck Bunny",
+      "year": 2008,
+      "tmdb_id": 10378,
+      "library": "电影",
+      "license": "CC BY 3.0",
+      "license_url": "https://creativecommons.org/licenses/by/3.0/",
+      "attribution": "© 2008 Blender Foundation · www.bigbuckbunny.org",
+      "homepage": "https://peach.blender.org/",
+      "source": {
+        "url": "https://download.blender.org/demo/movies/BBB/bbb_sunflower_1080p_30fps_normal.mp4.zip",
+        "member": "bbb_sunflower_1080p_30fps_normal.mp4",
+        "mirror_of": "Blender 官方下载站"
+      },
+      "plot": "憨厚的大兔子在森林里享受清晨，却撞上三只以欺负小动物为乐的捣蛋啮齿动物。心爱的蝴蝶被它们害了之后，大兔子决定好好教训它们一番。Blender 基金会第二部开放电影，轻松幽默，适合全家观看。"
+    },
+    {
+      "id": "sintel",
+      "title": "Sintel",
+      "year": 2010,
+      "tmdb_id": 45745,
+      "library": "电影",
+      "license": "CC BY 3.0",
+      "license_url": "https://creativecommons.org/licenses/by/3.0/",
+      "attribution": "© 2010 Blender Foundation · durian.blender.org",
+      "homepage": "https://durian.blender.org/",
+      "source": {
+        "url": "https://download.blender.org/durian/movies/Sintel.2010.720p.mkv.zip",
+        "member_suffix": ".mkv",
+        "mirror_of": "Blender 官方下载站"
+      },
+      "embedded_subtitles": true,
+      "subtitles": [
+        {
+          "url": "https://download.blender.org/durian/subs/sintel_chs.srt",
+          "tag": "简体中文.chs"
+        }
+      ],
+      "plot": "流浪的少女战士辛特尔救下一只受伤的小龙，两者结下深厚的情谊。有一天小龙被掳走，她踏上漫长而危险的寻龙之旅，最终发现这趟旅程的代价远超她的想象。Blender 基金会第三部开放电影，附带十余种语言字幕。"
+    },
+    {
+      "id": "tears-of-steel",
+      "title": "Tears of Steel",
+      "year": 2012,
+      "tmdb_id": 133701,
+      "library": "电影",
+      "license": "CC BY 3.0",
+      "license_url": "https://creativecommons.org/licenses/by/3.0/",
+      "attribution": "(CC) Blender Foundation · mango.blender.org",
+      "homepage": "https://mango.blender.org/",
+      "source": {
+        "url": "https://download.blender.org/demo/movies/ToS/tears_of_steel_720p.mov",
+        "mirror_of": "Blender 官方下载站"
+      },
+      "subtitles": [
+        {
+          "url": "https://download.blender.org/demo/movies/ToS/subtitles/TOS-CH.srt",
+          "tag": "简体中文.chs"
+        },
+        {
+          "url": "https://download.blender.org/demo/movies/ToS/subtitles/TOS-CH-traditional.srt",
+          "tag": "繁體中文.cht"
+        },
+        {
+          "url": "https://download.blender.org/demo/movies/ToS/subtitles/TOS-en.srt",
+          "tag": "en"
+        }
+      ],
+      "plot": "一群战士与科学家聚集在阿姆斯特丹的老教堂，试图重演过去的一个关键时刻，以拯救被毁灭性机器人占领的世界。Blender 基金会第四部开放电影，真人实拍结合视觉特效制作。"
+    },
+    {
+      "id": "spring",
+      "title": "Spring",
+      "year": 2019,
+      "tmdb_id": 593048,
+      "library": "电影",
+      "license": "CC BY 4.0",
+      "license_url": "https://creativecommons.org/licenses/by/4.0/",
+      "attribution": "© Blender Animation Studio · 导演 Andy Goralczyk · studio.blender.org",
+      "homepage": "https://studio.blender.org/projects/spring/",
+      "source": {
+        "url": "https://upload.wikimedia.org/wikipedia/commons/a/a5/Spring_-_Blender_Open_Movie.webm",
+        "mirror_of": "Wikimedia Commons（授权经社区审核）",
+        "transcode": true
+      },
+      "plot": "牧羊女孩和她的小狗直面古老的森林之灵，为让生命的轮回延续下去而踏上旅程。Blender 动画工作室出品，画面唯美。"
+    },
+    {
+      "id": "charge",
+      "title": "Charge",
+      "year": 2022,
+      "tmdb_id": 1062079,
+      "library": "电影",
+      "license": "CC BY 4.0",
+      "license_url": "https://creativecommons.org/licenses/by/4.0/",
+      "attribution": "© Blender Studio · studio.blender.org",
+      "homepage": "https://studio.blender.org/projects/charge/",
+      "source": {
+        "url": "https://archive.org/download/charge-blender-open-movie-1608p/Charge%20-%20Blender%20Open%20Movie%201608p.mp4",
+        "mirror_of": "Internet Archive 镜像"
+      },
+      "plot": "Blender Studio 第十四部开放电影：一部视觉冲击强烈的动作短片，灵感来自游戏过场动画与实时渲染演示，展示了 Blender 的写实渲染能力。本站收录 4K 版本。"
+    },
+    {
+      "id": "wing-it",
+      "title": "Wing It!",
+      "year": 2023,
+      "tmdb_id": 1177628,
+      "library": "电影",
+      "license": "CC BY 4.0",
+      "license_url": "https://creativecommons.org/licenses/by/4.0/",
+      "attribution": "© Blender Studio · studio.blender.org",
+      "homepage": "https://studio.blender.org/projects/wing-it/",
+      "source": {
+        "url": "https://archive.org/download/wing_it/wing_it.mp4",
+        "mirror_of": "Internet Archive 镜像"
+      },
+      "plot": "Blender Studio 第十五部开放电影：一位一丝不苟的工程师迎来一位热情过头的「准飞行员」不请自来，两人阴差阳错地坐着一架失控的飞船冲上了天。"
+    },
+    {
+      "id": "caminandes-llama-drama",
+      "title": "Caminandes: Llama Drama",
+      "year": 2013,
+      "tmdb_id": 253777,
+      "library": "动画短片",
+      "license": "CC BY 3.0",
+      "license_url": "https://creativecommons.org/licenses/by/3.0/",
+      "attribution": "© 2013 Blender Foundation · 导演 Pablo Vazquez",
+      "homepage": "https://archive.org/details/Caminandes1LlamaDrama",
+      "source": {
+        "url": "https://archive.org/download/Caminandes1LlamaDrama/01_llama_drama_1080p.mp4",
+        "mirror_of": "Internet Archive 镜像"
+      },
+      "set": "Caminandes 系列",
+      "plot": "巴塔哥尼亚高原上，小羊驼科罗想走到公路对面去——这件事比它想的难多了。Caminandes 系列第一集。"
+    },
+    {
+      "id": "caminandes-gran-dillama",
+      "title": "Caminandes: Gran Dillama",
+      "year": 2013,
+      "tmdb_id": 253774,
+      "library": "动画短片",
+      "license": "CC BY 3.0",
+      "license_url": "https://creativecommons.org/licenses/by/3.0/",
+      "attribution": "© 2013 Blender Foundation · 导演 Pablo Vazquez",
+      "homepage": "https://studio.blender.org/projects/caminandes-2/",
+      "source": {
+        "url": "https://download.blender.org/demo/movies/caminandes_gran_dillama.mp4.zip",
+        "member_suffix": ".mp4",
+        "mirror_of": "Blender 官方下载站"
+      },
+      "set": "Caminandes 系列",
+      "plot": "小羊驼科罗发现，围栏那边的草总是更绿——可是围栏通着电。Caminandes 系列第二集。"
+    },
+    {
+      "id": "caminandes-llamigos",
+      "title": "Caminandes: Llamigos",
+      "year": 2016,
+      "tmdb_id": 406956,
+      "library": "动画短片",
+      "license": "CC BY 3.0",
+      "license_url": "https://creativecommons.org/licenses/by/3.0/",
+      "attribution": "© 2016 Blender Foundation · 导演 Pablo Vazquez",
+      "homepage": "https://studio.blender.org/projects/caminandes-3/",
+      "source": {
+        "url": "https://archive.org/download/CaminandesLlamigos/Caminandes_%20Llamigos-1080p.mp4",
+        "mirror_of": "Internet Archive 镜像"
+      },
+      "set": "Caminandes 系列",
+      "plot": "巴塔哥尼亚的冬天，食物越来越少。小羊驼科罗和一只烦人的企鹅奥提为了最后一颗浆果展开了一场史诗级争夺。Caminandes 系列第三集。"
+    },
+    {
+      "id": "glass-half",
+      "title": "Glass Half",
+      "year": 2015,
+      "tmdb_id": 420577,
+      "library": "动画短片",
+      "license": "CC BY 4.0",
+      "license_url": "https://creativecommons.org/licenses/by/4.0/",
+      "attribution": "© 2015 Blender Foundation · cloud.blender.org",
+      "homepage": "https://studio.blender.org/projects/glass-half/",
+      "source": {
+        "url": "https://archive.org/download/GlassHalf1080p/Glass%20Half-1080p.mp4",
+        "mirror_of": "Internet Archive 镜像"
+      },
+      "plot": "两位业余艺术评论家在美术馆相遇，对看到的每件作品都争得面红耳赤，直到终于找到一件两人都认可的作品……"
+    },
+    {
+      "id": "the-daily-dweebs",
+      "title": "The Daily Dweebs",
+      "year": 2017,
+      "tmdb_id": 498482,
+      "library": "动画短片",
+      "license": "CC BY 4.0",
+      "license_url": "https://creativecommons.org/licenses/by/4.0/",
+      "attribution": "© 2017 Blender Foundation · cloud.blender.org",
+      "homepage": "https://studio.blender.org/projects/dailydweebs/",
+      "source": {
+        "url": "https://upload.wikimedia.org/wikipedia/commons/b/b2/The_Daily_Dweebs_-_Blender_Open_Movie-full_movie.webm",
+        "mirror_of": "Wikimedia Commons（授权经社区审核）",
+        "transcode": true
+      },
+      "plot": "一部动画剧集的试播集：宠物狗迪克西在上世纪五十年代的美国郊区闯出了一连串的小祸。"
+    },
+    {
+      "id": "coffee-run",
+      "title": "Coffee Run",
+      "year": 2020,
+      "tmdb_id": 717986,
+      "library": "动画短片",
+      "license": "CC BY 4.0",
+      "license_url": "https://creativecommons.org/licenses/by/4.0/",
+      "attribution": "© 2020 Blender Studio · studio.blender.org",
+      "homepage": "https://studio.blender.org/projects/coffee-run/",
+      "source": {
+        "url": "https://archive.org/download/coffee-run/Coffee%20Run.mp4",
+        "mirror_of": "Internet Archive 镜像"
+      },
+      "plot": "在咖啡因的驱动下，一位年轻女子一路奔跑，穿过关于一段旧恋情的酸甜回忆。"
+    }
+  ],
+  "photos": {
+    "library": "图片",
+    "width": 1920,
+    "items": [
+      {
+        "title": "绿金铃蛙",
+        "category": "动物",
+        "commons_file": "File:The Green and Golden Bell Frog.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:The_Green_and_Golden_Bell_Frog.jpg",
+        "author": "Bernard Spragg",
+        "license": "CC0",
+        "taken_at": "2010-04-30T11:13:53"
+      },
+      {
+        "title": "棕榈蝶",
+        "category": "动物",
+        "commons_file": "File:Elymnias hypermnestra male by kadavoor.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Elymnias_hypermnestra_male_by_kadavoor.jpg",
+        "author": "Jeevan Jose",
+        "license": "CC0",
+        "taken_at": "2012-08-02T09:44:39"
+      },
+      {
+        "title": "优越斑粉蝶",
+        "category": "动物",
+        "commons_file": "File:Common Jezebel Delias eucharis by kadavoor 3.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Common_Jezebel_Delias_eucharis_by_kadavoor_3.jpg",
+        "author": "Jeevan Jose",
+        "license": "CC0",
+        "taken_at": "2012-09-02T13:50:09"
+      },
+      {
+        "title": "蓝孔雀",
+        "category": "动物",
+        "commons_file": "File:Pavo Real Venezolano.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Pavo_Real_Venezolano.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2012-11-10T13:52:58"
+      },
+      {
+        "title": "飞翔的苍鹭",
+        "category": "动物",
+        "commons_file": "File:Ardea cinerea in flight.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Ardea_cinerea_in_flight.jpg",
+        "author": "Dinkum",
+        "license": "CC0",
+        "taken_at": "2013-04-26T13:48:45"
+      },
+      {
+        "title": "网纹蛱蝶",
+        "category": "动物",
+        "commons_file": "File:Chlosyne lacinia.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Chlosyne_lacinia.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2013-05-14T12:48:09"
+      },
+      {
+        "title": "美洲红鹳",
+        "category": "动物",
+        "commons_file": "File:Phoenicopterus ruber in São Paulo Zoo.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Phoenicopterus_ruber_in_S%C3%A3o_Paulo_Zoo.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2014-08-16T12:21:16"
+      },
+      {
+        "title": "小熊猫",
+        "category": "动物",
+        "commons_file": "File:Red Panda (24986761703).jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Red_Panda_(24986761703).jpg",
+        "author": "Mathias Appel",
+        "license": "CC0",
+        "taken_at": "2016-02-14T13:45:00"
+      },
+      {
+        "title": "幼年大红鹳",
+        "category": "动物",
+        "commons_file": "File:The juvenile greater flamingo.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:The_juvenile_greater_flamingo.jpg",
+        "author": "Hobbyfotowiki",
+        "license": "CC0",
+        "taken_at": "2017-09-30T10:00:59"
+      },
+      {
+        "title": "树荫下的羊",
+        "category": "动物",
+        "commons_file": "File:Sheep lounging in the shade of a tree at Röe Castle.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Sheep_lounging_in_the_shade_of_a_tree_at_R%C3%B6e_Castle.jpg",
+        "author": "W.carter",
+        "license": "CC0",
+        "taken_at": "2019-07-11T13:32:58"
+      },
+      {
+        "title": "林岩鹨",
+        "category": "动物",
+        "commons_file": "File:The dunnock (Prunella modularis).jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:The_dunnock_(Prunella_modularis).jpg",
+        "author": "Hobbyfotowiki",
+        "license": "CC0",
+        "taken_at": "2021-03-02T08:44:51"
+      },
+      {
+        "title": "黑色的灰松鼠",
+        "category": "动物",
+        "commons_file": "File:Melanistic Sciurus carolinensis at Jardin botanique Roger-Van den Hende.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Melanistic_Sciurus_carolinensis_at_Jardin_botanique_Roger-Van_den_Hende.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2022-11-13T14:47:35"
+      },
+      {
+        "title": "花苞上的瓢虫",
+        "category": "动物",
+        "commons_file": "File:Coccinella in Parc du Bois-de-Coulonge uncut version.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Coccinella_in_Parc_du_Bois-de-Coulonge_uncut_version.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2023-09-03T10:38:15"
+      },
+      {
+        "title": "绿鹭",
+        "category": "动物",
+        "commons_file": "File:Butorides striata striata in Petrópolis, Rio de Janeiro, Brazil 08.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Butorides_striata_striata_in_Petr%C3%B3polis,_Rio_de_Janeiro,_Brazil_08.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2023-09-17T15:13:40"
+      },
+      {
+        "title": "水豚",
+        "category": "动物",
+        "commons_file": "File:Hydrochoeris hydrochaeris in Brazil in Petrópolis, Rio de Janeiro, Brazil 09.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Hydrochoeris_hydrochaeris_in_Brazil_in_Petr%C3%B3polis,_Rio_de_Janeiro,_Brazil_09.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2023-09-17T15:15:45"
+      },
+      {
+        "title": "熊蜂与百日菊",
+        "category": "动物",
+        "commons_file": "File:Bombus impatiens on Zinnia elegans at Jardin botanique Roger-Van den Hende.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Bombus_impatiens_on_Zinnia_elegans_at_Jardin_botanique_Roger-Van_den_Hende.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2023-10-07T12:32:57"
+      },
+      {
+        "title": "雪山上的狗",
+        "category": "动物",
+        "commons_file": "File:Mixed-breed dogs in Serles.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Mixed-breed_dogs_in_Serles.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2024-02-05T05:47:53"
+      },
+      {
+        "title": "猞猁",
+        "category": "动物",
+        "commons_file": "File:Portrait of a Carpathian Lynx.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Portrait_of_a_Carpathian_Lynx.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2024-02-05T09:23:07"
+      },
+      {
+        "title": "普通狨",
+        "category": "动物",
+        "commons_file": "File:Callithrix jacchus in Parque Bondinho Pão de Açúcar, Rio de Janeiro.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Callithrix_jacchus_in_Parque_Bondinho_P%C3%A3o_de_A%C3%A7%C3%BAcar,_Rio_de_Janeiro.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2024-06-22T14:10:08"
+      },
+      {
+        "title": "飞翔的大白鹭",
+        "category": "动物",
+        "commons_file": "File:Great egret (great egret (Ardea alba) at Federsee, Germany) at Federsee.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Great_egret_(great_egret_(Ardea_alba)_at_Federsee,_Germany)_at_Federsee.jpg",
+        "author": "Hobbyfotowiki",
+        "license": "CC0",
+        "taken_at": "2024-10-22T14:30:55"
+      },
+      {
+        "title": "黄嘴鹮鹳",
+        "category": "动物",
+        "commons_file": "File:Yellow-billed stork (Mycteria ibis).jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Yellow-billed_stork_(Mycteria_ibis).jpg",
+        "author": "Hobbyfotowiki",
+        "license": "CC0",
+        "taken_at": "2025-01-11T10:22:57"
+      },
+      {
+        "title": "鸵鸟",
+        "category": "动物",
+        "commons_file": "File:Struthio camelus (captive) in Jardim Zoológico de Curitiba.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Struthio_camelus_(captive)_in_Jardim_Zool%C3%B3gico_de_Curitiba.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2025-10-19T12:59:28"
+      },
+      {
+        "title": "圣天使桥黄昏",
+        "category": "城市与建筑",
+        "commons_file": "File:Sant'Angelo bridge, dusk, Rome, Italy.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Sant%27Angelo_bridge,_dusk,_Rome,_Italy.jpg",
+        "author": "Jebulon",
+        "license": "CC0",
+        "taken_at": "2013-08-25T19:54:09"
+      },
+      {
+        "title": "伊瑞克提翁神庙",
+        "category": "城市与建筑",
+        "commons_file": "File:Erechtheum Acropolis Athens.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Erechtheum_Acropolis_Athens.jpg",
+        "author": "Jebulon",
+        "license": "CC0",
+        "taken_at": "2015-10-26T12:23:31"
+      },
+      {
+        "title": "芳堤娜城堡夜景",
+        "category": "城市与建筑",
+        "commons_file": "File:Chateau Frontenac illuminated at night in Quebec City.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Chateau_Frontenac_illuminated_at_night_in_Quebec_City.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2020-06-03T12:00:00"
+      },
+      {
+        "title": "贝尔西桥",
+        "category": "城市与建筑",
+        "commons_file": "File:Pont de Bercy, Paris 23 December 2021.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Pont_de_Bercy,_Paris_23_December_2021.jpg",
+        "author": "Pierre Blaché",
+        "license": "CC0",
+        "taken_at": "2021-12-23T17:25:00"
+      },
+      {
+        "title": "里约热内卢日落",
+        "category": "城市与建筑",
+        "commons_file": "File:Rio de Janeiro skyline and Sugarloaf Mountain at sunset, Brazil 3.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Rio_de_Janeiro_skyline_and_Sugarloaf_Mountain_at_sunset,_Brazil_3.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2023-06-03T14:08:17"
+      },
+      {
+        "title": "雾中的魁北克城",
+        "category": "城市与建筑",
+        "commons_file": "File:Snow-covered Quebec City skyline in fog.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Snow-covered_Quebec_City_skyline_in_fog.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2023-12-06T10:27:17"
+      },
+      {
+        "title": "新天鹅堡",
+        "category": "城市与建筑",
+        "commons_file": "File:Neuschwanstein Castle 2024.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Neuschwanstein_Castle_2024.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2024-02-03T06:13:14"
+      },
+      {
+        "title": "紫菜包饭",
+        "category": "美食",
+        "commons_file": "File:Gimbap (pixabay).jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Gimbap_(pixabay).jpg",
+        "author": "changupn",
+        "license": "CC0",
+        "taken_at": "2014-05-27T15:58:57"
+      },
+      {
+        "title": "巧克力蛋糕",
+        "category": "美食",
+        "commons_file": "File:Piece of chocolate cake on a white plate decorated with chocolate sauce.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Piece_of_chocolate_cake_on_a_white_plate_decorated_with_chocolate_sauce.jpg",
+        "author": "Daria Yakovleva",
+        "license": "CC0",
+        "taken_at": "2017-01-11T12:00:00"
+      },
+      {
+        "title": "水中的辣椒",
+        "category": "美食",
+        "commons_file": "File:Peppers in water.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Peppers_in_water.jpg",
+        "author": "ulleo",
+        "license": "CC0",
+        "taken_at": "2017-07-11T11:00:08"
+      },
+      {
+        "title": "豆蔻面包",
+        "category": "美食",
+        "commons_file": "File:Cardamom buns.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Cardamom_buns.jpg",
+        "author": "W.carter",
+        "license": "CC0",
+        "taken_at": "2017-11-19T16:47:20"
+      },
+      {
+        "title": "蒸芦笋",
+        "category": "美食",
+        "commons_file": "File:Steam-boiling green asparagus.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Steam-boiling_green_asparagus.jpg",
+        "author": "W.carter",
+        "license": "CC0",
+        "taken_at": "2018-05-03T20:47:16"
+      },
+      {
+        "title": "苹果蛋糕配冰淇淋",
+        "category": "美食",
+        "commons_file": "File:Apple cake with vanilla ice cream 2.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Apple_cake_with_vanilla_ice_cream_2.jpg",
+        "author": "W.carter",
+        "license": "CC0",
+        "taken_at": "2020-03-23T18:07:23"
+      },
+      {
+        "title": "木瓜",
+        "category": "美食",
+        "commons_file": "File:Mamões.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Mam%C3%B5es.jpg",
+        "author": "ArionStar",
+        "license": "CC0",
+        "taken_at": "2024-02-01T11:21:48"
+      },
+      {
+        "title": "柑橘",
+        "category": "美食",
+        "commons_file": "File:Laranjas-pera.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Laranjas-pera.jpg",
+        "author": "ArionStar",
+        "license": "CC0",
+        "taken_at": "2024-02-03T08:57:37"
+      },
+      {
+        "title": "水与落叶",
+        "category": "静物",
+        "commons_file": "File:Playing with water, light and leaves.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Playing_with_water,_light_and_leaves.jpg",
+        "author": "Lesekreis",
+        "license": "CC0",
+        "taken_at": "2014-11-25T12:19:16"
+      },
+      {
+        "title": "冰冻的肥皂泡",
+        "category": "静物",
+        "commons_file": "File:Frozen soap bubble behind fir twigs (Unsplash BojuZpqw4zM).jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Frozen_soap_bubble_behind_fir_twigs_(Unsplash_BojuZpqw4zM).jpg",
+        "author": "Aaron Burden",
+        "license": "CC0",
+        "taken_at": "2017-03-16T12:00:00"
+      },
+      {
+        "title": "玉树盆栽",
+        "category": "静物",
+        "commons_file": "File:Among the branches of a potted jade plant.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Among_the_branches_of_a_potted_jade_plant.jpg",
+        "author": "W.carter",
+        "license": "CC0",
+        "taken_at": "2017-10-10T12:24:51"
+      },
+      {
+        "title": "水面上的浮标",
+        "category": "静物",
+        "commons_file": "File:Orange buoy in water.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Orange_buoy_in_water.jpg",
+        "author": "W.carter",
+        "license": "CC0",
+        "taken_at": "2018-06-02T18:48:03"
+      },
+      {
+        "title": "国际象棋",
+        "category": "静物",
+        "commons_file": "File:Chess game Staunton No. 6 perfil view 8.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Chess_game_Staunton_No._6_perfil_view_8.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2024-04-26T13:32:11"
+      },
+      {
+        "title": "托尔卡尔喀斯特地貌",
+        "category": "风景",
+        "commons_file": "File:Rocks El Torcal de Antequera karst Andalusia Spain.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Rocks_El_Torcal_de_Antequera_karst_Andalusia_Spain.jpg",
+        "author": "Jebulon",
+        "license": "CC0",
+        "taken_at": "2012-08-05T11:06:33"
+      },
+      {
+        "title": "阿尔卑斯山间的古堡",
+        "category": "风景",
+        "commons_file": "File:Tschanüff gegen Piz Spadla.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Tschan%C3%BCff_gegen_Piz_Spadla.jpg",
+        "author": "Hermann Hammer",
+        "license": "CC0",
+        "taken_at": "2012-11-02T12:00:00"
+      },
+      {
+        "title": "埃伊纳岛港口",
+        "category": "风景",
+        "commons_file": "File:Aegina sunset.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Aegina_sunset.jpg",
+        "author": "Jebulon",
+        "license": "CC0",
+        "taken_at": "2015-10-27T16:40:28"
+      },
+      {
+        "title": "湖畔山毛榉林",
+        "category": "风景",
+        "commons_file": "File:Trees along the Hald Sø Viborg Commune Danemark.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Trees_along_the_Hald_S%C3%B8_Viborg_Commune_Danemark.jpg",
+        "author": "Jebulon",
+        "license": "CC0",
+        "taken_at": "2016-02-22T15:28:30"
+      },
+      {
+        "title": "德里莫纳瀑布",
+        "category": "风景",
+        "commons_file": "File:Drymona water fall and pool north Euboea Greece.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Drymona_water_fall_and_pool_north_Euboea_Greece.jpg",
+        "author": "Jebulon",
+        "license": "CC0",
+        "taken_at": "2016-04-18T12:00:00"
+      },
+      {
+        "title": "马尔莫拉达峰",
+        "category": "风景",
+        "commons_file": "File:Marmolada, Italy.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Marmolada,_Italy.jpg",
+        "author": "Marco Bonomo",
+        "license": "CC0",
+        "taken_at": "2016-05-05T12:00:00"
+      },
+      {
+        "title": "罗弗敦群岛的极光",
+        "category": "风景",
+        "commons_file": "File:Lofoten, Norway (Unsplash).jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Lofoten,_Norway_(Unsplash).jpg",
+        "author": "Johannes Groll",
+        "license": "CC0",
+        "taken_at": "2017-05-08T12:00:00"
+      },
+      {
+        "title": "山毛榉与蕨类",
+        "category": "风景",
+        "commons_file": "File:Beech and ferns in Gullmarsskogen.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Beech_and_ferns_in_Gullmarsskogen.jpg",
+        "author": "W.carter",
+        "license": "CC0",
+        "taken_at": "2017-06-09T13:43:44"
+      },
+      {
+        "title": "蹄盖蕨",
+        "category": "风景",
+        "commons_file": "File:Lady fern at Myrstigen trail 1.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Lady_fern_at_Myrstigen_trail_1.jpg",
+        "author": "W.carter",
+        "license": "CC0",
+        "taken_at": "2020-05-28T16:23:19"
+      },
+      {
+        "title": "蒙莫朗西瀑布",
+        "category": "风景",
+        "commons_file": "File:Parc de la Chute-Montmorency 001.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Parc_de_la_Chute-Montmorency_001.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2021-04-22T11:28:09"
+      },
+      {
+        "title": "贝尔维尔山谷雪景",
+        "category": "风景",
+        "commons_file": "File:Overview of Les Menuires and the Belleville valley.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Overview_of_Les_Menuires_and_the_Belleville_valley.jpg",
+        "author": "DimiTalen",
+        "license": "CC0",
+        "taken_at": "2022-01-06T10:40:08"
+      },
+      {
+        "title": "雅克-卡蒂埃国家公园",
+        "category": "风景",
+        "commons_file": "File:Parc national de la Jacques-Cartier, Quebec, Canada 22.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Parc_national_de_la_Jacques-Cartier,_Quebec,_Canada_22.jpg",
+        "author": "Wilfredor",
+        "license": "CC0",
+        "taken_at": "2022-08-20T13:51:12"
+      },
+      {
+        "title": "大峡谷南缘日落",
+        "category": "风景",
+        "commons_file": "File:Grand Canyon South Rim at Sunset.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Grand_Canyon_South_Rim_at_Sunset.jpg",
+        "author": "Mgimelfarb",
+        "license": "CC0",
+        "taken_at": "2023-09-25T12:00:00"
+      },
+      {
+        "title": "纪念碑谷全景",
+        "category": "风景",
+        "commons_file": "File:Monument Valley Arizona Panoramic.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Monument_Valley_Arizona_Panoramic.jpg",
+        "author": "Mgimelfarb",
+        "license": "CC0",
+        "taken_at": "2023-09-25T12:00:00"
+      },
+      {
+        "title": "施图拜阿尔卑斯山",
+        "category": "风景",
+        "commons_file": "File:Wetterspitzen (Stubaier Alpen).jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Wetterspitzen_(Stubaier_Alpen).jpg",
+        "author": "Jörg Braukmann",
+        "license": "CC0",
+        "taken_at": "2024-08-12T10:48:29"
+      },
+      {
+        "title": "日落岛与帆船",
+        "category": "风景",
+        "commons_file": "File:Sunset Key and Sailboats, Florida, 2025.jpg",
+        "source_page": "https://commons.wikimedia.org/wiki/File:Sunset_Key_and_Sailboats,_Florida,_2025.jpg",
+        "author": "Julian Lupyan",
+        "license": "CC0",
+        "taken_at": "2025-11-26T16:55:55"
+      }
+    ],
+    "albums": {
+      "_comment": "图片库按 EXIF 拍摄时间按月分组；原图拍摄时间横跨十几年、几乎每月一张，墙面很稀疏。演示站把拍摄时间按分类归到下面的月份（日与时刻保留原值），原始拍摄时间见 taken_at 与 Commons 页面。",
+      "风景": "2026-07",
+      "动物": "2026-06",
+      "静物": "2026-05",
+      "美食": "2026-04",
+      "城市与建筑": "2026-03"
+    }
+  }
+}

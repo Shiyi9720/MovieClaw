@@ -1,0 +1,28 @@
+# MovieClaw 公开演示站的 HTTPS 入口（域名来自 .env 的 DEMO_DOMAIN，证书自动申请）。
+# iOS App 连接公网服务器必须是有效证书的 https 地址。
+{$DEMO_DOMAIN} {
+	# 只压缩文本类响应；视频流与图片本身已压缩，压了只会白费 CPU
+	encode {
+		zstd
+		gzip
+		match {
+			header Content-Type text/*
+			header Content-Type application/json*
+			header Content-Type application/javascript*
+			header Content-Type image/svg+xml*
+		}
+	}
+
+	reverse_proxy movieclaw:3000 {
+		# 取流与 SSE 事件流不缓冲，边收边转
+		flush_interval -1
+	}
+
+	header {
+		# 演示站不希望被搜索引擎当成影视资源站收录
+		X-Robots-Tag "noindex, nofollow"
+		-Server
+	}
+
+	# 刻意不开访问日志：访客 IP 能不留就不留
+}

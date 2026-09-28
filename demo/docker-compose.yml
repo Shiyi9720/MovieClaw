@@ -1,0 +1,66 @@
+# =============================================================================
+# MovieClaw 公开演示站（设计见 docs/design/demo-site.md，部署步骤见 demo/README.md）
+#
+# 本文件与 Caddyfile、reset.sh、accounts.json 一起放在服务器的演示站目录下：
+#   ./data             运行数据（建站后打成 golden-data.tar.gz，每天还原一次）
+#   ./media            demo/fetch_content.py 整理好的影片与图片（只读挂载）
+#   ./accounts.json    登录页公布的演示账号（与建站脚本用的是同一份）
+#   ./.env             DEMO_DOMAIN=演示站域名，MOVIECLAW_DEMO_IMAGE=镜像名
+#
+# 建站时要临时关掉演示模式（只读守卫会拒绝建库、建成员）：
+#   MOVIECLAW_DEMO_MODE=false docker compose up -d movieclaw
+# =============================================================================
+name: movieclaw-demo
+
+services:
+  movieclaw:
+    # 必须用本分支（feat/demo）构建的镜像：官方镜像没有演示模式，
+    # 也没有 iOS App 需要的设备登录接口
+    image: ${MOVIECLAW_DEMO_IMAGE:-movieclaw:demo}
+    container_name: movieclaw-demo
+    init: true
+    restart: unless-stopped
+    ports:
+      # 只给本机：公网流量一律经 Caddy（HTTPS），建站脚本经这个口访问
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./data:/app/data
+      # 只读：即便哪条路漏了，也删不掉、改不了演示内容
+      - ./media:/media:ro
+      - ./accounts.json:/demo/accounts.json:ro
+    environment:
+      - TZ=Asia/Shanghai
+      # 关掉 /docs 与 openapi.json，不向匿名访客暴露完整接口面
+      - APP_ENV=production
+      # 演示模式：全站只读、登录页公布账号、访客之间信息脱敏、应用内更新失效
+      - MOVIECLAW_DEMO_MODE=${MOVIECLAW_DEMO_MODE:-true}
+      - MOVIECLAW_DEMO_ACCOUNTS_FILE=/demo/accounts.json
+      # 公网只走 HTTPS（Caddy 终结 TLS），会话 Cookie 只经 https 传输
+      - SESSION_COOKIE_SECURE=true
+      # 运行日志里有访客 IP：只留 7 天
+      - LOG_RETENTION_DAYS=7
+      # TMDB Key 在构建镜像时已烧入；要换 Key 取消注释：
+      # - TMDB_API_KEY=你的 key
+    # 小机器上给 Caddy 与系统留点余量（按 VPS 规格调整）
+    # mem_limit: 3g
+
+  caddy:
+    image: caddy:2
+    container_name: movieclaw-demo-caddy
+    restart: unless-stopped
+    depends_on:
+      - movieclaw
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      - DEMO_DOMAIN=${DEMO_DOMAIN:?请在 .env 里设置 DEMO_DOMAIN（演示站域名）}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  caddy-data:
+  caddy-config:

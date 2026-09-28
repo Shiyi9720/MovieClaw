@@ -2,14 +2,39 @@ from __future__ import annotations
 
 import hmac
 
-from fastapi import Cookie, Depends, Header
+from fastapi import Cookie, Depends, Header, WebSocketException, status
 from starlette.requests import HTTPConnection
 
 from movieclaw_api.api.client_address import client_address
-from movieclaw_api.exceptions import ForbiddenException, UnauthorizedException
+from movieclaw_api.exceptions import AppException, ForbiddenException, UnauthorizedException
 from movieclaw_api.services import auth as auth_service
+from movieclaw_api.services import demo as demo_service
 from movieclaw_api.services.auth import Principal
 from movieclaw_api.settings.schemas import get_sync_setting
+
+
+async def demo_guard(connection: HTTPConnection) -> None:
+    """公开演示站的只读守卫（docs/design/demo-site.md）：挂在全部业务路由上。
+
+    未开演示模式时直接放行。开了之后按路由的 operation_id 判定：写请求默认
+    拒绝、只放行白名单；少数读接口（目录浏览、日志……）也拒绝。判定表与理由
+    文案都在 services/demo.py，这里只负责把结论变成 403。
+
+    放在路由级依赖而不是 ASGI 中间件：依赖里拿得到已匹配的路由（operation_id
+    是稳定标识，比按路径正则匹配可靠），抛出的业务异常也走统一的错误响应格式。
+    唯一的 WebSocket 路由（转码 Worker 控制面）演示站用不上，直接拒绝握手。
+    """
+    if not demo_service.is_demo_mode():
+        return
+    if connection.scope.get("type") == "websocket":
+        raise WebSocketException(
+            code=status.WS_1008_POLICY_VIOLATION, reason="演示站不支持转码 Worker 接入"
+        )
+    route = connection.scope.get("route")
+    operation_id = getattr(route, "operation_id", None) or ""
+    reason = demo_service.rejection_for(connection.scope.get("method", "GET"), operation_id)
+    if reason is not None:
+        raise AppException(status_code=403, code=demo_service.DEMO_READ_ONLY_CODE, message=reason)
 
 
 def _extract_bearer(authorization: str | None) -> str | None:

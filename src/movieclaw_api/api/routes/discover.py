@@ -36,6 +36,7 @@ from movieclaw_api.schemas.discover import (
     TitleSearchView,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
+from movieclaw_api.services import demo as demo_service
 from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.discover_library import DiscoverLibraryProjectionService
 from movieclaw_api.services.library.access import visible_library_ids
@@ -237,7 +238,9 @@ async def search_titles(
     except (TmdbError, DoubanError) as exc:
         raise _translate(exc) from exc
     history_id = None
-    if payload.save_history:
+    # 公开演示站不落搜索历史：同一个账号被许多访客共用，前一位访客输入的
+    # 文字会出现在下一位的「最近搜索」里（docs/design/demo-site.md）
+    if payload.save_history and not demo_service.is_demo_mode():
         member_id = principal.member_id if principal.member_id is not None else 0
         history_id = await _record_media_history(
             session,

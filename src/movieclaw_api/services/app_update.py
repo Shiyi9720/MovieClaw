@@ -93,7 +93,14 @@ def _updates_dir() -> Path:
 
 
 def _runtime_version() -> int | None:
-    """镜像的运行时版本；非 Docker entrypoint 环境（源码部署/开发）为 None。"""
+    """镜像的运行时版本；非 Docker entrypoint 环境（源码部署/开发）为 None。
+
+    公开演示站同样返回 None，即整个应用内更新（检查、安装、回退、模型更新）
+    都不适用：演示站固定跑它构建时的那份代码，一旦被更新成正式版，只读守卫
+    就随之消失（docs/design/demo-site.md）。
+    """
+    if get_settings().demo_mode:
+        return None
     raw = os.environ.get("MOVIECLAW_RUNTIME_VERSION", "")
     return int(raw) if raw.isdigit() else None
 

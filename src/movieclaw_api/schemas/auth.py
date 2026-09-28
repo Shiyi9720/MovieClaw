@@ -10,10 +10,29 @@ from pydantic import Field
 from movieclaw_api.schemas.base import BaseModel
 
 
+class DemoAccountView(BaseModel):
+    """公开演示站在登录页公布的一个账号（docs/design/demo-site.md）。"""
+
+    username: str
+    password: str
+    label: str = Field(description="角色名，如「超级管理员」「家庭成员」")
+    description: str = Field(default="", description="一句话说明这个角色能看到什么")
+
+
+class DemoSiteView(BaseModel):
+    """公开演示站的说明：登录页据此展示只读提示与可一键填入的账号。"""
+
+    notice: str = Field(default="", description="演示站说明（内容来源、只读、定时还原等）")
+    accounts: list[DemoAccountView] = Field(default_factory=list)
+
+
 class BootstrapStatus(BaseModel):
     """首次初始化状态：前端据此决定进引导页（/setup）还是登录页（/login）。"""
 
     initialized: bool
+    demo: DemoSiteView | None = Field(
+        default=None, description="公开演示站模式下的说明与演示账号；正常部署恒为空"
+    )
 
 
 class BootstrapRequest(BaseModel):
@@ -101,6 +120,12 @@ class SessionView(BaseModel):
     device: DeviceBrief | None = Field(
         default=None,
         description="本次请求所用的登录设备；升级前签发的旧网页会话为空",
+    )
+    # 声明成可空只为生成的 iOS 模型是可选字段（apps/apple/scripts/gen_api.py 按可空性
+    # 定可选）：App 连没有这个字段的老服务器时解码不能失败。服务端恒输出 true / false
+    demo: bool | None = Field(
+        default=False,
+        description="是否是公开演示站（全站只读）：客户端据此隐藏演示站不开放的入口",
     )
 
 

@@ -507,6 +507,8 @@ function NicknameRow() {
  * 没有这类设备时不出现勾选项：没东西可注销，多一个选项只会让人犹豫。
  */
 function ChangePasswordCard() {
+  // 公开演示站的账号是大家共用的，改密码会把其他访客锁在门外，服务端也会拒绝
+  const demo = useSession().session.demo === true;
   const [oldPassword, setOldPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -570,6 +572,14 @@ function ChangePasswordCard() {
       />
     </div>
   );
+
+  if (demo) {
+    return (
+      <div className="css-glass !rounded-2xl p-5 text-sub text-[var(--text-muted)]">
+        这是公开演示站：演示账号由所有访客共用，密码不能修改。
+      </div>
+    );
+  }
 
   return (
     <div className="css-glass space-y-4 !rounded-2xl p-5">

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Header, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_agent import (
@@ -43,6 +44,8 @@ from movieclaw_api.schemas.agent import (
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services import auth as auth_service
+from movieclaw_api.services import demo as demo_service
+from movieclaw_api.services import demo_agent
 from movieclaw_api.services.agent_attachments import (
     MAX_IMAGE_BYTES,
     compose_user_content,
@@ -65,6 +68,7 @@ from movieclaw_api.services.llm_config import acquire_llm_router
 from movieclaw_api.services.mclaw_tool import render_service_map
 from movieclaw_api.settings import AppServerSetting, get_setting_store
 from movieclaw_db.engine import get_session
+from movieclaw_db.models.agent_session import AgentSession
 from movieclaw_db.repositories.agent_session_repo import (
     AgentSessionRepository,
     is_running,
@@ -224,6 +228,12 @@ async def _cli_env(session_id: str) -> dict[str, str]:
     }
 
 
+def _ensure_demo_visible(session_id: str, identity: Principal) -> None:
+    """演示站：会话按登录设备隔离（services/demo_agent.py），别人的会话一律当不存在。"""
+    if demo_service.is_demo_mode() and not demo_agent.is_visible(session_id, identity):
+        raise NotFoundException("Agent 会话不存在")
+
+
 async def _accept_user_message(
     payload: SessionStartPayload,
     identity: Principal,
@@ -246,10 +256,12 @@ async def _accept_user_message(
     # 先组装路由器：内部会校验模型供应商是否已配置，未配置时抛 404。必须在任何
     # 会话记录落盘（转录文件 / 索引行）之前完成——否则校验失败时，前端虽然收到
     # 正确的错误提示，磁盘上却已残留一条空会话，下次刷新侧栏会冒出来。
-    llm_router = await acquire_llm_router(session)
+    demo = demo_service.is_demo_mode()
+    llm_router = demo_agent.router() if demo else await acquire_llm_router(session)
 
     if payload.session_id:
         session_id = payload.session_id
+        _ensure_demo_visible(session_id, identity)
         row = await repo.get(session_id)
         if row is None:
             raise NotFoundException("Agent 会话不存在")
@@ -276,6 +288,8 @@ async def _accept_user_message(
         header = store.create()
         session_id = header.session_id
         await repo.create(session_id, title=None)
+        if demo:
+            demo_agent.claim(session_id, identity)
         history = []
         existing_entries = []
         entry_count = 0
@@ -301,6 +315,9 @@ async def _accept_user_message(
         history=history,
         entry_count=entry_count,
         llm_router=llm_router,
+        # 演示站只挂卡片与只读查库两个工具，不给 bash / 真命令行
+        tools=demo_agent.tools() if demo else None,
+        system_prompt=demo_agent.SYSTEM_PROMPT if demo else None,
     )
 
 
@@ -499,6 +516,7 @@ async def download_session_attachment(
 async def list_sessions(
     limit: int = Query(default=50, description="返回条数上限"),
     offset: int = Query(default=0, description="分页偏移（跳过前 N 条）"),
+    identity: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[SessionSummary]]:
     """按最近活动时间倒序分页返回会话摘要。
@@ -506,6 +524,19 @@ async def list_sessions(
     ``running`` 表示当前是否有消息正在处理；``entry_count`` 同时统计 message
     与 compaction。最多返回 200 条，公开协议不披露内部运行编号。
     """
+    if demo_service.is_demo_mode():
+        # 演示站：先给这台设备补齐预置对话，再只列它自己看得见的会话
+        await demo_agent.ensure_device_sessions(identity)
+        rows = (
+            await session.execute(
+                select(AgentSession)
+                .where(AgentSession.id.in_(demo_agent.visible_ids(identity)))
+                .order_by(AgentSession.updated_at.desc(), AgentSession.created_at.desc())
+                .offset(max(offset, 0))
+                .limit(min(limit, 200))
+            )
+        ).scalars()
+        return ok([SessionSummary.from_model(row) for row in rows])
     rows = await AgentSessionRepository(session).list_recent(
         limit=min(limit, 200), offset=max(offset, 0)
     )
@@ -520,6 +551,7 @@ async def list_sessions(
 )
 async def get_session_transcript(
     session_id: str,
+    identity: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SessionTranscriptView]:
     """一次返回按写入顺序排列的完整 message/compaction 轨迹。
@@ -529,6 +561,7 @@ async def get_session_transcript(
     handoff 记录只带来源信息，继承上下文的快照不在此重复下发（见
     ``SessionHandoffEntryView.replacement_history``）。
     """
+    _ensure_demo_visible(session_id, identity)
     row = await AgentSessionRepository(session).get(session_id)
     if row is None:
         raise NotFoundException("Agent 会话不存在")
@@ -764,6 +797,7 @@ async def retry_session_message(
     if identity.kind == "agent":
         raise BadRequestException("Agent 工作区内不能再发起新的 Agent 运行（禁止递归）")
 
+    _ensure_demo_visible(session_id, identity)
     store = get_agent_session_store()
     repo = AgentSessionRepository(session)
     row = await repo.get(session_id)
@@ -800,9 +834,14 @@ async def retry_session_message(
     model = _resolve_model_choice(payload.model, target.model)
 
     # 供应商校验和运行所需上下文在删除轨迹前准备完成；下面才进入不可逆阶段。
-    llm_router = await acquire_llm_router(session)
-    system_prompt = await _agent_system_prompt()
-    tools = get_agent_tools(await _cli_env(session_id), generative_ui=True)
+    if demo_service.is_demo_mode():
+        llm_router: LlmRouter = demo_agent.router()
+        system_prompt = demo_agent.SYSTEM_PROMPT
+        tools = demo_agent.tools()
+    else:
+        llm_router = await acquire_llm_router(session)
+        system_prompt = await _agent_system_prompt()
+        tools = get_agent_tools(await _cli_env(session_id), generative_ui=True)
 
     store.discard_from_user_message(session_id, payload.message_id)
     # 重试路径同款兜底：截断后若仍残留未配对的工具调用（上次异常停机遗留），
@@ -870,6 +909,7 @@ async def delete_session(
 async def follow_session(
     session_id: str,
     last_event_id: int | None = Header(default=None, alias="Last-Event-ID"),
+    identity: Principal = Depends(require_login),
 ) -> StreamingResponse:
     """跟随会话当前或进程内保留的最近一次消息处理，直到运行进入终态。
 
@@ -878,6 +918,7 @@ async def follow_session(
     最后已处理的 id，只接收缺失事件。心跳不进入事件日志，也不推进游标。
     没有当前或尚在保留期内的最近一次处理时返回 404；持久记录应读取完整轨迹。
     """
+    _ensure_demo_visible(session_id, identity)
     registry = get_agent_run_registry()
     cursor = last_event_id or 0
     # 在 StreamingResponse 建立前完成存在性和游标校验，确保 404/400 仍能以
@@ -941,5 +982,6 @@ async def stop_session(
     """
     if identity.kind == "agent" and identity.agent_session_id == session_id:
         raise BadRequestException("当前 Agent 不能停止承载自己的会话")
+    _ensure_demo_visible(session_id, identity)
     await get_agent_run_registry().cancel_session(session_id)
     return ok({}, message="已请求停止会话")

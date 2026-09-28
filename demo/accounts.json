@@ -1,0 +1,76 @@
+{
+  "_comment": "演示站账号（docs/design/demo-site.md）。notice 与 accounts 由服务端读取、公布在登录页（MOVIECLAW_DEMO_ACCOUNTS_FILE 指向本文件）；members 只给 provision.py 建成员用。这些密码本来就是公开的，改了要同步重新建站。",
+  "notice": "这是 MovieClaw 的公开演示站：影片与图片均为开放授权作品（CC BY / CC0），全站只读，数据每天自动还原。",
+  "accounts": [
+    {
+      "username": "admin",
+      "password": "movieclaw",
+      "role": "admin",
+      "label": "超级管理员",
+      "description": "能看到全部管理功能（成员、媒体库、设置），所有修改都会被拒绝"
+    },
+    {
+      "username": "family",
+      "password": "movieclaw",
+      "role": "member",
+      "label": "家庭成员",
+      "description": "看得到全部媒体库，能点「订阅」（演示站不会真的下载）"
+    },
+    {
+      "username": "kids",
+      "password": "movieclaw",
+      "role": "member",
+      "label": "小朋友",
+      "description": "只看得到「动画短片」和「图片」，内容分级不超过 7 岁"
+    },
+    {
+      "username": "guest",
+      "password": "movieclaw",
+      "role": "member",
+      "label": "朋友",
+      "description": "只看得到「电影」，没有订阅入口"
+    }
+  ],
+  "admin": {
+    "nickname": "演示管理员"
+  },
+  "members": [
+    {
+      "username": "family",
+      "nickname": "家人",
+      "allow_subscribe": true,
+      "allow_search": false,
+      "allow_direct_download": false
+    },
+    {
+      "username": "kids",
+      "nickname": "小朋友",
+      "allow_subscribe": false,
+      "allow_search": false,
+      "allow_direct_download": false,
+      "libraries": [
+        "动画短片",
+        "图片"
+      ],
+      "content_age_limit": 7,
+      "allow_unrated": true
+    },
+    {
+      "username": "guest",
+      "nickname": "朋友",
+      "allow_subscribe": false,
+      "allow_search": false,
+      "allow_direct_download": false,
+      "libraries": [
+        "电影"
+      ]
+    },
+    {
+      "username": "former",
+      "password": "former-member-2026",
+      "nickname": "已停用的成员",
+      "allow_subscribe": false,
+      "enabled": false
+    }
+  ]
+}
