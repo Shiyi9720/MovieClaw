@@ -94,6 +94,10 @@ final class SourceByteCache: @unchecked Sendable {
         let indexPath: String?
         var contentLength: Int64?
         var blocks: [Int64: Block] = [:]
+        /// [MovieClaw P50] 每块另记的一段（与 `blocks` 那段不相连、数据已经写进文件），只在内存里：
+        /// 尾部预读先占了块尾，moov / 索引再从块中间顺序写过来时，原来每一小段都因「比已记的短」被丢账，
+        /// 下次打开整块得重下。暂记在这里，长到与主段相接就并进去，比主段长就互换
+        var spare: [Int64: (lo: Int64, hi: Int64)] = [:]
         /// [MovieClaw P42] 记账有没落盘的变化、是否已排了落盘
         var indexDirty = false
         var indexFlushScheduled = false
@@ -263,20 +267,33 @@ final class SourceByteCache: @unchecked Sendable {
         while cursor < end {
             let index = cursor / Self.blockSize
             let blockEnd = min(end, (index + 1) * Self.blockSize)
-            let before = entry.blocks[index].map { $0.hi - $0.lo } ?? 0
-            if var block = entry.blocks[index], cursor <= block.hi, blockEnd >= block.lo {
-                block.lo = min(block.lo, cursor)
-                block.hi = max(block.hi, blockEnd)
-                block.lastUse = useClock
-                entry.blocks[index] = block
-            } else if (entry.blocks[index].map { blockEnd - cursor >= $0.hi - $0.lo } ?? true) {
-                // 与已有覆盖不相连：留长的那段
-                entry.blocks[index] = Block(lo: cursor, hi: blockEnd, lastUse: useClock)
+            let before = coveredLocked(entry, block: index)
+            // [MovieClaw P50] 新写的这段、已记的主段、暂记的另一段：相接或重叠的并成一段，最长的当主段（读、落盘都只认它），
+            // 次长的留作暂记，再短的丢账（数据还在文件里，只是不认）
+            var ranges: [(lo: Int64, hi: Int64)] = [(cursor, blockEnd)]
+            if let block = entry.blocks[index] { ranges.append((block.lo, block.hi)) }
+            if let spare = entry.spare[index] { ranges.append(spare) }
+            ranges.sort { $0.lo < $1.lo }
+            var merged: [(lo: Int64, hi: Int64)] = []
+            for range in ranges {
+                if let last = merged.last, range.lo <= last.hi {
+                    merged[merged.count - 1].hi = max(last.hi, range.hi)
+                } else {
+                    merged.append(range)
+                }
             }
-            totalBytes += (entry.blocks[index].map { $0.hi - $0.lo } ?? 0) - before
+            merged.sort { $0.hi - $0.lo > $1.hi - $1.lo }
+            entry.blocks[index] = Block(lo: merged[0].lo, hi: merged[0].hi, lastUse: useClock)
+            entry.spare[index] = merged.count > 1 && AetherEngine.sourceByteCacheKeepsSpareRuns ? merged[1] : nil
+            totalBytes += coveredLocked(entry, block: index) - before
             cursor = blockEnd
         }
         markIndexDirtyLocked(entry)
+    }
+
+    /// [MovieClaw P50] 这一块记着的字节（主段加暂记的一段），算预算用。调用方持锁
+    private func coveredLocked(_ entry: Entry, block index: Int64) -> Int64 {
+        (entry.blocks[index].map { $0.hi - $0.lo } ?? 0) + (entry.spare[index].map { $0.hi - $0.lo } ?? 0)
     }
 
     /// 从 `offset` 起有多少连续缓存就读多少（至多 `maxLen`），返回读到的字节数；0 = 没有
@@ -581,6 +598,7 @@ final class SourceByteCache: @unchecked Sendable {
     private func dropLocked(_ key: String) {
         guard let entry = entries.removeValue(forKey: key) else { return }
         totalBytes -= entry.blocks.values.reduce(0) { $0 + ($1.hi - $1.lo) }
+        totalBytes -= entry.spare.values.reduce(0) { $0 + ($1.hi - $1.lo) }   // [MovieClaw P50]
     }
 
     private func contiguousEndLocked(_ entry: Entry, from offset: Int64) -> Int64 {
@@ -670,7 +688,7 @@ final class SourceByteCache: @unchecked Sendable {
             for (index, block) in entry.blocks {
                 if isPinnedLocked(entry, block: index) {
                     pinned.append((key, index, block.lastUse))
-                    pinnedBytes += block.hi - block.lo
+                    pinnedBytes += coveredLocked(entry, block: index)
                 } else {
                     normal.append((key, index, block.lastUse))
                 }
@@ -683,7 +701,9 @@ final class SourceByteCache: @unchecked Sendable {
             guard let entry = entries[candidate.key], let block = entry.blocks.removeValue(forKey: candidate.index) else {
                 return 0
             }
-            let freed = block.hi - block.lo
+            // [MovieClaw P50] 打洞是整块打的：暂记的那段一起没了
+            let spare = entry.spare.removeValue(forKey: candidate.index)
+            let freed = block.hi - block.lo + (spare.map { $0.hi - $0.lo } ?? 0)
             totalBytes -= freed
             eviction.holes.append((entry, candidate.index * Self.blockSize))
             touched[ObjectIdentifier(entry)] = entry
@@ -727,6 +747,15 @@ extension AetherEngine {
     /// [MovieClaw P42] 片源字节缓存跨启动保留（默认开）。只在共享实例第一次用到之前改才有效（宿主在建第一个引擎前设），
     /// 真机新旧对照用
     nonisolated(unsafe) public static var persistsSourceByteCache = true
+
+    /// [MovieClaw P50] 片源字节缓存每块另记一段暂存范围（默认开，见 `SourceByteCache.recordWriteLocked`）。关掉即每块只记一段
+    /// （P50 之前的行为），真机新旧对照用
+    nonisolated(unsafe) public static var sourceByteCacheKeepsSpareRuns = true
+
+    /// [MovieClaw P50] 删掉跨启动保留的片源字节缓存（整个目录）。只能在共享实例第一次用到之前调，真机对照每次热身前清场用
+    nonisolated public static func removePersistedSourceByteCache() {
+        try? FileManager.default.removeItem(at: SourceByteCache.persistentRoot)
+    }
 
     /// [MovieClaw P32] 片源字节缓存的写盘与淘汰是否放在后台串行队列（默认开）。宿主在真机上做新旧对照时可关掉
     public static var sourceByteCacheWritesInBackground: Bool {

@@ -97,6 +97,10 @@ final class NativeEngine: NSObject, PlayerEngine {
         // -mcNoPersistentByteCache YES：片源字节缓存不跨启动保留（引擎补丁 P42 之前的行为，真机新旧对照用）。
         // 必须在下面任何一个碰到片源字节缓存的设置之前（共享缓存第一次用到时就按这个开关建好了）
         if UserDefaults.standard.bool(forKey: "mcNoPersistentByteCache") { AetherPlayback.setPersistsSourceCache(false) }
+        // -mcPurgeByteCache YES：先删掉跨启动保留的片源字节缓存（实验台每次热身前清场，免得对照两组互相沾光）
+        if UserDefaults.standard.bool(forKey: "mcPurgeByteCache") { AetherPlayback.removePersistedSourceCache() }
+        // -mcNoSpareRuns YES：片源字节缓存每块只记一段（引擎补丁 P50 之前的行为，真机新旧对照用）
+        AetherPlayback.setSourceCacheKeepsSpareRuns(!UserDefaults.standard.bool(forKey: "mcNoSpareRuns"))
         // -mcAetherCues YES：把文字字幕与 ASS 定位打到控制台
         AetherPlayback.logsCues = UserDefaults.standard.bool(forKey: "mcAetherCues")
         // -mcSyncByteCache YES：片源字节缓存改回在取数线程上同步写盘（引擎补丁 P32 之前的行为，真机新旧对照用）
@@ -112,6 +116,8 @@ final class NativeEngine: NSObject, PlayerEngine {
         }
         // -mcCuePrewarmMiddle YES：MKV 索引预热照旧跳到片中间（引擎补丁 P45 之前的行为，真机新旧对照用）
         AetherPlayback.setCuePrewarmTargetsStart(!UserDefaults.standard.bool(forKey: "mcCuePrewarmMiddle"))
+        // -mcNoCuesPrefetch YES：MKV 索引照旧由解复用器按需读（引擎补丁 P49 之前的行为，真机新旧对照用）
+        AetherPlayback.setPrefetchesMatroskaCues(!UserDefaults.standard.bool(forKey: "mcNoCuesPrefetch"))
         // -mcWitnessInterval <秒>：起播 / 跳转后看缓冲过没过开播线的间隔（引擎补丁 P28，默认 0.025，原来 0.1；真机对照用）
         let witness = UserDefaults.standard.double(forKey: "mcWitnessInterval")
         if witness > 0 { AetherPlayback.vodStartWitnessIntervalSeconds = witness }

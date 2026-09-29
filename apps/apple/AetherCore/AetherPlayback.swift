@@ -210,6 +210,11 @@ public final class AetherPlayback {
         AetherEngine.preconnect(url: url, httpHeaders: headers)
     }
 
+    /// MKV 文件头一到就按 SeekHead 把索引（Cues）先取回来（引擎补丁 P49，默认开；真机新旧对照时关掉）
+    public static func setPrefetchesMatroskaCues(_ on: Bool) {
+        AetherEngine.prefetchesMatroskaCues = on
+    }
+
     /// MKV 索引预热是否跳到起播点（引擎补丁 P45，默认开；关掉即上游的跳到片中间，真机新旧对照用）
     public static func setCuePrewarmTargetsStart(_ on: Bool) {
         AetherEngine.cuePrewarmTargetsStart = on
@@ -644,6 +649,16 @@ public final class AetherPlayback {
     /// 片源字节缓存是否跨启动保留（引擎补丁 P42，默认开）。要在建第一个引擎之前设，真机新旧对照用
     public nonisolated static func setPersistsSourceCache(_ on: Bool) {
         AetherEngine.persistsSourceByteCache = on
+    }
+
+    /// 片源字节缓存每块另记一段暂存范围（引擎补丁 P50，默认开）。真机新旧对照用
+    public nonisolated static func setSourceCacheKeepsSpareRuns(_ on: Bool) {
+        AetherEngine.sourceByteCacheKeepsSpareRuns = on
+    }
+
+    /// 删掉跨启动保留的片源字节缓存（引擎补丁 P50）：只能在建第一个引擎之前调，真机对照每次热身前清场用
+    public nonisolated static func removePersistedSourceCache() {
+        AetherEngine.removePersistedSourceByteCache()
     }
 
     /// 片源字节缓存的记账立刻落盘（引擎补丁 P42）：App 进后台时调，下次启动续播认得最后几秒下过的字节

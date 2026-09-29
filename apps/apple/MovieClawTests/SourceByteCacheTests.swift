@@ -208,6 +208,59 @@ struct SourceByteCacheTests {
         return dir
     }
 
+    /// [MovieClaw P50] 尾部预读先写了文件最后 64 KB，moov / 索引再从最后一块的中间顺序写过来：原来每一小段都
+    /// 「比已记的短」被丢账，下次打开整块重下（真机 12 部里 7 部）。现在暂记着，接上尾部那段就并成一整段
+    @Test func tailFirstThenSequentialStreamKeepsTheWholeBlock() {
+        let dir = persistentDir()
+        let key = "file-9-\(UUID())"
+        let length = Int64(block) * 3 + 700_000
+        let lastBlock = Int64(block) * 3
+        let tail = bytes(65_536, seed: 21)
+        let previous = SourceByteCache(budgetBytes: 64 << 20, persistentDirectory: dir)
+        previous.noteContentLength(key: key, length: length)
+        previous.write(key: key, offset: length - 65_536, data: tail)
+        // moov 从块中间某处（离文件尾 60 万字节）起，按 16 KB 一小段顺序写到文件尾
+        let moovStart = length - 600_000
+        let moov = bytes(600_000, seed: 22)
+        var offset = 0
+        while offset < moov.count {
+            let size = min(16_384, moov.count - offset)
+            previous.write(key: key, offset: moovStart + Int64(offset), data: moov.subdata(in: offset ..< offset + size))
+            offset += size
+        }
+        #expect(previous.contiguousEnd(key: key, from: moovStart) == length)
+        #expect(read(previous, key, at: moovStart, max: moov.count) == moov)
+        // 预算只算一次：并起来的一段，不重复计
+        #expect(previous.cachedBytes == 600_000)
+        // 跨启动也完整（落盘的只有主段，并完就是整段）
+        previous.flushIndexes()
+        previous.drain()
+        let next = SourceByteCache(budgetBytes: 64 << 20, persistentDirectory: dir)
+        #expect(next.contiguousEnd(key: key, from: moovStart) == length)
+        #expect(read(next, key, at: moovStart, max: moov.count) == moov)
+        #expect(next.contiguousEnd(key: key, from: lastBlock) == lastBlock)   // 块头那段从没写过
+        withExtendedLifetime(previous) {}
+    }
+
+    /// [MovieClaw P50] 同一块里两段一直没接上：读只认长的那段，暂记的那段算进预算，整块淘汰时一起扣掉
+    @Test func spareRunIsAccountedAndEvictedWithItsBlock() {
+        let cache = SourceByteCache(budgetBytes: Int64(block) * 4)
+        let key = "t-\(UUID())"
+        cache.write(key: key, offset: 0, data: bytes(300_000, seed: 31))
+        cache.write(key: key, offset: 500_000, data: bytes(100_000, seed: 32))
+        #expect(cache.contiguousEnd(key: key, from: 0) == 300_000)
+        #expect(cache.contiguousEnd(key: key, from: 500_000) == 500_000)   // 暂记的不给读
+        #expect(cache.cachedBytes == 400_000)
+        // 再写 6 块把第 0 块挤掉：两段一起扣
+        for index in 1 ... 6 {
+            cache.write(key: key, offset: Int64(block) * Int64(index), data: bytes(block, seed: UInt8(index)))
+        }
+        #expect(cache.contiguousEnd(key: key, from: 0) == 0)
+        #expect(cache.cachedBytes <= Int64(block) * 4)
+        #expect(cache.cachedBytes % Int64(block) == 0)
+        cache.purgeAll()
+    }
+
     @Test func survivesRelaunch() {
         // 上一场下过的文件头、大小，下一场（新实例 = App 重启）原样拿到，一个请求都不用发
         let dir = persistentDir()

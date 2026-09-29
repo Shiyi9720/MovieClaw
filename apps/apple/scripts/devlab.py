@@ -27,6 +27,10 @@ HERE = os.path.expanduser(
 LONG = "14:+10,22:+600,32:-5,40:300,48:+20"
 SHORT = "14:+10,22:+120,32:-5,40:60,48:+20"
 DEVICE = os.environ.get("MC_DEVICE", "")  # 真机 UDID：xcrun devicectl list devices
+# App 启动后多久打开播放器（秒）。要让启动后的空闲预热先跑完时调大（MC_ROUTE_DELAY=6），每部片的时长跟着加
+ROUTE_DELAY = float(os.environ.get("MC_ROUTE_DELAY", "2"))
+ROUTE_FIRST = os.environ.get("MC_ROUTE_FIRST", "")
+ROUTE_THEN_DELAY = float(os.environ.get("MC_ROUTE_THEN_DELAY", "3"))
 # report 经 SSH 在 NAS 的 movieclaw 容器里只读查播放记录（MC_NAS_SSH，默认 root@192.168.1.10）
 CORPUS_FILE = os.path.expanduser(
     os.environ.get("MC_LAB_CORPUS", "~/.config/movieclaw/devlab-corpus.json")
@@ -84,10 +88,21 @@ def run_one(batch, name, extra=(), tag=None, seconds=66, close_at=56, at="keep",
         "YES",
         "-mcFrameStatsEverySecond",
         "YES",
-        "-mcRoute",
-        route,
+        # MC_ROUTE_FIRST=/library：先开这个页面，停 MC_ROUTE_THEN_DELAY 秒（默认 3）再开播放页（量页面上的预连）
+        *(
+            [
+                "-mcRoute",
+                ROUTE_FIRST,
+                "-mcRouteThen",
+                route,
+                "-mcRouteThenDelay",
+                str(ROUTE_THEN_DELAY),
+            ]
+            if ROUTE_FIRST
+            else ["-mcRoute", route]
+        ),
         "-mcRouteDelay",
-        "2",
+        str(ROUTE_DELAY),
         *(["-mcAutoSeek", plan] if seek else []),
         "-mcLab",
         f"devlab-{batch}:{tag}",
@@ -97,7 +112,9 @@ def run_one(batch, name, extra=(), tag=None, seconds=66, close_at=56, at="keep",
     for _ in range(2):
         with open(path, "w") as log:
             p = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
-            time.sleep(seconds)
+            time.sleep(
+                seconds + max(0.0, ROUTE_DELAY - 2) + (ROUTE_THEN_DELAY if ROUTE_FIRST else 0)
+            )
             p.kill()
             p.wait()
         t = Path(path).read_text(encoding="utf-8", errors="replace")
@@ -346,7 +363,13 @@ def main():
                     run_one(
                         batch,
                         t,
-                        arms[a],
+                        # MC_PURGE_WARMUP=1：热身前清空跨启动缓存，每组都从零开始填（比较缓存记法本身时用，免得两组互相沾光）
+                        arms[a]
+                        + (
+                            ["-mcPurgeByteCache", "YES"]
+                            if os.environ.get("MC_PURGE_WARMUP") == "1"
+                            else []
+                        ),
                         tag=f"{t}@{a}@r{r}w",
                         seconds=18,
                         close_at=12,
