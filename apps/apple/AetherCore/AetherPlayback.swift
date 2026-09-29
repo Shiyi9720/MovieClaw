@@ -656,6 +656,11 @@ public final class AetherPlayback {
         AetherEngine.sourceByteCacheKeepsSpareRuns = on
     }
 
+    /// 启动整理跨启动缓存超额时先缩到只剩文件头尾的元数据、缩完仍超才整条删（引擎补丁 P51，默认开）。真机新旧对照用
+    public nonisolated static func setSourceCacheTrimKeepsMetadata(_ on: Bool) {
+        AetherEngine.sourceByteCacheTrimKeepsMetadata = on
+    }
+
     /// 删掉跨启动保留的片源字节缓存（引擎补丁 P50）：只能在建第一个引擎之前调，真机对照每次热身前清场用
     public nonisolated static func removePersistedSourceCache() {
         AetherEngine.removePersistedSourceByteCache()

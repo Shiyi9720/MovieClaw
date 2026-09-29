@@ -440,11 +440,73 @@ final class SourceByteCache: @unchecked Sendable {
         }
         var total = complete.reduce(0) { $0 + $1.bytes }
         let budget = persistedBudgetBytes
-        for item in complete.sorted(by: { $0.usedAt < $1.usedAt }) where total > budget {
+        // [MovieClaw P51] 超了保留上限：先从旧到新把每份缩到只剩元数据区（P46 的文件头 8 MiB、文件尾 32 MiB——moov、Cues、
+        // SeekHead 所在，续播一打开就要读），缩完仍超才从旧到新整条删。原来直接整条删：看一会儿高码率片缓存就涨到几百 MB，
+        // 超过上限（运行预算的一半，至多 512 MiB），下次启动这一份——正是要续播的那部——连头尾一起没了，续播又得全部重下
+        // （真机：4K60 片热身 18 秒写了 398 MB，下次启动整理赶在装载之前跑完就整条删掉，开容器重下 10 MB 的 moov，415 毫秒）
+        complete.sort { $0.usedAt < $1.usedAt }
+        let before = total
+        var shrunk = 0, dropped = 0
+        if total > budget, AetherEngine.sourceByteCacheTrimKeepsMetadata {
+            for i in complete.indices where total > budget {
+                guard let after = shrinkIfNotLive(
+                    bin: dir.appendingPathComponent(complete[i].stem + ".bin").path,
+                    idx: dir.appendingPathComponent(complete[i].stem + ".idx").path,
+                    usedAt: complete[i].usedAt) else { continue }
+                total -= complete[i].bytes - after
+                complete[i].bytes = after
+                shrunk += 1
+            }
+        }
+        for item in complete where total > budget {
             unlink(dir.appendingPathComponent(item.stem + ".bin").path)
             unlink(dir.appendingPathComponent(item.stem + ".idx").path)
             total -= item.bytes
+            dropped += 1
         }
+        if shrunk + dropped > 0 {
+            EngineLog.emit(
+                "[SourceByteCache] [MovieClaw P51] 启动整理：跨启动缓存 \(before >> 20) MB 超过上限 \(budget >> 20) MB，"
+                + "\(shrunk) 份缩到只剩文件头尾、\(dropped) 份整条删，剩 \(total >> 20) MB", category: .demux)
+        }
+    }
+
+    /// [MovieClaw P51] 持锁缩：装载时的恢复（`restoreLocked`）也在这把锁里，两者不会交错——先缩完的，恢复读到的就是缩过的
+    /// 记账；先恢复的，这里看到它已经开着就不动。不能只靠开头取的「正开着」快照：整理在后台线程上跑，与第一次装载几乎同时，
+    /// 恢复要是落在快照之后、打洞之前，恢复出来的那份会把刚打成洞的块当成数据，读出全零（整条删没有这个问题：已打开的文件删了照样能读）
+    private func shrinkIfNotLive(bin: String, idx: String, usedAt: Date) -> Int64? {
+        lock.lock(); defer { lock.unlock() }
+        guard !entries.values.contains(where: { $0.path == bin }) else { return nil }
+        return Self.shrinkToMetadata(bin: bin, idx: idx, usedAt: usedAt)
+    }
+
+    /// [MovieClaw P51] 把一份跨启动缓存缩到只剩元数据区的块：先写缩过的记账（保留原来的修改时间，新旧次序不变），
+    /// 再给丢掉的块打洞——同淘汰，记账先于打洞，进程在中间被杀也只是少认几块。返回缩完的实际占用；
+    /// 记账读不出、不知道文件大小（算不出文件尾）、本来就只有元数据区的，返回 nil 不动
+    private static func shrinkToMetadata(bin: String, idx: String, usedAt: Date) -> Int64? {
+        guard let data = FileManager.default.contents(atPath: idx),
+              var file = try? JSONDecoder().decode(IndexFile.self, from: data), file.version == 1,
+              let length = file.contentLength, length > 0 else { return nil }
+        func isMetadata(_ row: [Int64]) -> Bool {
+            guard row.count == 4 else { return false }
+            return row[0] * blockSize < pinnedHeadBytes || (row[0] + 1) * blockSize > length - pinnedTailBytes
+        }
+        let dropped = file.blocks.filter { !isMetadata($0) }
+        guard !dropped.isEmpty else { return nil }
+        file.blocks = file.blocks.filter(isMetadata)
+        guard let encoded = try? JSONEncoder().encode(file) else { return nil }
+        writeIndex(encoded, to: idx)
+        try? FileManager.default.setAttributes([.modificationDate: usedAt], ofItemAtPath: idx)
+        let fd = open(bin, O_RDWR)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        for row in dropped where row.count == 4 && row[0] >= 0 {
+            var range = fpunchhole_t(fp_flags: 0, reserved: 0, fp_offset: off_t(row[0] * blockSize),
+                                     fp_length: off_t(blockSize))
+            _ = fcntl(fd, F_PUNCHHOLE, &range)
+        }
+        var info = stat()
+        return fstat(fd, &info) == 0 ? Int64(info.st_blocks) * 512 : nil
     }
 
     /// 把还没落盘的记账都写下去（宿主在 App 进后台时调）。在后台队列上排队，排在已交出的写入之后
@@ -751,6 +813,10 @@ extension AetherEngine {
     /// [MovieClaw P50] 片源字节缓存每块另记一段暂存范围（默认开，见 `SourceByteCache.recordWriteLocked`）。关掉即每块只记一段
     /// （P50 之前的行为），真机新旧对照用
     nonisolated(unsafe) public static var sourceByteCacheKeepsSpareRuns = true
+
+    /// [MovieClaw P51] 启动整理跨启动缓存超额时先缩到只剩元数据区、缩完仍超才整条删（默认开，见 `SourceByteCache.trimPersisted`）。
+    /// 关掉即直接整条删（P51 之前的行为），真机新旧对照用
+    nonisolated(unsafe) public static var sourceByteCacheTrimKeepsMetadata = true
 
     /// [MovieClaw P50] 删掉跨启动保留的片源字节缓存（整个目录）。只能在共享实例第一次用到之前调，真机对照每次热身前清场用
     nonisolated public static func removePersistedSourceByteCache() {

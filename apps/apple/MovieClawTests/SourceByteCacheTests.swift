@@ -336,6 +336,31 @@ struct SourceByteCacheTests {
         withExtendedLifetime(previous) {}
     }
 
+    /// [MovieClaw P51] 启动整理超额时先缩到只剩元数据区：看了一会儿的高码率片，下次启动文件头、文件尾还在
+    /// （续播一打开就要读），中间那段丢掉；原来整条删，续播全部重下
+    @Test func launchTrimShrinksAnOversizedSourceToItsMetadata() {
+        let dir = persistentDir()
+        let key = "file-3-\(UUID())"
+        let length = Int64(block) * 64   // 64 MiB：头 8 块、尾 32 块是元数据区，第 8～31 块不是
+        let previous = SourceByteCache(budgetBytes: Int64(block) * 128, persistentDirectory: dir)
+        previous.noteContentLength(key: key, length: length)
+        previous.write(key: key, offset: 0, data: bytes(block * 2, seed: 5))                  // 文件头
+        previous.write(key: key, offset: Int64(block) * 16, data: bytes(block * 8, seed: 6))  // 续播点那一段
+        previous.write(key: key, offset: length - Int64(block), data: bytes(block, seed: 7))  // 文件尾
+        previous.flushIndexes()
+        previous.drain()
+        // 下次启动：保留上限是运行预算的一半（4 块），这一份 11 块超了
+        let launch = SourceByteCache(budgetBytes: Int64(block) * 8, persistentDirectory: dir)
+        launch.trimPersisted()
+        #expect(launch.contiguousEnd(key: key, from: 0) == Int64(block) * 2)
+        #expect(read(launch, key, at: 0, max: 100) == bytes(100, seed: 5))
+        #expect(launch.contiguousEnd(key: key, from: length - Int64(block)) == length)
+        #expect(read(launch, key, at: length - Int64(block), max: 100) == bytes(100, seed: 7))
+        #expect(launch.contiguousEnd(key: key, from: Int64(block) * 16) == Int64(block) * 16)   // 中间那段不认了
+        #expect(launch.cachedBytes == Int64(block) * 3)
+        withExtendedLifetime(previous) {}
+    }
+
     @Test func launchTrimRemovesOrphansAndOldestOverBudget() throws {
         // 启动整理：只有数据没有记账的删掉；保留总量（运行预算的一半 = 2 块）超了，按最近使用删旧的
         let dir = persistentDir()

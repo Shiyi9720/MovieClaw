@@ -99,6 +99,8 @@ final class NativeEngine: NSObject, PlayerEngine {
         if UserDefaults.standard.bool(forKey: "mcNoPersistentByteCache") { AetherPlayback.setPersistsSourceCache(false) }
         // -mcPurgeByteCache YES：先删掉跨启动保留的片源字节缓存（实验台每次热身前清场，免得对照两组互相沾光）
         if UserDefaults.standard.bool(forKey: "mcPurgeByteCache") { AetherPlayback.removePersistedSourceCache() }
+        // -mcTrimDropsWhole YES：启动整理跨启动缓存超额时直接整条删（引擎补丁 P51 之前的行为，真机新旧对照用）
+        AetherPlayback.setSourceCacheTrimKeepsMetadata(!UserDefaults.standard.bool(forKey: "mcTrimDropsWhole"))
         // -mcNoSpareRuns YES：片源字节缓存每块只记一段（引擎补丁 P50 之前的行为，真机新旧对照用）
         AetherPlayback.setSourceCacheKeepsSpareRuns(!UserDefaults.standard.bool(forKey: "mcNoSpareRuns"))
         // -mcAetherCues YES：把文字字幕与 ASS 定位打到控制台
