@@ -1,5 +1,8 @@
 """PGS → SRT 适配层：能力检测、轨道抽取与 ``seconv`` OCR。
 
+轨道（``.sup``）交给 ``media_extract`` 的共享整文件抽取，与播放器同一份产物；
+seconv 起在独立进程组里，停止任务或停机时随之结束（见 ``process``）。
+
 这一层只负责把内封 PGS 变成可复用的文本中间品，不参与选源、翻译和
 最终 sidecar 命名。官方 Docker 镜像按目标架构内置 Subtitle Edit 5.1 的
 ``seconv`` 与 Tesseract；源码直跑时也可从 ``PATH`` 或
@@ -15,7 +18,6 @@ Windows/Linux/macOS x64/ARM64 组合，并分别校验 ffmpeg、seconv、OCR
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import platform
@@ -24,10 +26,12 @@ import subprocess
 import sys
 import tempfile
 import threading
-import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from movieclaw_api.services import media_extract
+from movieclaw_api.services.subtitle_gen import process
 
 if TYPE_CHECKING:
     from movieclaw_api.services.subtitle_gen.source import SourceCandidate
@@ -707,13 +711,6 @@ def cached_srt_path(
     return cache_dir() / f"{_cache_stem(file, candidate, source_language)}.srt"
 
 
-def cached_sup_path(file: LibraryFile, candidate: SourceCandidate) -> Path:
-    """SUP 与识别语言无关，同一轨道重新 OCR 时复用一份抽取缓存。"""
-    from movieclaw_api.services.subtitle_gen.extract import cache_dir
-
-    return cache_dir() / f"{file.id}.embedded{candidate.key}.pgs.sup"
-
-
 def _is_fresh(path: Path, video: Path) -> bool:
     try:
         return (
@@ -747,140 +744,81 @@ def conversion_capability(
     return detect_capability(source_language or candidate.language)
 
 
-def _extract_sup_sync(video: Path, stream_index: int, out_path: Path) -> None:
-    if _is_fresh(out_path, video):
-        return
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_name(f".{out_path.stem}.{uuid.uuid4().hex}.part.sup")
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        proc = subprocess.run(
-            [
-                "ffmpeg",
-                "-v",
-                "error",
-                "-y",
-                "-i",
-                str(video),
-                "-map",
-                f"0:s:{stream_index}",
-                "-c:s",
-                "copy",
-                str(tmp_path),
-            ],
-            capture_output=True,
-            timeout=_EXTRACT_TIMEOUT,
-            creationflags=creationflags,
-        )
-    except subprocess.TimeoutExpired as exc:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink(missing_ok=True)
+async def extract_sup(file: LibraryFile, candidate: SourceCandidate) -> Path:
+    """从媒体文件抽出这条 PGS 轨（``.sup``），返回产物路径。
+
+    走 ``media_extract`` 的共享抽取：与播放器同一份产物、同一趟通读（一个文件
+    所有轨一起抽），可取消、超时按体积估。此前这里单独再跑一遍 ffmpeg，
+    播放器抽过的片子要被整片再读一次，取消也停不下来。
+    """
+    if candidate.kind != "embedded" or not is_pgs_codec(candidate.format):
+        raise PgsConversionError("所选字幕不是可转换的内封 PGS 轨道")
+    index = int(candidate.key)
+    track = await media_extract.extract_track_async(file, index)
+    if track is None or track.format != "sup":
+        reason = media_extract.failure_reason(file, index) or "具体原因见服务端日志"
         raise PgsConversionError(
-            f"PGS 轨道抽取超过 {_EXTRACT_TIMEOUT:.0f} 秒：{video}"
-        ) from exc
-    except OSError as exc:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink(missing_ok=True)
-        raise PgsConversionError(f"无法启动 ffmpeg 抽取 PGS：{exc}") from exc
-    if proc.returncode != 0 or not tmp_path.is_file() or tmp_path.stat().st_size == 0:
-        error = proc.stderr.decode(errors="replace").strip()[:300]
-        with contextlib.suppress(OSError):
-            tmp_path.unlink(missing_ok=True)
-        raise PgsConversionError(
-            f"PGS 轨道抽取失败：{video} 字幕轨 {stream_index}（{error or '未知错误'}）"
+            f"PGS 轨道抽取失败：{Path(file.file_path).name} 字幕轨 {index + 1}（{reason}）"
         )
-    try:
-        tmp_path.replace(out_path)
-    except OSError as exc:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink(missing_ok=True)
-        raise PgsConversionError(f"PGS 缓存写入失败：{out_path}（{exc}）") from exc
+    return track.path
 
 
-def _convert_sync(
+async def ocr_to_srt(
     file: LibraryFile,
     candidate: SourceCandidate,
     capability: Capability,
     source_language: str | None,
+    sup_path: Path,
 ) -> Path:
+    """用 seconv 把 ``.sup`` 识别成缓存 SRT；命中缓存时不重复 OCR。
+
+    seconv 起在独立进程组里（见 ``process``）：用户停止任务或应用停机时连同
+    OCR 引擎一起结束，不再等它自然跑完（最长一小时）。
+    """
     video = Path(file.file_path)
     out_path = cached_srt_path(file, candidate, source_language)
-    if _is_fresh(out_path, video):
+    if await asyncio.to_thread(_is_fresh, out_path, video):
         return out_path
     if not capability.available or not capability.seconv_path:
         raise PgsConversionError(capability.message)
     if not capability.engine or capability.engine == "cache" or not capability.ocr_language:
         raise PgsConversionError("PGS OCR 能力检测结果不完整，请重新预检后再试")
-
-    sup_path = cached_sup_path(file, candidate)
-    _extract_sup_sync(video, int(candidate.key), sup_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        with tempfile.TemporaryDirectory(prefix="pgs-ocr-", dir=out_path.parent) as temp:
-            temp_dir = Path(temp)
-            argv = [
-                capability.seconv_path,
-                str(sup_path),
-                "subrip",
-                f"--ocr-engine:{capability.engine}",
-                f"--ocr-language:{capability.ocr_language}",
-                f"--output-folder:{temp_dir}",
-                "--overwrite",
-            ]
-            try:
-                proc = subprocess.run(
-                    argv,
-                    capture_output=True,
-                    text=True,
-                    timeout=_OCR_TIMEOUT,
-                    creationflags=creationflags,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise PgsConversionError(
-                    f"PGS OCR 超过 {_OCR_TIMEOUT / 60:.0f} 分钟，已停止转换"
-                ) from exc
-            except OSError as exc:
-                raise PgsConversionError(f"无法启动 seconv：{exc}") from exc
-            outputs = sorted(
-                path
-                for path in temp_dir.iterdir()
-                if path.is_file() and path.suffix.lower() == ".srt"
-            )
-            if proc.returncode != 0 or not outputs or outputs[0].stat().st_size == 0:
-                detail = (proc.stderr or proc.stdout or "未知错误").strip().replace("\n", " ")
-                raise PgsConversionError(f"PGS OCR 转换失败：{detail[:400]}")
-            try:
-                outputs[0].replace(out_path)
-            except OSError as exc:
-                raise PgsConversionError(f"PGS OCR 结果写入缓存失败：{out_path}（{exc}）") from exc
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix="pgs-ocr-", dir=out_path.parent))
     except OSError as exc:
         raise PgsConversionError(f"无法创建 PGS OCR 临时目录：{exc}") from exc
+    try:
+        argv = [
+            capability.seconv_path,
+            str(sup_path),
+            "subrip",
+            f"--ocr-engine:{capability.engine}",
+            f"--ocr-language:{capability.ocr_language}",
+            f"--output-folder:{temp_dir}",
+            "--overwrite",
+        ]
+        try:
+            result = await process.run(argv, timeout=_OCR_TIMEOUT)
+        except process.ProcessTimeout as exc:
+            raise PgsConversionError(
+                f"PGS OCR 超过 {_OCR_TIMEOUT / 60:.0f} 分钟，已停止转换"
+            ) from exc
+        except OSError as exc:
+            raise PgsConversionError(f"无法启动 seconv：{exc}") from exc
+        outputs = sorted(
+            path
+            for path in temp_dir.iterdir()
+            if path.is_file() and path.suffix.lower() == ".srt"
+        )
+        if result.returncode != 0 or not outputs or outputs[0].stat().st_size == 0:
+            raw = result.stderr or result.stdout
+            detail = raw.decode(errors="replace").strip().replace("\n", " ") or "未知错误"
+            raise PgsConversionError(f"PGS OCR 转换失败：{detail[:400]}")
+        try:
+            outputs[0].replace(out_path)
+        except OSError as exc:
+            raise PgsConversionError(f"PGS OCR 结果写入缓存失败：{out_path}（{exc}）") from exc
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
     return out_path
-
-
-async def convert_embedded_pgs(
-    file: LibraryFile,
-    candidate: SourceCandidate,
-    capability: Capability | None = None,
-    source_language: str | None = None,
-) -> Path:
-    """把一个内封 PGS 候选转换成缓存 SRT，命中缓存时不重复 OCR。"""
-    if candidate.kind != "embedded" or not is_pgs_codec(candidate.format):
-        raise PgsConversionError("所选字幕不是可转换的内封 PGS 轨道")
-    current = (
-        conversion_capability(file, candidate, source_language)
-        if capability is None
-        else capability
-    )
-    if current.cached:
-        return cached_srt_path(file, candidate, source_language)
-    if not current.available:
-        raise PgsConversionError(current.message)
-    return await asyncio.to_thread(
-        _convert_sync,
-        file,
-        candidate,
-        current,
-        source_language,
-    )

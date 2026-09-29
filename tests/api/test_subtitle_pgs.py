@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -288,34 +287,90 @@ async def test_plan_revalidates_confirmed_track_and_language(monkeypatch) -> Non
     assert missing is None
 
 
-async def test_convert_pgs_uses_atomic_cache(tmp_path: Path, monkeypatch) -> None:
+async def test_pgs_reuses_shared_extraction_and_caches_ocr_atomically(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """.sup 走与播放器共用的整文件抽取（不再单独把整片再读一遍），OCR 结果
+    原子落缓存，临时目录不留残片，第二次直接命中缓存。"""
+    from movieclaw_api.services import media_extract
+    from movieclaw_api.services.subtitle_gen import process
+
     monkeypatch.chdir(tmp_path)
     video = tmp_path / "Movie.mkv"
     video.write_bytes(b"video")
     row = _file(video)
-    calls: list[list[str]] = []
+    sup = tmp_path / "shared" / "42.s0.sup"
+    sup.parent.mkdir()
+    sup.write_bytes(b"PG")
+    extracted: list[int] = []
+    runs: list[list[str]] = []
 
-    def fake_run(argv, **_kwargs):  # noqa: ANN001
-        calls.append(argv)
-        if argv[0] == "ffmpeg":
-            Path(argv[-1]).write_bytes(b"sup")
-            return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+    async def shared_extract(_file, index):  # noqa: ANN001
+        extracted.append(index)
+        return media_extract.ExtractedTrack(path=sup, format="sup")
+
+    async def fake_seconv(argv, *, timeout):  # noqa: ANN001
+        runs.append(argv)
         output_folder = next(v.split(":", 1)[1] for v in argv if v.startswith("--output-folder:"))
         Path(output_folder, "converted.srt").write_text(
-            "1\n00:00:01,000 --> 00:00:02,000\nhello\n",
-            encoding="utf-8",
+            "1\n00:00:01,000 --> 00:00:02,000\nhello\n", encoding="utf-8"
         )
-        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+        return process.Completed(returncode=0, stdout=b"ok", stderr=b"")
 
-    monkeypatch.setattr(pgs.subprocess, "run", fake_run)
+    monkeypatch.setattr(media_extract, "extract_track_async", shared_extract)
+    monkeypatch.setattr(pgs.process, "run", fake_seconv)
 
-    result = await pgs.convert_embedded_pgs(row, _candidate(), _capability())
+    sup_path = await pgs.extract_sup(row, _candidate())
+    result = await pgs.ocr_to_srt(row, _candidate(), _capability(), "eng", sup_path)
 
-    assert result.is_file()
+    assert extracted == [0] and sup_path == sup
     assert "hello" in result.read_text(encoding="utf-8")
-    assert calls[0][0] == "ffmpeg"
-    assert "--ocr-engine:tesseract" in calls[1]
-    assert not list(result.parent.glob("*.part.sup"))
+    assert runs[0][1] == str(sup) and "--ocr-engine:tesseract" in runs[0]
+    assert not list(result.parent.glob("pgs-ocr-*")), "临时目录要清掉"
+
+    again = await pgs.ocr_to_srt(row, _candidate(), _capability(), "eng", sup_path)
+    assert again == result and len(runs) == 1, "缓存命中不该再跑 OCR"
+
+
+async def test_pgs_extraction_failure_carries_the_reason(tmp_path: Path, monkeypatch) -> None:
+    from movieclaw_api.services import media_extract
+
+    row = _file(tmp_path / "Movie.mkv")
+
+    async def failed(_file, _index):  # noqa: ANN001
+        return None
+
+    monkeypatch.setattr(media_extract, "extract_track_async", failed)
+    monkeypatch.setattr(media_extract, "failure_reason", lambda _f, _i: "读取超时：13 分钟")
+
+    with pytest.raises(pgs.PgsConversionError, match="读取超时：13 分钟"):
+        await pgs.extract_sup(row, _candidate())
+
+
+async def test_stopping_ocr_cleans_up_its_temp_dir(tmp_path: Path, monkeypatch) -> None:
+    """停止任务时 OCR 随之取消（进程组由 process.run 结束），临时目录也不留。"""
+    import asyncio
+
+    monkeypatch.chdir(tmp_path)
+    video = tmp_path / "Movie.mkv"
+    video.write_bytes(b"video")
+    row = _file(video)
+    started = asyncio.Event()
+
+    async def hanging_seconv(_argv, *, timeout):  # noqa: ANN001
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(pgs.process, "run", hanging_seconv)
+    task = asyncio.create_task(
+        pgs.ocr_to_srt(row, _candidate(), _capability(), "eng", tmp_path / "x.sup")
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    cache = pgs.cached_srt_path(row, _candidate(), "eng").parent
+    assert not list(cache.glob("pgs-ocr-*"))
 
 
 def test_preview_offers_confirmed_pgs_conversion() -> None:
@@ -570,7 +625,6 @@ async def test_preview_of_ambiguous_pgs_spawns_no_probe(monkeypatch) -> None:
             42,
             "chs",
             secondary_language="eng",
-            wait=False,
         )
         assert pv.pgs_conversion is not None
         assert pv.pgs_conversion.language.confirmation_required
