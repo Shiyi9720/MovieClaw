@@ -1878,6 +1878,14 @@ public final class AetherEngine: ObservableObject {
     /// stays true source PTS for subtitle-cue alignment. Reset to 0 on load/stop; set in onPlaylistShiftChanged.
     var sourcePresentationOrigin: Double = 0
 
+    /// [MovieClaw P39] 宿主要求下一次 `load()` 的起播点按代价吸附到关键帧（见 `KeyframeSnapPolicy.startLanding`）。
+    /// 一次性：`load()` 入口取走并清零。只该在用户起播 / 续播时设；引擎自己的重建（换音轨、回前台、AirPlay 切换）
+    /// 走同一个 `load()`，不设它就原位接上，画面不会往回跳
+    public var snapsNextStartToKeyframe = false
+
+    /// [MovieClaw P39] 本次装载是否吸附起播点：`load()` 入口从 `snapsNextStartToKeyframe` 取来，`loadNative` 用掉即清
+    var startSnapArmed = false
+
     /// AE#270: the origin this session settled on, nil before the first publish. A non-disc VOD source
     /// keeps its first one: later publishes fold producer drift into the shift, and re-reading them would
     /// move the display axis under a picture that has not moved.
@@ -3706,6 +3714,9 @@ public final class AetherEngine: ObservableObject {
     ) async throws -> SourceProbe? {
         // [MovieClaw P22] 本次地址登记到宿主给的稳定键上：探测、播放、重建、字幕旁路打开这个地址都落到同一份字节缓存
         if case .url(let url) = source { SourceByteCache.shared.bind(url: url, key: options.sourceCacheKey) }
+        // [MovieClaw P39] 一次性开关在入口取走：这次装载内部的重开（HLS 改道等）与之后的重建都不再吸附
+        startSnapArmed = snapsNextStartToKeyframe
+        snapsNextStartToKeyframe = false
         let attempt = LoadAttempt()
         defer { if let gen = attempt.generation { waitingLoadGenerations.remove(gen) } }
         do {

@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -27,8 +28,16 @@ import Foundation
 /// ## 预算与清理
 /// 全进程共用一个预算，默认 min(1 GiB, 临时目录可用空间的 1/8)，每来一个新片源按当时的可用空间重算。按 1 MiB
 /// 的块记最近使用，超了先丢最久没用的块（在稀疏文件上打洞，空间立刻还回去），丢到预算的九成为止，块丢光的片源
-/// 整条删掉。关掉播放器不清：退出再进同一部片、断线重连换了引擎实例，续播点附近都直接从本机起播；App 下次启动时
-/// 由 `sweep` 清掉上次留下的文件。
+/// 整条删掉。关掉播放器不清：退出再进同一部片、断线重连换了引擎实例，续播点附近都直接从本机起播。
+///
+/// ## [MovieClaw P42] 跨启动保留：续播从本机起播
+/// 原来 App 每次启动都把上次的缓存清掉（记账只在内存里，文件内容无从核对）。可真实使用里续播占七成多
+/// （2026-09-30 NAS 播放记录），续播要读的正是上一场下过的字节：文件头、索引（MP4 的 moov、MKV 的 Cues）、
+/// 续播点所在的那一段。现在共享实例落在 Caches 目录，每个片源两个文件，按键的哈希命名：`.bin` 是稀疏数据，
+/// `.idx` 是记账（文件大小与每块的连续覆盖）。记账随写入在后台队列上防抖落盘；淘汰时先落记账、再打洞——
+/// 记账永远不会说一块在、数据却已被打了洞（读出全零就是花屏）。进程被杀时记账最多落后几秒，只会少认几块，不会多认。
+/// 某个片源第一次被访问时按需从磁盘恢复（连接报的文件大小对不上照样整份作废）；App 启动时 `sweep` 整理一次：
+/// 删孤儿文件、30 天没用过的，总量超过保留预算时按最近使用整条删。测试自建的实例不落盘（与原来一样用临时目录）。
 ///
 /// ## [MovieClaw P32] 写盘与淘汰在后台串行队列上做
 /// 读取器收到网络数据后调 `write`，原来是当场 `pwrite` 进稀疏文件、超预算时当场逐块打洞，全程持锁、占着取数线程。
@@ -39,15 +48,27 @@ import Foundation
 /// 再打洞，同一队列上后来的写入排在打洞之后，不会被误清。积压超过 `maxPendingBytes` 时新写入直接不缓存，内存不会堆起来。
 final class SourceByteCache: @unchecked Sendable {
 
-    static let shared = SourceByteCache(asynchronous: true)
+    static let shared = SourceByteCache(
+        asynchronous: true, persistentDirectory: AetherEngine.persistsSourceByteCache ? persistentRoot : nil)
 
     /// 记账与淘汰的粒度。每块只记一段连续覆盖（网络数据按顺序到，够用；零散写入不连续时以新的为准）
     static let blockSize: Int64 = 1 << 20
 
+    /// 不落盘的实例（测试自建的）放这里；P42 之前共享实例也在这里，`sweep` 顺手清掉旧版留下的
     static var directory: URL {
         URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("aether-bytecache", isDirectory: true)
     }
+
+    /// [MovieClaw P42] 跨启动保留的共享缓存放 Caches：系统存储紧张时可以回收，不进备份
+    static var persistentRoot: URL {
+        (FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true))
+            .appendingPathComponent("aether-bytecache", isDirectory: true)
+    }
+
+    /// [MovieClaw P42] 记账多久落一次盘（写入之后）。进程被杀最多丢这么久的记账：只会少认几块，不会多认
+    static let indexFlushDelay: TimeInterval = 3
 
     private struct Block {
         var lo: Int64
@@ -55,20 +76,38 @@ final class SourceByteCache: @unchecked Sendable {
         var lastUse: UInt64
     }
 
+    /// [MovieClaw P42] `.idx` 里存的记账：块号、覆盖起止、最近使用（只用来排新旧）
+    private struct IndexFile: Codable {
+        var version = 1
+        var key: String
+        var contentLength: Int64?
+        var blocks: [[Int64]]
+    }
+
     private final class Entry {
+        let key: String
         let fd: Int32
         let path: String
+        /// [MovieClaw P42] 落盘的记账文件；nil = 不落盘（测试实例）
+        let indexPath: String?
         var contentLength: Int64?
         var blocks: [Int64: Block] = [:]
+        /// [MovieClaw P42] 记账有没落盘的变化、是否已排了落盘
+        var indexDirty = false
+        var indexFlushScheduled = false
 
-        init(fd: Int32, path: String) {
+        init(key: String, fd: Int32, path: String, indexPath: String?) {
+            self.key = key
             self.fd = fd
             self.path = path
+            self.indexPath = indexPath
         }
 
         deinit {
+            // 整份作废（淘汰光了、源站文件换了）才会走到这里：数据与记账一起删。进程退出时不会走到，文件留给下次
             close(fd)
             unlink(path)
+            if let indexPath { unlink(indexPath) }
         }
     }
 
@@ -97,9 +136,13 @@ final class SourceByteCache: @unchecked Sendable {
     private var pendingBytes = 0
     static let maxPendingBytes = 64 << 20
 
-    init(budgetBytes: Int64? = nil, asynchronous: Bool = false) {
+    /// [MovieClaw P42] 跨启动保留的目录；nil = 不落盘（测试自建的实例，文件在临时目录、随实例删掉）
+    private let persistentDirectory: URL?
+
+    init(budgetBytes: Int64? = nil, asynchronous: Bool = false, persistentDirectory: URL? = nil) {
         self.fixedBudget = budgetBytes
         self._asynchronous = asynchronous
+        self.persistentDirectory = persistentDirectory
     }
 
     /// 等后台队列上已交出的写入都落完盘（测试用）
@@ -157,8 +200,7 @@ final class SourceByteCache: @unchecked Sendable {
                 return
             }
             recordWriteLocked(entry: entry, offset: offset, count: data.count)
-            let holes = evictOverBudgetLocked()
-            Self.punch(holes)
+            Self.apply(evictOverBudgetLocked())
             return
         }
         guard !disabled, pendingBytes + data.count <= Self.maxPendingBytes, let entry = entryLocked(key) else {
@@ -182,10 +224,11 @@ final class SourceByteCache: @unchecked Sendable {
                 return
             }
             recordWriteLocked(entry: entry, offset: offset, count: data.count)
-            let holes = evictOverBudgetLocked()
+            let eviction = evictOverBudgetLocked()
             lock.unlock()
-            // 打洞在锁外：块已从账上删掉，读者不会再读它们；同一队列上后来的写入排在这之后
-            Self.punch(holes)
+            // 打洞在锁外：块已从账上删掉，读者不会再读它们；同一队列上后来的写入排在这之后。
+            // 落盘的记账先于打洞写好（P42）
+            Self.apply(eviction)
         }
     }
 
@@ -229,13 +272,14 @@ final class SourceByteCache: @unchecked Sendable {
             totalBytes += (entry.blocks[index].map { $0.hi - $0.lo } ?? 0) - before
             cursor = blockEnd
         }
+        markIndexDirtyLocked(entry)
     }
 
     /// 从 `offset` 起有多少连续缓存就读多少（至多 `maxLen`），返回读到的字节数；0 = 没有
     func read(key: String, offset: Int64, into dst: UnsafeMutablePointer<UInt8>, maxLen: Int) -> Int {
         guard maxLen > 0, offset >= 0 else { return 0 }
         lock.lock(); defer { lock.unlock() }
-        guard let entry = entries[key] else { return 0 }
+        guard let entry = existingEntryLocked(key) else { return 0 }
         let available = contiguousEndLocked(entry, from: offset) - offset
         guard available > 0 else { return 0 }
         let count = Int(min(Int64(maxLen), available))
@@ -256,7 +300,7 @@ final class SourceByteCache: @unchecked Sendable {
     /// 从 `offset` 起连续缓存到哪里（不含）；没有缓存时就是 `offset`
     func contiguousEnd(key: String, from offset: Int64) -> Int64 {
         lock.lock(); defer { lock.unlock() }
-        guard let entry = entries[key] else { return offset }
+        guard let entry = existingEntryLocked(key) else { return offset }
         return contiguousEndLocked(entry, from: offset)
     }
 
@@ -264,7 +308,7 @@ final class SourceByteCache: @unchecked Sendable {
     func copy(key: String, offset: Int64, length: Int) -> Data? {
         guard length > 0 else { return nil }
         lock.lock(); defer { lock.unlock() }
-        guard let entry = entries[key], contiguousEndLocked(entry, from: offset) >= offset + Int64(length) else {
+        guard let entry = existingEntryLocked(key), contiguousEndLocked(entry, from: offset) >= offset + Int64(length) else {
             return nil
         }
         var data = Data(count: length)
@@ -281,18 +325,21 @@ final class SourceByteCache: @unchecked Sendable {
     func noteContentLength(key: String, length: Int64) {
         guard length > 0 else { return }
         lock.lock(); defer { lock.unlock() }
-        if let known = entries[key]?.contentLength, known != length {
+        if let known = existingEntryLocked(key)?.contentLength, known != length {
             EngineLog.emit("[SourceByteCache] [MovieClaw P22] \(key): size \(known)B -> \(length)B, "
                            + "the source changed; dropping its cached bytes", category: .demux)
             dropLocked(key)
         }
         guard !disabled, let entry = entryLocked(key) else { return }
-        entry.contentLength = length
+        if entry.contentLength != length {
+            entry.contentLength = length
+            markIndexDirtyLocked(entry)
+        }
     }
 
     func contentLength(key: String) -> Int64? {
         lock.lock(); defer { lock.unlock() }
-        return entries[key]?.contentLength
+        return existingEntryLocked(key)?.contentLength
     }
 
     // MARK: 清理
@@ -305,8 +352,8 @@ final class SourceByteCache: @unchecked Sendable {
         totalBytes = 0
     }
 
-    /// App 启动时调：删掉死会话留下的缓存文件。清扫在后台线程跑，可能晚于刚开始的播放，
-    /// 所以本进程正开着的文件跳过（删了它，这一场的缓存就成了看不见的孤儿文件）
+    /// App 启动时调（后台线程）：清掉临时目录里不落盘的旧缓存（P42 之前共享实例也放那里），再整理跨启动保留的那份
+    /// （`trimPersisted`）。清扫可能晚于刚开始的播放，所以本进程正开着的文件一律跳过
     static func sweep() {
         let live = shared.livePaths()
         let files = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
@@ -314,11 +361,162 @@ final class SourceByteCache: @unchecked Sendable {
             let path = directory.appendingPathComponent(name).path
             if !live.contains(path) { unlink(path) }
         }
+        shared.trimPersisted()
     }
 
     private func livePaths() -> Set<String> {
         lock.lock(); defer { lock.unlock() }
-        return Set(entries.values.map(\.path))
+        return Set(entries.values.flatMap { [$0.path, $0.indexPath].compactMap { $0 } })
+    }
+
+    // MARK: - [MovieClaw P42] 跨启动保留
+
+    /// 跨启动保留的总量上限：运行时预算的一半（默认 512 MiB）。上一场看的片子留得住续播点附近、文件头与索引就够了
+    private var persistedBudgetBytes: Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return budgetLocked() / 2
+    }
+
+    /// 多久没用过的片源整条删
+    static let persistedMaxAge: TimeInterval = 30 * 24 * 3600
+
+    /// 整理跨启动保留的缓存（`sweep` 调，后台线程）：只有数据没有记账（或反过来）的删掉；太久没用的删掉；
+    /// 总量超过保留上限时按记账最后一次落盘的时间从旧到新整条删。本进程正开着的跳过
+    func trimPersisted() {
+        guard let dir = persistentDirectory else { return }
+        let live = livePaths()
+        let fm = FileManager.default
+        let names = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+        var stems: [String: (bin: Bool, idx: Bool)] = [:]
+        for name in names {
+            let url = URL(fileURLWithPath: name)
+            let stem = url.deletingPathExtension().lastPathComponent
+            switch url.pathExtension {
+            case "bin": stems[stem, default: (false, false)].bin = true
+            case "idx": stems[stem, default: (false, false)].idx = true
+            default: unlink(dir.appendingPathComponent(name).path)   // 写记账的临时文件等
+            }
+        }
+        var complete: [(stem: String, usedAt: Date, bytes: Int64)] = []
+        let now = Date()
+        for (stem, has) in stems {
+            let bin = dir.appendingPathComponent(stem + ".bin").path
+            let idx = dir.appendingPathComponent(stem + ".idx").path
+            guard !live.contains(bin), !live.contains(idx) else { continue }
+            guard has.bin, has.idx else {
+                unlink(bin); unlink(idx)
+                continue
+            }
+            var info = stat()
+            let usedAt = (try? fm.attributesOfItem(atPath: idx)[.modificationDate] as? Date) ?? .distantPast
+            // 稀疏文件按实际占用算（st_blocks 以 512 字节计）
+            let bytes = stat(bin, &info) == 0 ? Int64(info.st_blocks) * 512 : 0
+            if now.timeIntervalSince(usedAt) > Self.persistedMaxAge {
+                unlink(bin); unlink(idx)
+                continue
+            }
+            complete.append((stem, usedAt, bytes))
+        }
+        var total = complete.reduce(0) { $0 + $1.bytes }
+        let budget = persistedBudgetBytes
+        for item in complete.sorted(by: { $0.usedAt < $1.usedAt }) where total > budget {
+            unlink(dir.appendingPathComponent(item.stem + ".bin").path)
+            unlink(dir.appendingPathComponent(item.stem + ".idx").path)
+            total -= item.bytes
+        }
+    }
+
+    /// 把还没落盘的记账都写下去（宿主在 App 进后台时调）。在后台队列上排队，排在已交出的写入之后。
+    /// 记账文件一律持锁写：同步写盘模式下淘汰也在锁里写记账、打洞，这样两边不会交错（旧快照晚于打洞落盘）
+    func flushIndexes() {
+        ioQueue.async { [self] in
+            lock.lock(); defer { lock.unlock() }
+            for entry in entries.values where entry.indexDirty {
+                entry.indexDirty = false
+                if let (path, data) = indexSnapshotLocked(entry) { Self.writeIndex(data, to: path) }
+            }
+        }
+    }
+
+    /// 键 → 落盘文件名（不含扩展名）。键里有文件 id，不直接拿来当文件名
+    private static func fileStem(for key: String) -> String {
+        SHA256.hash(data: Data(key.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// 记账变了：排一次防抖落盘（已经排了就不再排）。调用方持锁
+    private func markIndexDirtyLocked(_ entry: Entry) {
+        guard entry.indexPath != nil else { return }
+        entry.indexDirty = true
+        guard !entry.indexFlushScheduled else { return }
+        entry.indexFlushScheduled = true
+        ioQueue.asyncAfter(deadline: .now() + Self.indexFlushDelay) { [weak self, weak entry] in
+            guard let self, let entry else { return }
+            self.lock.lock(); defer { self.lock.unlock() }
+            entry.indexFlushScheduled = false
+            // 已经作废（整条删了、换成了新的一份）或已被别处写过：不写。持锁写，理由见 `flushIndexes`
+            guard self.entries[entry.key] === entry, entry.indexDirty else { return }
+            entry.indexDirty = false
+            if let (path, data) = self.indexSnapshotLocked(entry) { Self.writeIndex(data, to: path) }
+        }
+    }
+
+    /// 这一份的记账（路径 + 内容）。调用方持锁
+    private func indexSnapshotLocked(_ entry: Entry) -> (String, Data)? {
+        guard let path = entry.indexPath else { return nil }
+        let file = IndexFile(
+            key: entry.key, contentLength: entry.contentLength,
+            blocks: entry.blocks.map { [$0.key, $0.value.lo, $0.value.hi, Int64(truncatingIfNeeded: $0.value.lastUse)] })
+        guard let data = try? JSONEncoder().encode(file) else { return nil }
+        return (path, data)
+    }
+
+    /// 记账整份替换（先写临时文件再改名）：进程在中途被杀，留下的要么是旧的一份、要么是新的一份
+    private static func writeIndex(_ data: Data, to path: String) {
+        try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+
+    /// 某个片源第一次被访问：磁盘上有上一场留下的就接着用。调用方持锁
+    private func existingEntryLocked(_ key: String) -> Entry? {
+        if let entry = entries[key] { return entry }
+        guard !disabled, let restored = restoreLocked(key) else { return nil }
+        entries[key] = restored
+        budgetBytes = nil
+        return restored
+    }
+
+    /// 从 `.idx` / `.bin` 恢复一份。记账与键对不上、数据文件没了、块越界的一概不认。调用方持锁
+    private func restoreLocked(_ key: String) -> Entry? {
+        guard let dir = persistentDirectory else { return nil }
+        let stem = Self.fileStem(for: key)
+        let bin = dir.appendingPathComponent(stem + ".bin").path
+        let idx = dir.appendingPathComponent(stem + ".idx").path
+        guard let data = FileManager.default.contents(atPath: idx) else { return nil }
+        guard let file = try? JSONDecoder().decode(IndexFile.self, from: data), file.version == 1, file.key == key else {
+            unlink(idx); unlink(bin)
+            return nil
+        }
+        let fd = open(bin, O_RDWR)
+        guard fd >= 0 else {
+            unlink(idx)
+            return nil
+        }
+        var info = stat()
+        let size: Int64 = fstat(fd, &info) == 0 ? Int64(info.st_size) : 0
+        let entry = Entry(key: key, fd: fd, path: bin, indexPath: idx)
+        entry.contentLength = file.contentLength
+        // 最近使用只用来排新旧：按原来的先后重新编号，接在本进程的时钟后面
+        for block in file.blocks.filter({ $0.count == 4 }).sorted(by: { $0[3] < $1[3] }) {
+            let (index, lo, hi) = (block[0], block[1], block[2])
+            guard index >= 0, lo >= index * Self.blockSize, lo < hi, hi <= (index + 1) * Self.blockSize, hi <= size else {
+                continue
+            }
+            useClock += 1
+            entry.blocks[index] = Block(lo: lo, hi: hi, lastUse: useClock)
+            totalBytes += hi - lo
+        }
+        EngineLog.emit("[SourceByteCache] [MovieClaw P42] restored \(key): \(entry.blocks.count) blocks, "
+                       + "\(entry.blocks.values.reduce(0) { $0 + ($1.hi - $1.lo) } >> 20) MB", category: .demux)
+        return entry
     }
 
     var cachedBytes: Int64 {
@@ -329,17 +527,28 @@ final class SourceByteCache: @unchecked Sendable {
     // MARK: - 内部（调用方已持锁）
 
     private func entryLocked(_ key: String) -> Entry? {
-        if let entry = entries[key] { return entry }
+        if let entry = existingEntryLocked(key) { return entry }
         budgetBytes = nil   // 新片源：按现在的可用空间重算预算
-        let dir = Self.directory
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let path = dir.appendingPathComponent(UUID().uuidString).path
+        let path: String
+        var indexPath: String?
+        if let dir = persistentDirectory {
+            // [MovieClaw P42] 按键的哈希命名：下次启动按键找得回来。旧的一份（记账坏了、键对不上）直接覆盖
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let stem = Self.fileStem(for: key)
+            path = dir.appendingPathComponent(stem + ".bin").path
+            indexPath = dir.appendingPathComponent(stem + ".idx").path
+            if let indexPath { unlink(indexPath) }
+        } else {
+            let dir = Self.directory
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            path = dir.appendingPathComponent(UUID().uuidString).path
+        }
         let fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0o600)
         guard fd >= 0 else {
             disabled = true
             return nil
         }
-        let entry = Entry(fd: fd, path: path)
+        let entry = Entry(key: key, fd: fd, path: path, indexPath: indexPath)
         entries[key] = entry
         return entry
     }
@@ -392,12 +601,25 @@ final class SourceByteCache: @unchecked Sendable {
         #endif
     }
 
+    /// 一次淘汰要做的事：打哪些洞；[MovieClaw P42] 以及打洞之前要先写下去的记账（淘汰动过、还留着的那些片源）
+    private struct Eviction {
+        var holes: [Hole] = []
+        var indexes: [(path: String, data: Data)] = []
+    }
+
+    /// 执行一次淘汰：先写记账，再打洞。记账落在前面，进程在两步之间被杀也只是少认几块；反过来就会认下全零的洞
+    private static func apply(_ eviction: Eviction) {
+        for index in eviction.indexes { writeIndex(index.data, to: index.path) }
+        punch(eviction.holes)
+    }
+
     /// 超了预算：按最近使用从旧到新丢块，丢到预算的九成（成批丢，免得每写一块都扫一遍）。
     /// 只在账上删、返回要打的洞，由调用方在锁外打（P32）
-    private func evictOverBudgetLocked() -> [Hole] {
+    private func evictOverBudgetLocked() -> Eviction {
         let budget = budgetLocked()
-        guard totalBytes > budget else { return [] }
-        var holes: [Hole] = []
+        guard totalBytes > budget else { return Eviction() }
+        var eviction = Eviction()
+        var touched: [ObjectIdentifier: Entry] = [:]
         var candidates: [(key: String, index: Int64, lastUse: UInt64)] = []
         for (key, entry) in entries {
             for (index, block) in entry.blocks { candidates.append((key, index, block.lastUse)) }
@@ -409,13 +631,19 @@ final class SourceByteCache: @unchecked Sendable {
                 continue
             }
             totalBytes -= block.hi - block.lo
-            holes.append((entry, candidate.index * Self.blockSize))
+            eviction.holes.append((entry, candidate.index * Self.blockSize))
+            touched[ObjectIdentifier(entry)] = entry
         }
         // 块丢光的片源整条删（关文件、删文件），免得看过的片子多了文件句柄越攒越多
         for (key, entry) in entries where entry.blocks.isEmpty {
             entries.removeValue(forKey: key)
         }
-        return holes
+        // [MovieClaw P42] 还留着的片源：记账按淘汰后的样子重写（整条删了的，数据与记账随 Entry 一起删）
+        for entry in touched.values where entries[entry.key] === entry {
+            entry.indexDirty = false
+            if let snapshot = indexSnapshotLocked(entry) { eviction.indexes.append((snapshot.0, snapshot.1)) }
+        }
+        return eviction
     }
 }
 
@@ -429,6 +657,10 @@ extension AetherEngine {
 
     /// [MovieClaw P34] 探测流时把第二条起的 TrueHD 暂当附件（默认开，见 `Demuxer.parkUnsizedPGS`）。宿主做新旧对照时可关
     nonisolated(unsafe) public static var parkSecondaryTrueHDDuringProbe = true
+
+    /// [MovieClaw P42] 片源字节缓存跨启动保留（默认开）。只在共享实例第一次用到之前改才有效（宿主在建第一个引擎前设），
+    /// 真机新旧对照用
+    nonisolated(unsafe) public static var persistsSourceByteCache = true
 
     /// [MovieClaw P32] 片源字节缓存的写盘与淘汰是否放在后台串行队列（默认开）。宿主在真机上做新旧对照时可关掉
     public static var sourceByteCacheWritesInBackground: Bool {

@@ -155,4 +155,123 @@ struct SourceByteCacheTests {
         cache.purgeAll()
         #expect(cache.key(for: first) == nil)
     }
+
+    // MARK: - P42 跨启动保留
+
+    /// 每个用例一个空目录，模拟 Caches 下的缓存目录。上一场的实例要留到用例结束（实例释放时会删掉它开着的片源，
+    /// 真机上共享实例活到进程退出，不会走到那一步）
+    private func persistentDir() -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("p42-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    @Test func survivesRelaunch() {
+        // 上一场下过的文件头、大小，下一场（新实例 = App 重启）原样拿到，一个请求都不用发
+        let dir = persistentDir()
+        let key = "file-7-\(UUID())"
+        let data = bytes(block * 2 + 5000, seed: 11)
+        let previous = SourceByteCache(budgetBytes: 64 << 20, persistentDirectory: dir)
+        previous.noteContentLength(key: key, length: 50 << 20)
+        previous.write(key: key, offset: 0, data: data)
+        previous.flushIndexes()
+        previous.drain()
+        let next = SourceByteCache(budgetBytes: 64 << 20, persistentDirectory: dir)
+        #expect(next.contentLength(key: key) == 50 << 20)
+        #expect(next.contiguousEnd(key: key, from: 0) == Int64(data.count))
+        #expect(read(next, key, at: 0, max: data.count) == data)
+        withExtendedLifetime(previous) {}
+    }
+
+    @Test func evictedBlocksNeverComeBackAsZeros() {
+        // 淘汰打了洞的块，下一场绝不能当成还在（读出全零就是花屏）：淘汰时先写记账再打洞
+        let dir = persistentDir()
+        let key = "file-8-\(UUID())"
+        let previous = SourceByteCache(budgetBytes: Int64(block) * 4, persistentDirectory: dir)
+        previous.noteContentLength(key: key, length: 100 << 20)
+        for index in 0 ..< 8 {
+            previous.write(key: key, offset: Int64(block * index), data: bytes(block, seed: UInt8(index)))
+        }
+        previous.drain()
+        let next = SourceByteCache(budgetBytes: 64 << 20, persistentDirectory: dir)
+        var claimed = 0
+        for index in 0 ..< 8 {
+            let got = read(next, key, at: Int64(block * index), max: block)
+            guard !got.isEmpty else { continue }
+            claimed += 1
+            #expect(got == bytes(block, seed: UInt8(index)).prefix(got.count))
+        }
+        #expect(claimed > 0)
+        // 最早写的那块早被淘汰了
+        #expect(read(next, key, at: 0, max: 10).isEmpty)
+        withExtendedLifetime(previous) {}
+    }
+
+    @Test func corruptIndexIsIgnored() throws {
+        // 记账写坏了（或键对不上）：不认，当新片源重下
+        let dir = persistentDir()
+        let key = "file-9-\(UUID())"
+        let previous = SourceByteCache(budgetBytes: 64 << 20, persistentDirectory: dir)
+        previous.noteContentLength(key: key, length: 10 << 20)
+        previous.write(key: key, offset: 0, data: bytes(100_000, seed: 5))
+        previous.flushIndexes()
+        previous.drain()
+        let idx = try #require(FileManager.default.contentsOfDirectory(atPath: dir.path).first { $0.hasSuffix(".idx") })
+        try Data("garbage".utf8).write(to: dir.appendingPathComponent(idx))
+        let next = SourceByteCache(budgetBytes: 64 << 20, persistentDirectory: dir)
+        #expect(next.contentLength(key: key) == nil)
+        #expect(next.contiguousEnd(key: key, from: 0) == 0)
+        withExtendedLifetime(previous) {}
+    }
+
+    @Test func changedSourceDropsPersistedBytes() {
+        // 下一场连接报的大小对不上：源站上的文件换过了，上一场留下的整份作废
+        let dir = persistentDir()
+        let key = "file-10-\(UUID())"
+        let previous = SourceByteCache(budgetBytes: 64 << 20, persistentDirectory: dir)
+        previous.noteContentLength(key: key, length: 1_000_000)
+        previous.write(key: key, offset: 0, data: bytes(4096, seed: 6))
+        previous.flushIndexes()
+        previous.drain()
+        let next = SourceByteCache(budgetBytes: 64 << 20, persistentDirectory: dir)
+        #expect(next.contiguousEnd(key: key, from: 0) == 4096)
+        next.noteContentLength(key: key, length: 2_000_000)
+        #expect(next.contiguousEnd(key: key, from: 0) == 0)
+        #expect(next.contentLength(key: key) == 2_000_000)
+        withExtendedLifetime(previous) {}
+    }
+
+    @Test func launchTrimRemovesOrphansAndOldestOverBudget() throws {
+        // 启动整理：只有数据没有记账的删掉；保留总量（运行预算的一半 = 2 块）超了，按最近使用删旧的
+        let dir = persistentDir()
+        let fm = FileManager.default
+        fm.createFile(atPath: dir.appendingPathComponent("orphan.bin").path, contents: Data(count: 10))
+        let previous = SourceByteCache(budgetBytes: Int64(block) * 4, persistentDirectory: dir)
+        let old = "file-1-\(UUID())", new = "file-2-\(UUID())"
+        for (key, seed) in [(old, UInt8(1)), (new, UInt8(2))] {
+            previous.noteContentLength(key: key, length: 50 << 20)
+            previous.write(key: key, offset: 0, data: bytes(block * 2, seed: seed))
+        }
+        previous.flushIndexes()
+        previous.drain()
+        let idxNames = try fm.contentsOfDirectory(atPath: dir.path).filter { $0.hasSuffix(".idx") }
+        #expect(idxNames.count == 2)
+        let oldIdx = try #require(idxNames.first { name in
+            let data = try? Data(contentsOf: dir.appendingPathComponent(name))
+            let object = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            return object?["key"] as? String == old
+        })
+        // 旧片源一小时前用过，新片源刚用过
+        try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3600)],
+                             ofItemAtPath: dir.appendingPathComponent(oldIdx).path)
+        // 下次启动时的整理（新实例，没有正开着的片源）
+        let launch = SourceByteCache(budgetBytes: Int64(block) * 4, persistentDirectory: dir)
+        launch.trimPersisted()
+        let left = try fm.contentsOfDirectory(atPath: dir.path)
+        #expect(!left.contains("orphan.bin"))
+        #expect(!left.contains(oldIdx))
+        #expect(left.filter { $0.hasSuffix(".idx") }.count == 1)
+        #expect(launch.contentLength(key: new) == 50 << 20)
+        withExtendedLifetime(previous) {}
+    }
 }
