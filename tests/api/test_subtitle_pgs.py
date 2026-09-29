@@ -469,3 +469,127 @@ async def test_generation_preflight_rejects_unconfirmed_ocr_language(monkeypatch
             "chs",
             convert_pgs=True,
         )  # type: ignore[arg-type]
+
+
+def _stub_bundled_environment(monkeypatch) -> dict[str, int]:
+    """模拟官方镜像：seconv 可用、Tesseract 装齐 11 种语言；返回各探针的调用次数。"""
+    calls = {"seconv": 0, "tesseract": 0}
+    monkeypatch.setattr(pgs.sys, "platform", "linux")
+    monkeypatch.setattr(pgs.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        pgs.shutil,
+        "which",
+        lambda name: {"ffmpeg": "/usr/bin/ffmpeg", "tesseract": "/usr/bin/tesseract"}.get(name),
+    )
+    monkeypatch.setattr(pgs, "_resolve_seconv", lambda: "/opt/seconv")
+
+    def seconv_probe(*_args):  # noqa: ANN002
+        calls["seconv"] += 1
+        return True, "5.1.0"
+
+    def tesseract_probe(_path):  # noqa: ANN001
+        calls["tesseract"] += 1
+        return set(pgs._TESSERACT_LANGUAGES.values()), None
+
+    monkeypatch.setattr(pgs, "_run_probe", seconv_probe)
+    monkeypatch.setattr(pgs, "_tesseract_languages", tesseract_probe)
+    return calls
+
+
+def test_environment_is_probed_once_for_all_languages(monkeypatch) -> None:
+    """列出可选识别语言曾对 11 种语言逐个起 seconv + tesseract（24 个子进程）。
+
+    NAS 上 seconv 冷启动一两秒，一次预检就超过 iOS/网页的 20 秒超时。环境是
+    部署时定下的，整个进程只该探测一次。
+    """
+    calls = _stub_bundled_environment(monkeypatch)
+
+    pgs.detect_capability("chs")
+    options, representative = pgs.available_ocr_languages()
+    pgs.detect_capability("eng")
+
+    assert calls == {"seconv": 1, "tesseract": 1}
+    assert len(options) == len(pgs.OCR_LANGUAGE_LABELS)
+    assert representative is not None and representative.available
+
+
+def test_concurrent_first_detection_shares_one_probe(monkeypatch) -> None:
+    """预检、确认生成、后台任务可能同时撞上首次探测，只能起一批子进程。"""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    calls = _stub_bundled_environment(monkeypatch)
+    lock = threading.Lock()
+
+    def slow_seconv(*_args):  # noqa: ANN002
+        with lock:
+            calls["seconv"] += 1
+        time.sleep(0.2)
+        return True, "5.1.0"
+
+    monkeypatch.setattr(pgs, "_run_probe", slow_seconv)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(pgs.detect_capability, ["eng", "chs", "jpn", "kor"]))
+
+    assert calls["seconv"] == 1
+    assert all(result.available for result in results)
+
+
+async def test_preview_of_ambiguous_pgs_spawns_no_probe(monkeypatch) -> None:
+    """环境预热之后，语言待确认的 PGS 预检不再现场起任何子进程。"""
+    calls = _stub_bundled_environment(monkeypatch)
+    pgs._environment()  # 相当于启动预热（conftest 已把 warm_capability 换成空操作）
+    row = LibraryFile(
+        id=42,
+        library_id=1,
+        media_item_id=1,
+        file_path="/media/Movie.mkv",
+        duration_seconds=6000,
+        subtitle_streams=[{"codec": "hdmv_pgs_subtitle", "language": "chi"}],
+        external_subtitles=[],
+        source="scanned",
+    )
+
+    async def fake_load_row(_session, _file_id):  # noqa: ANN001
+        return row
+
+    async def fake_context(_session, _row):  # noqa: ANN001
+        from movieclaw_api.services.subtitle_gen import translate
+
+        return translate.FilmContext(title="Movie", year=None, genres=[], overview=None), "zh"
+
+    monkeypatch.setattr(tasks, "_load_row", fake_load_row)
+    monkeypatch.setattr(tasks, "_film_context", fake_context)
+    before = dict(calls)
+
+    for _ in range(3):  # 拨双语开关、换语言、重新检查都会再发一次预检
+        pv = await tasks.preview(
+            None,  # type: ignore[arg-type]
+            42,
+            "chs",
+            secondary_language="eng",
+            wait=False,
+        )
+        assert pv.pgs_conversion is not None
+        assert pv.pgs_conversion.language.confirmation_required
+        assert len(pv.pgs_conversion.language_options) == len(pgs.OCR_LANGUAGE_LABELS)
+
+    assert calls == before, "预检不该再起 seconv/tesseract"
+
+
+def test_missing_component_tells_user_to_restart(monkeypatch) -> None:
+    """环境只在启动时检测：缺组件的提示要说清楚装好后重启才生效。"""
+    monkeypatch.setattr(pgs.sys, "platform", "linux")
+    monkeypatch.setattr(pgs.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        pgs.shutil,
+        "which",
+        lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None,
+    )
+    monkeypatch.setattr(pgs, "_resolve_seconv", lambda: None)
+
+    result = pgs.detect_capability("eng")
+
+    assert any("重启" in item for item in result.suggestions)

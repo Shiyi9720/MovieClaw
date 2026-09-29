@@ -8,20 +8,24 @@
 跨平台边界在真正启动任务前完成检测：只接受 Subtitle Edit 官方提供的
 Windows/Linux/macOS x64/ARM64 组合，并分别校验 ffmpeg、seconv、OCR
 引擎及语言包。检测失败返回结构化中文说明，绝不等后台任务启动后才静默跳过。
+这些都是部署环境的属性，进程启动时在后台探测一次并缓存（见 ``_Environment``），
+预检只查表，不在请求里起子进程；改了环境需重启生效。
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import platform
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -30,12 +34,16 @@ if TYPE_CHECKING:
     from movieclaw_db.models import LibraryFile
 
 
+logger = logging.getLogger("movieclaw_api.subtitle_gen")
+
 PGS_CODECS = frozenset({"hdmv_pgs_subtitle", "pgs", "sup"})
 
 _SECONV_PROBE_TIMEOUT = 10.0
 _OCR_PROBE_TIMEOUT = 20.0
 _EXTRACT_TIMEOUT = 180.0
 _OCR_TIMEOUT = 3600.0
+#: 环境只在启动时探测一次；缺组件的提示都要讲清楚装好之后怎么生效。
+_RESTART_HINT = "安装或修改后请重启 MovieClaw，才会重新检测"
 
 _ARCH_ALIASES = {
     "amd64": "x64",
@@ -383,32 +391,158 @@ def _base_capability(
     )
 
 
+@dataclass(frozen=True)
+class _Environment:
+    """本机 PGS 转换环境的探测快照：进程生命周期内只探测一次。
+
+    平台架构、ffmpeg、seconv、OCR 引擎与 Tesseract 语言包都是部署时就定下的
+    事实，运行期间不会变。此前每次预检都现场探测，语言需要确认时还要把 11 种
+    语言逐个探一遍，一次请求串行起 24 个子进程（seconv 是 .NET 程序，NAS 上
+    每次冷启动一两秒），iOS 与网页都因此撞上 20 秒超时。现在启动时在后台探测
+    一次，之后按语言下结论只是查表。改了环境（装语言包、换 seconv、改
+    ``MOVIECLAW_PGS_OCR_ENGINE``）需要重启 MovieClaw 才会重新检测。
+
+    字段按探测顺序填写；前一步已判定不可用时后面的步骤不再执行，保持原来
+    「能力缺失时尽早给出第一条原因」的语义。
+    """
+
+    platform_name: str
+    architecture: str
+    runtime_error: str | None = None
+    ffmpeg: bool = False
+    seconv_path: str | None = None
+    seconv_healthy: bool = False
+    seconv_detail: str = ""
+    engine: str = "auto"
+    paddle_path: str | None = None
+    paddle_healthy: bool = False
+    paddle_detail: str = ""
+    tesseract_path: str | None = None
+    tesseract_languages: frozenset[str] = frozenset()
+    tesseract_error: str | None = None
+
+
+_ENVIRONMENT: _Environment | None = None
+# 预检、确认生成、后台任务都在线程池里取能力结论，可能同时撞上首次探测；
+# 用锁保证只探测一次，后来者等同一份结果，而不是各自再起一批子进程。
+_ENVIRONMENT_LOCK = threading.Lock()
+
+
+def _probe_environment() -> _Environment:
+    """（阻塞）真正起子进程探测本机环境：seconv、PaddleOCR、Tesseract 各至多一次。"""
+    platform_name, architecture, runtime_error = _runtime()
+    env = _Environment(platform_name=platform_name, architecture=architecture)
+    if runtime_error:
+        return replace(env, runtime_error=runtime_error)
+    if shutil.which("ffmpeg") is None:
+        return env
+    env = replace(env, ffmpeg=True)
+
+    seconv = _resolve_seconv()
+    if seconv is None:
+        return env
+    healthy, detail = _run_probe([seconv, "--version"], _SECONV_PROBE_TIMEOUT)
+    env = replace(env, seconv_path=seconv, seconv_healthy=healthy, seconv_detail=detail)
+    if not healthy:
+        return env
+
+    requested = os.environ.get("MOVIECLAW_PGS_OCR_ENGINE", "auto").strip().lower()
+    env = replace(env, engine=requested)
+    if requested not in {"auto", "paddle", "tesseract"}:
+        return env
+
+    if requested in {"auto", "paddle"}:
+        paddle = shutil.which("paddleocr")
+        if paddle is not None:
+            paddle_ok, paddle_detail = _run_probe([paddle, "--help"], _OCR_PROBE_TIMEOUT)
+            env = replace(
+                env, paddle_path=paddle, paddle_healthy=paddle_ok, paddle_detail=paddle_detail
+            )
+        if requested == "paddle":
+            return env
+
+    tesseract = shutil.which("tesseract")
+    if tesseract is not None:
+        installed, error = _tesseract_languages(tesseract)
+        env = replace(
+            env,
+            tesseract_path=tesseract,
+            tesseract_languages=frozenset(installed),
+            tesseract_error=error,
+        )
+    return env
+
+
+def _environment() -> _Environment:
+    """取本机环境快照；首次调用（通常是启动预热）才真正探测。"""
+    global _ENVIRONMENT
+    if _ENVIRONMENT is None:
+        with _ENVIRONMENT_LOCK:
+            if _ENVIRONMENT is None:
+                _ENVIRONMENT = _probe_environment()
+                _log_environment(_ENVIRONMENT)
+    return _ENVIRONMENT
+
+
+def _log_environment(env: _Environment) -> None:
+    """启动日志里写一句结论：部署者不必等到点 AI 字幕才知道图片字幕能不能识别。"""
+    options = [label for code, label in OCR_LANGUAGE_LABELS.items() if _decide(env, code).available]
+    if options:
+        logger.info("PGS 图片字幕识别自检通过，可识别：%s", "、".join(options))
+    else:
+        logger.info(
+            "当前设备不能识别 PGS 图片字幕（只有图片字幕的片子无法生成 AI 字幕）：%s",
+            _decide(env, "eng").message,
+        )
+
+
+def reset_capability_cache() -> None:
+    """测试用：丢掉环境快照，下次取能力时重新探测。"""
+    global _ENVIRONMENT
+    with _ENVIRONMENT_LOCK:
+        _ENVIRONMENT = None
+
+
+def warm_capability() -> None:
+    """（阻塞，调用方须放线程池）启动时预热环境探测，让首次预检直接命中缓存。"""
+    _environment()
+
+
 def detect_capability(language: str | None) -> Capability:
     """检测当前设备能否把指定语言的 PGS 转为 SRT。
 
     ``MOVIECLAW_PGS_OCR_ENGINE`` 可设为 ``paddle`` 或 ``tesseract``；默认
     ``auto`` 优先选择已安装且健康的 PaddleOCR，失败后再尝试 Tesseract。
+    环境只在进程内探测一次（见 ``_Environment``），这里按语言查表下结论。
     """
-    platform_name, architecture, runtime_error = _runtime()
-    if runtime_error:
+    return _decide(_environment(), language)
+
+
+def _decide(env: _Environment, language: str | None) -> Capability:
+    """用环境快照回答「这种语言的 PGS 能不能转」：纯计算，不起任何子进程。"""
+    platform_name, architecture = env.platform_name, env.architecture
+    if env.runtime_error:
         return _base_capability(
             available=False,
             platform_name=platform_name,
             architecture=architecture,
-            message=runtime_error,
+            message=env.runtime_error,
             suggestions=("请改用 x64/ARM64 主机执行 OCR，或手动添加 SRT/ASS/VTT 字幕",),
         )
 
-    if shutil.which("ffmpeg") is None:
+    if not env.ffmpeg:
         return _base_capability(
             available=False,
             platform_name=platform_name,
             architecture=architecture,
             message="系统中未找到 ffmpeg，无法从媒体文件抽取 PGS 轨道",
-            suggestions=("安装 ffmpeg 并确保命令位于 PATH；官方 Docker 镜像已内置",),
+            suggestions=(
+                "安装 ffmpeg 并确保命令位于 PATH；官方 Docker 镜像已内置",
+                _RESTART_HINT,
+            ),
         )
 
-    seconv = _resolve_seconv()
+    seconv = env.seconv_path
     if seconv is None:
         return _base_capability(
             available=False,
@@ -419,22 +553,25 @@ def detect_capability(language: str | None) -> Capability:
                 "安装与当前系统和架构匹配的 SeConv 5.1，并加入 PATH",
                 "也可通过 MOVIECLAW_SECONV_PATH 指向 seconv 可执行文件",
                 "官方 Docker 镜像会按 amd64/arm64 自动内置正确版本",
+                _RESTART_HINT,
             ),
         )
-    healthy, detail = _run_probe([seconv, "--version"], _SECONV_PROBE_TIMEOUT)
-    if not healthy:
+    if not env.seconv_healthy:
         return _base_capability(
             available=False,
             platform_name=platform_name,
             architecture=architecture,
-            message=f"seconv 无法在当前设备启动：{detail or '未返回版本信息'}",
-            suggestions=("确认下载的 seconv 架构正确，并检查其系统动态库依赖",),
+            message=f"seconv 无法在当前设备启动：{env.seconv_detail or '未返回版本信息'}",
+            suggestions=(
+                "确认下载的 seconv 架构正确，并检查其系统动态库依赖",
+                _RESTART_HINT,
+            ),
             seconv_path=seconv,
         )
 
     raw_lang = str(language or "").strip().lower()
     lang = normalize_ocr_language(raw_lang) or raw_lang
-    requested = os.environ.get("MOVIECLAW_PGS_OCR_ENGINE", "auto").strip().lower()
+    requested = env.engine
     if requested not in {"auto", "paddle", "tesseract"}:
         return _base_capability(
             available=False,
@@ -444,33 +581,32 @@ def detect_capability(language: str | None) -> Capability:
                 "MOVIECLAW_PGS_OCR_ENGINE 配置无效："
                 f"{requested!r}（只允许 auto、paddle、tesseract）"
             ),
+            suggestions=(_RESTART_HINT,),
             seconv_path=seconv,
         )
 
     paddle_error: str | None = None
     if requested in {"auto", "paddle"}:
         paddle_language = _PADDLE_LANGUAGES.get(lang)
-        paddle = shutil.which("paddleocr")
         if not paddle_language:
             paddle_error = f"PGS 语言 {lang or '未知'} 没有可确认的 PaddleOCR 语言映射"
-        elif paddle is None:
+        elif env.paddle_path is None:
             paddle_error = "未找到 paddleocr 命令"
+        elif env.paddle_healthy:
+            return _base_capability(
+                available=True,
+                platform_name=platform_name,
+                architecture=architecture,
+                engine="paddle",
+                ocr_language=paddle_language,
+                message=(
+                    f"可使用 PaddleOCR（{paddle_language}）将 PGS 转为临时 SRT；"
+                    "转换完成并通过完整度检查后才会调用 AI 翻译"
+                ),
+                seconv_path=seconv,
+            )
         else:
-            paddle_ok, paddle_detail = _run_probe([paddle, "--help"], _OCR_PROBE_TIMEOUT)
-            if paddle_ok:
-                return _base_capability(
-                    available=True,
-                    platform_name=platform_name,
-                    architecture=architecture,
-                    engine="paddle",
-                    ocr_language=paddle_language,
-                    message=(
-                        f"可使用 PaddleOCR（{paddle_language}）将 PGS 转为临时 SRT；"
-                        "转换完成并通过完整度检查后才会调用 AI 翻译"
-                    ),
-                    seconv_path=seconv,
-                )
-            paddle_error = f"paddleocr 无法启动：{paddle_detail or '未知错误'}"
+            paddle_error = f"paddleocr 无法启动：{env.paddle_detail or '未知错误'}"
         if requested == "paddle":
             return _base_capability(
                 available=False,
@@ -479,35 +615,33 @@ def detect_capability(language: str | None) -> Capability:
                 message=paddle_error,
                 suggestions=(
                     "安装可用的 PaddleOCR，或将 MOVIECLAW_PGS_OCR_ENGINE 改为 auto/tesseract",
+                    _RESTART_HINT,
                 ),
                 seconv_path=seconv,
             )
 
     tesseract_language = _TESSERACT_LANGUAGES.get(lang)
-    tesseract = shutil.which("tesseract")
     if not tesseract_language:
         message = f"PGS 语言 {lang or '未知'} 无法自动选择 OCR 语言包"
-    elif tesseract is None:
+    elif env.tesseract_path is None:
         message = "未找到 Tesseract OCR"
+    elif env.tesseract_error:
+        message = f"Tesseract 无法读取语言包列表：{env.tesseract_error}"
+    elif tesseract_language not in env.tesseract_languages:
+        message = f"Tesseract 缺少 {tesseract_language} 语言包"
     else:
-        installed, error = _tesseract_languages(tesseract)
-        if error:
-            message = f"Tesseract 无法读取语言包列表：{error}"
-        elif tesseract_language not in installed:
-            message = f"Tesseract 缺少 {tesseract_language} 语言包"
-        else:
-            return _base_capability(
-                available=True,
-                platform_name=platform_name,
-                architecture=architecture,
-                engine="tesseract",
-                ocr_language=tesseract_language,
-                message=(
-                    f"可使用 Tesseract（{tesseract_language}）将 PGS 转为临时 SRT；"
-                    "转换完成并通过完整度检查后才会调用 AI 翻译"
-                ),
-                seconv_path=seconv,
-            )
+        return _base_capability(
+            available=True,
+            platform_name=platform_name,
+            architecture=architecture,
+            engine="tesseract",
+            ocr_language=tesseract_language,
+            message=(
+                f"可使用 Tesseract（{tesseract_language}）将 PGS 转为临时 SRT；"
+                "转换完成并通过完整度检查后才会调用 AI 翻译"
+            ),
+            seconv_path=seconv,
+        )
 
     details = message
     if paddle_error and requested == "auto":
@@ -520,6 +654,7 @@ def detect_capability(language: str | None) -> Capability:
         suggestions=(
             f"安装与字幕语言匹配的 OCR 语言包（当前轨道：{lang or '未知语言'}）",
             "也可以为影片添加可直接翻译的 SRT、ASS 或 VTT 外挂字幕",
+            _RESTART_HINT,
         ),
         seconv_path=seconv,
     )
@@ -528,8 +663,9 @@ def detect_capability(language: str | None) -> Capability:
 def available_ocr_languages() -> tuple[tuple[tuple[str, str], ...], Capability | None]:
     """返回当前设备真正可用的用户语言选项及一份代表性环境结论。
 
-    只在语言缺失或冲突时调用；异常轨很少，逐语言复用完整探针可确保源码部署
-    缺少部分 traineddata 时，下拉框不会给出实际不可用的选项。
+    只在语言缺失或冲突时调用。逐语言复用同一份结论，源码部署缺少部分
+    traineddata 时下拉框不会给出实际不可用的选项；环境快照是缓存的，
+    逐语言判断不再各自起子进程。
     """
     options: list[tuple[str, str]] = []
     first_available: Capability | None = None
