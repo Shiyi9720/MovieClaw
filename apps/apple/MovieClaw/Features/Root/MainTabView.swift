@@ -34,8 +34,9 @@ struct MainTabView: View {
     /// 头像页签在窗口里的位置（账号手势提示气泡对准它，见 TabBarAccountGestures）
     @State private var avatarTabFrame: CGRect = .zero
     @State private var showAccountTip = false
-    /// 账号手势提示看过没有（只提示一次）
-    @AppStorage("movieclaw.tips.accountGestures") private var accountTipShown = false
+    /// 账号手势提示看过没有（只提示一次）。只在气泡真的显示出来时才记：头像页签的位置还没找到时
+    /// 气泡画不出来，照样记下就等于没提示过却再也不提示了（v1 键在测试包里就这样被误记过，换了新键）
+    @AppStorage("movieclaw.tips.accountGestures.v2") private var accountTipShown = false
     /// 双击切换进行中：切换要向服务器校验一次令牌，期间再双击不重复发起
     @State private var switchingAccount = false
 
@@ -99,11 +100,12 @@ struct MainTabView: View {
                 AccountGestureTip(avatarFrame: avatarTabFrame) { withAnimation { showAccountTip = false } }
             }
         }
-        // 本机账号超过一个时才提示账号手势（一个账号时这两个手势都没意义），只提示一次
-        .task(id: model.savedAccountCount) {
-            guard model.savedAccountCount > 1, !accountTipShown else { return }
+        // 本机账号超过一个时才提示账号手势（一个账号时这两个手势都没意义），只提示一次；
+        // 等找到头像页签的位置再提示（气泡要对准它）
+        .task(id: "\(model.savedAccountCount)|\(avatarTabFrame != .zero)") {
+            guard model.savedAccountCount > 1, !accountTipShown, avatarTabFrame != .zero else { return }
             try? await Task.sleep(for: .seconds(1.2))
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, avatarTabFrame != .zero else { return }
             accountTipShown = true
             withAnimation { showAccountTip = true }
             try? await Task.sleep(for: .seconds(6))
