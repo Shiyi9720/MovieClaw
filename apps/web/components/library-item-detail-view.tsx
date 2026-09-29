@@ -140,7 +140,7 @@ export function LibraryItemDetailView({
   initialSeason?: number;
   initialEpisode?: number;
 }) {
-  const { canManageLibraries, isAdmin } = usePermissions();
+  const { canManageLibraries, canSearchTorrents, isAdmin } = usePermissions();
   // 洗版入口（quality-upgrade.md §13.3/§13.5）：有订阅并入既有订阅，无订阅走
   // 订阅弹层的洗版变体（库存季预填、建完自动接一轮洗版）
   const { canSubscribe, subscriptionOf, open: openSubscribe } = useSubscribeEntry();
@@ -663,7 +663,10 @@ export function LibraryItemDetailView({
       scraped={detail.source === "tmdb"}
       readsNfo={detail.kind === "video"}
       scraping={scrapingNow}
-      searchHref={`/search?q=${encodeURIComponent(detail.title)}` as Route}
+      // 公开演示站不接资源站点：不给「搜索资源」（canSearchTorrents 为 false）
+      searchHref={
+        canSearchTorrents ? (`/search?q=${encodeURIComponent(detail.title)}` as Route) : undefined
+      }
       // 加入合集：任何能看到这部片的人都能把它扔进自己的单子
       onAddToCollection={() => setAddToCollectionOpen(true)}
       // 分享仅超管（media-share.md §2.1）；照片库条目不分享（分享页是影片页）
@@ -1402,8 +1405,8 @@ function ItemActionsMenu({
   /** 其他库的视频条目：刷新会先重读视频旁的 NFO（照片、影视库里的临时条目只重建封面） */
   readsNfo: boolean;
   scraping: boolean;
-  /** 站点资源搜索直达（预填片名）：手动补版本/换版本的入口 */
-  searchHref: Route;
+  /** 站点资源搜索直达（预填片名）：手动补版本/换版本的入口；无资源搜索权限时不传 */
+  searchHref?: Route;
   onReidentify: () => void;
   onRefreshMetadata: () => void;
   /** 重新生成章节场景图（与刷新元数据独立）；所在库关了开关时不传 */
@@ -1449,7 +1452,7 @@ function ItemActionsMenu({
           collisionPadding={12}
           className="menu-surface z-50 min-w-[11rem] p-1"
         >
-          {canManage && (
+          {canManage && searchHref && (
             <DropdownMenu.Item
               onSelect={() => router.push(searchHref)}
               className={itemClass}

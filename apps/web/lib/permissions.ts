@@ -10,7 +10,10 @@ import { useSession } from "@/lib/session";
 export interface AppPermissions {
   isAdmin: boolean;
   canSubscribe: boolean;
+  /** 能用全局搜索框（影视 / 媒体库 / 站点资源三个垂直的总入口） */
   canSearch: boolean;
+  /** 能用站点资源（PT 种子）搜索：搜索页的资源垂直、详情页「搜索资源」、手动选种 */
+  canSearchTorrents: boolean;
   canDirectDownload: boolean;
   canManageLibraries: boolean;
   canManageSubscriptions: boolean;
@@ -19,12 +22,15 @@ export interface AppPermissions {
 export function permissionsFor(session: SessionView): AppPermissions {
   const isAdmin = session.role === "admin";
   // 公开演示站（docs/design/demo-site.md）不接 PT 站点：资源站搜索与一键下载对谁都
-  // 不开放，超管也一样。订阅入口照常显示，确认订阅时由后端说明演示站不会真的下载
+  // 不开放，超管也一样；搜索框本身照常显示（影视与媒体库搜索后端是放行的）。
+  // 订阅入口照常显示，确认订阅时由后端说明演示站不会真的下载
   const demo = session.demo === true;
+  const canSearch = isAdmin || session.capabilities.allow_search;
   return {
     isAdmin,
     canSubscribe: isAdmin || session.capabilities.allow_subscribe,
-    canSearch: !demo && (isAdmin || session.capabilities.allow_search),
+    canSearch,
+    canSearchTorrents: !demo && canSearch,
     canDirectDownload: !demo && (isAdmin || session.capabilities.allow_direct_download),
     canManageLibraries: isAdmin,
     canManageSubscriptions: isAdmin,

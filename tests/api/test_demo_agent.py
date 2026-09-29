@@ -149,3 +149,29 @@ async def test_device_sessions_are_isolated_complete_and_idempotent(db) -> None:
         # 续聊从这份转录重建历史，必须能原样喂回模型
         assert store.build_history(sid)
         json.dumps([m.model_dump() for m in messages], ensure_ascii=False)
+
+
+def test_demo_agent_quota_per_device(monkeypatch) -> None:
+    """每台设备新开会话数与发消息频率有上限，超了明说（429），不影响别的设备。"""
+    import pytest
+
+    from movieclaw_api.exceptions import AppException
+
+    monkeypatch.setattr(demo_agent, "_owners", {})
+    monkeypatch.setattr(demo_agent, "_message_times", {})
+    monkeypatch.setattr(demo_agent, "MAX_NEW_SESSIONS_PER_DEVICE", 2)
+    monkeypatch.setattr(demo_agent, "MAX_MESSAGES_PER_WINDOW", 3)
+    alice, bob = _principal(1), _principal(2)
+
+    for sid in ("a1", "a2"):
+        demo_agent.ensure_can_send(alice, new_session=True)
+        demo_agent.claim(sid, alice)
+    with pytest.raises(AppException) as exc:
+        demo_agent.ensure_can_send(alice, new_session=True)
+    assert exc.value.status_code == 429 and "已有的会话" in exc.value.message
+
+    # 在已有会话里续聊不受会话数限制，但受频率限制（前面已计 2 次）
+    demo_agent.ensure_can_send(alice, new_session=False)
+    with pytest.raises(AppException):
+        demo_agent.ensure_can_send(alice, new_session=False)
+    demo_agent.ensure_can_send(bob, new_session=True)

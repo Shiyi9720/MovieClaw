@@ -29,6 +29,8 @@ import {
 } from "@/lib/api/app";
 import { getHealth } from "@/lib/api/health";
 import { formatBytes } from "@/lib/format";
+import { HttpError } from "@/lib/http";
+import { useSession } from "@/lib/session";
 import { formatDateTime, formatUnixDateTime } from "@/lib/time";
 
 /**
@@ -84,7 +86,20 @@ interface AvailableUpdate {
   knownBad: boolean;
 }
 
+/**
+ * 重启请求失败时，是否属于「连接层面」的失败：status 0 = 网络断开 / 连接被重置
+ * （lib/http.ts 把 fetch 的 TypeError 与超时归一成 status 0），502～504 = 反代在后端
+ * 退出的瞬间代答的网关错误。这两类可能正是进程退出掐断了请求，属预期；其余状态码
+ * 是后端明确给出的业务错误（如公开演示站的 403），服务根本没有重启。
+ */
+function isConnectionLoss(status: number): boolean {
+  return status === 0 || status === 502 || status === 503 || status === 504;
+}
+
 export function AppUpdateSection() {
+  // 公开演示站（docs/design/demo-site.md）：应用内更新、回退与重启一律不提供，
+  // 后端也会拒绝；只展示当前版本，免得访客点了按钮才收到拒绝
+  const demo = useSession().session.demo === true;
   const [status, setStatus] = useState<UpdateStatusView | null>(null);
   const [failed, setFailed] = useState(false);
   const [check, setCheck] = useState<UpdateCheckView | null>(null);
@@ -92,6 +107,8 @@ export function AppUpdateSection() {
   const [checkError, setCheckError] = useState<string | null>(null);
   const [progress, setProgress] = useState<UpdateProgressView | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // 重启请求被后端拒绝时的说明，显示在「重启应用」按钮下方（离动作最近）
+  const [restartError, setRestartError] = useState<string | null>(null);
   const [modelCheck, setModelCheck] = useState<ModelUpdateCheckView | null>(null);
   const [modelChecking, setModelChecking] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
@@ -311,12 +328,19 @@ export function AppUpdateSection() {
       tone: "danger",
     });
     if (!ok) return;
-    void waitForRestart("app");
+    setRestartError(null);
     try {
       await restartApp();
-    } catch {
-      // 请求可能因进程退出而中断，属预期：等待流程已经在轮询 /health 了
+    } catch (e) {
+      // 后端明确拒绝（业务错误）：原样展示后端说明，不进等待流程——否则会对着
+      // 一个根本没重启的服务转圈约 60 秒再自动刷新。连接层面的失败可能是进程
+      // 退出掐断了请求，属预期，照常进入等待
+      if (e instanceof HttpError && !isConnectionLoss(e.status)) {
+        setRestartError(e.message);
+        return;
+      }
     }
+    void waitForRestart("app");
   };
 
   /** 调整本地保留版本数（立即生效并按新策略清理）。 */
@@ -415,7 +439,7 @@ export function AppUpdateSection() {
                   <span className="font-mono text-body text-[var(--text)]">
                     v{status.current_version}
                   </span>
-                  {status.can_update && !updating && (
+                  {status.can_update && !updating && !demo && (
                     <button
                       type="button"
                       onClick={doCheck}
@@ -437,10 +461,16 @@ export function AppUpdateSection() {
               {checkError && (
                 <p className="mt-1.5 text-right text-caption text-red-300">{checkError}</p>
               )}
-              {!status.can_update && (
+              {demo ? (
                 <p className="mt-1.5 text-right text-caption text-[var(--text-faint)]">
-                  仅 Docker 镜像部署支持应用内更新；源码部署请用 git pull 更新
+                  演示站不提供应用内更新
                 </p>
+              ) : (
+                !status.can_update && (
+                  <p className="mt-1.5 text-right text-caption text-[var(--text-faint)]">
+                    仅 Docker 镜像部署支持应用内更新；源码部署请用 git pull 更新
+                  </p>
+                )
               )}
             </div>
             {status.inactive_overlay_version && (
@@ -499,7 +529,7 @@ export function AppUpdateSection() {
           )}
 
           {/* 新版本卡片：进页由快照预填，手动检查后以检查结果为准 */}
-          {!updating && available && (
+          {!updating && available && !demo && (
             <div className="css-glass !rounded-2xl px-5 py-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <p className="text-ui font-medium text-[var(--text)]">
@@ -551,7 +581,7 @@ export function AppUpdateSection() {
       )}
 
       {/* —— NER 模型 ——（独立于代码更新；生效需重新解析模型指针，走全量重启） */}
-      {status.can_update && (
+      {status.can_update && !demo && (
         <section>
           <h3 className="group-label mb-2.5 px-1">NER 识别模型</h3>
           <div className="css-glass !rounded-2xl px-5 py-4">
@@ -610,7 +640,7 @@ export function AppUpdateSection() {
       )}
 
       {/* —— 回退与版本保留 ——（有候选版本才出现回退入口；保留数设置常驻） */}
-      {status.can_update && rollback && (
+      {status.can_update && rollback && !demo && (
         <section>
           <h3 className="group-label mb-2.5 px-1">回退</h3>
           <div className="css-glass divide-y divide-white/[0.055] !rounded-2xl">
@@ -669,47 +699,50 @@ export function AppUpdateSection() {
       )}
 
       {/* —— 维护 ——（重启应用：与更新/回退同属"让应用重来一次"，放在本页最后，
-             与上面的更新动作隔开，避免顺手误点） */}
-      <section>
-        <h3 className="group-label mb-2.5 px-1">维护</h3>
-        <div className="css-glass !rounded-2xl">
-          <div className="flex items-center justify-between gap-4 px-5 py-4">
-            <span className="flex min-w-0 items-center gap-1.5">
-              <span className="truncate text-ui font-medium text-[var(--text)]">重启应用</span>
-              <Tooltip
-                content={
-                  <>
-                    <p>优雅停机后重新启动后端服务，正在进行的任务会中断。</p>
-                    <p className="mt-1.5">
-                      Docker 部署由容器入口自动拉起新进程，通常几秒内恢复；源码部署需有
-                      systemd 等守护，否则退出后要到服务器上手动启动。
-                    </p>
-                  </>
-                }
-                placement="top"
-                maxWidth={340}
-                openOnClick
-              >
-                <button
-                  type="button"
-                  aria-label="重启应用的说明"
-                  className="flex shrink-0 text-[var(--text-faint)] transition-colors hover:text-[var(--text-muted)] focus-visible:text-[var(--text-muted)]"
+             与上面的更新动作隔开，避免顺手误点；演示站不提供） */}
+      {!demo && (
+        <section>
+          <h3 className="group-label mb-2.5 px-1">维护</h3>
+          <div className="css-glass !rounded-2xl">
+            <div className="flex items-center justify-between gap-4 px-5 py-4">
+              <span className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate text-ui font-medium text-[var(--text)]">重启应用</span>
+                <Tooltip
+                  content={
+                    <>
+                      <p>优雅停机后重新启动后端服务，正在进行的任务会中断。</p>
+                      <p className="mt-1.5">
+                        Docker 部署由容器入口自动拉起新进程，通常几秒内恢复；源码部署需有
+                        systemd 等守护，否则退出后要到服务器上手动启动。
+                      </p>
+                    </>
+                  }
+                  placement="top"
+                  maxWidth={340}
+                  openOnClick
                 >
-                  <InfoIcon className="size-[15px]" />
-                </button>
-              </Tooltip>
-            </span>
-            <button
-              type="button"
-              onClick={() => void doRestart()}
-              disabled={updating}
-              className="btn-glass shrink-0 px-3.5 py-1.5 text-sub font-semibold text-red-300/90 hover:text-red-200 disabled:opacity-50"
-            >
-              重启应用
-            </button>
+                  <button
+                    type="button"
+                    aria-label="重启应用的说明"
+                    className="flex shrink-0 text-[var(--text-faint)] transition-colors hover:text-[var(--text-muted)] focus-visible:text-[var(--text-muted)]"
+                  >
+                    <InfoIcon className="size-[15px]" />
+                  </button>
+                </Tooltip>
+              </span>
+              <button
+                type="button"
+                onClick={() => void doRestart()}
+                disabled={updating}
+                className="btn-glass shrink-0 px-3.5 py-1.5 text-sub font-semibold text-red-300/90 hover:text-red-200 disabled:opacity-50"
+              >
+                重启应用
+              </button>
+            </div>
+            {restartError && <p className="px-5 pb-4 text-sub text-red-300">{restartError}</p>}
           </div>
-        </div>
-      </section>
+        </section>
+      )}
 
       <RollbackDialog
         open={rollbackOpen}

@@ -27,12 +27,15 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from collections import deque
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, ValidationError
 
 from movieclaw_api.core.config import get_settings
+from movieclaw_api.exceptions import AppException
 from movieclaw_api.schemas.base import BaseModel
 
 logger = logging.getLogger("movieclaw_api.demo")
@@ -67,13 +70,6 @@ ALLOWED_WRITE_OPERATIONS: frozenset[str] = frozenset(
         "playback.marks.set",  # 收藏 / 已看：只落当前账号自己的播放状态
         "playback.metric.report",
         "playback.client-log",
-        # ---- 影片分享的访客通道：演示站不能创建分享，放行只为不改变其语义 ----
-        "share.unlock",
-        "share.playback.decide",
-        "share.playback.session.start",
-        "share.playback.session.ping",
-        "share.playback.session.stop",
-        "share.playback.progress",
         # ---- AI 助手：对话走预设回复的演示模型，会话按设备隔离（services/demo_agent.py）----
         "session.start",
         "session.stop",
@@ -106,6 +102,10 @@ BLOCKED_READ_OPERATIONS: dict[str, str] = {
     "site.catalog": _PT_MESSAGE,
     "search.torrents": _PT_MESSAGE,
     "workflow.search.torrents.stream": _PT_MESSAGE,
+    # 完整接口清单：公开账号登录后就能拿到，等于把 /docs 又开了出来
+    "system.spec": "演示站不提供接口清单",
+    # 转码诊断里有 ffmpeg 输出片段，带服务器上的文件路径
+    "playback.session.diagnostics": "演示站不提供转码诊断信息",
 }
 
 # 按 operation_id 前缀给出更具体的拒绝理由（先匹配先用）；都不匹配时用通用文案。
@@ -116,8 +116,10 @@ _WRITE_MESSAGES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("members.",), "演示站不能新增、修改、停用或删除成员"),
     (("auth.bootstrap",), "演示站已完成初始化"),
     (("subscriptions.create",), _SUBSCRIBE_MESSAGE),
+    (("playback.activity.",), "演示站不能结束其他人正在进行的播放"),
+    (("share.", "shares.", "collection.share", "library.items.share"), "演示站不开放影片分享"),
     (
-        ("auth.devices.", "auth.device.", "auth.tokens", "playback.device.", "playback.activity."),
+        ("auth.devices.", "auth.device.", "auth.tokens", "playback.device."),
         "演示站不能管理登录设备与令牌",
     ),
     (
@@ -238,9 +240,68 @@ def is_public_account(username: str) -> bool:
     return any(account.username.lower() == wanted for account in demo_accounts().accounts)
 
 
+# ---------------------------------------------------------------------------
+# 登录频率：按来源地址限
+# ---------------------------------------------------------------------------
+# 公开账号不走「按用户名连续失败锁定」（见 is_public_account），但每次登录都要
+# 跑一次刻意很慢的密码哈希校验，成功后还会建一条登录设备、生成一套预置对话。
+# 不设上限的话，一个脚本就能把 CPU 与磁盘拖垮。所以演示站对**全部**登录请求
+# 按来源地址计数（随机用户名也要跑一次哈希，同样要算）：正常访客切几次角色
+# 远用不到上限。取不到可信地址时（反代没配 FORWARDED_ALLOW_IPS）所有人落进
+# 同一个桶，上限相应放宽——宁可高峰时让人稍等，也不让服务被拖死。
+LOGIN_WINDOW_SECONDS = 600
+LOGIN_LIMIT_PER_ADDRESS = 30
+LOGIN_LIMIT_UNKNOWN_ADDRESS = 600
+# 记录的地址数上限：超出时先丢已过窗口的，再丢最早的，防止海量地址注水内存
+_MAX_LOGIN_ADDRESSES = 20000
+_login_attempts: dict[str, deque[float]] = {}
+
+
+def ensure_login_allowed(address: str) -> None:
+    """演示模式下登录前调用：该来源地址近 10 分钟的登录次数超限时抛 429。
+
+    未开演示模式时什么都不做。每次调用本身计一次（成功失败都算）。
+    """
+    if not is_demo_mode():
+        return
+    now = time.monotonic()
+    limit = LOGIN_LIMIT_PER_ADDRESS if address else LOGIN_LIMIT_UNKNOWN_ADDRESS
+    attempts = _login_attempts.get(address)
+    if attempts is None:
+        if len(_login_attempts) >= _MAX_LOGIN_ADDRESSES:
+            _prune_login_attempts(now)
+        attempts = _login_attempts[address] = deque()
+    while attempts and now - attempts[0] > LOGIN_WINDOW_SECONDS:
+        attempts.popleft()
+    if len(attempts) >= limit:
+        wait = int(LOGIN_WINDOW_SECONDS - (now - attempts[0])) + 1
+        logger.warning("演示站登录过于频繁，来源 %s 已达 %d 次/10 分钟", address or "未知", limit)
+        raise AppException(
+            status_code=429,
+            code="TOO_MANY_ATTEMPTS",
+            message=f"登录过于频繁，请 {max(wait, 1)} 秒后再试",
+        )
+    attempts.append(now)
+
+
+def _prune_login_attempts(now: float) -> None:
+    stale = [
+        key
+        for key, attempts in _login_attempts.items()
+        if not attempts or now - attempts[-1] > LOGIN_WINDOW_SECONDS
+    ]
+    for key in stale:
+        del _login_attempts[key]
+    # 全都还在窗口里：丢掉最早登记的一半（dict 保持插入顺序）
+    if len(_login_attempts) >= _MAX_LOGIN_ADDRESSES:
+        for key in list(_login_attempts)[: _MAX_LOGIN_ADDRESSES // 2]:
+            del _login_attempts[key]
+
+
 def reset_demo_state() -> None:
-    """仅供测试：清掉账号清单缓存。"""
+    """仅供测试：清掉账号清单缓存与登录计数。"""
     _load_accounts_file.cache_clear()
+    _login_attempts.clear()
 
 
 # ---------------------------------------------------------------------------

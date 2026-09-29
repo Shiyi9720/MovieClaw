@@ -195,6 +195,8 @@ def test_demo_blocks_sensitive_reads(client: TestClient, monkeypatch) -> None:
     _assert_demo_denied(client.get("/api/v1/system/logs"))
     _assert_demo_denied(client.get("/api/v1/extension/token"))
     _assert_demo_denied(client.get("/api/v1/sites/catalog"), contains="PT")
+    # 完整接口清单：公开账号登录后就能拿，等于绕开了关闭的 /docs
+    _assert_demo_denied(client.get("/api/v1/spec"))
 
     # 发现照常开放、订阅面板能预检，只有确认订阅被拒，并说明演示站不会真的下载
     for method, operation in [
@@ -367,3 +369,59 @@ def test_demo_disables_in_app_update(monkeypatch) -> None:
         assert app_update._runtime_version() is None
     finally:
         get_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# 上线安全：空库不能被抢注、登录与冒用演示设备
+# ---------------------------------------------------------------------------
+
+
+def test_demo_mode_rejects_bootstrap_on_empty_data(client: TestClient, monkeypatch) -> None:
+    """data/ 被清空后以演示模式启动：首次引导必须被拒，陌生人不能抢注超管。"""
+    _enable_demo(monkeypatch)
+    _assert_demo_denied(client.post(f"{_AUTH}/bootstrap", json=_ADMIN))
+
+
+def test_demo_closes_api_docs_regardless_of_app_env(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "local")
+    _enable_demo(monkeypatch)
+    from movieclaw_api.app import create_app
+
+    app = create_app()
+    assert app.docs_url is None and app.openapi_url is None and app.redoc_url is None
+
+
+def test_demo_limits_login_rate_per_address(client: TestClient, monkeypatch) -> None:
+    """公开账号不按用户名锁定，但按来源地址限频：脚本刷登录拖不垮服务。"""
+    _provision(client)
+    _enable_demo(monkeypatch)
+    monkeypatch.setattr(demo_service, "LOGIN_LIMIT_UNKNOWN_ADDRESS", 3)
+    monkeypatch.setattr(demo_service, "LOGIN_LIMIT_PER_ADDRESS", 3)
+    client.cookies.clear()
+    statuses = [client.post(f"{_AUTH}/login", json=_ADMIN).status_code for _ in range(4)]
+    assert statuses == [200, 200, 200, 429]
+    body = client.post(f"{_AUTH}/login", json=_MEMBER).json()
+    assert body["code"] == "TOO_MANY_ATTEMPTS" and "登录过于频繁" in body["message"]
+
+
+def test_demo_login_rate_limit_is_off_outside_demo_mode(monkeypatch) -> None:
+    monkeypatch.delenv("MOVIECLAW_DEMO_MODE", raising=False)
+    get_settings.cache_clear()
+    monkeypatch.setattr(demo_service, "LOGIN_LIMIT_PER_ADDRESS", 0)
+    demo_service.ensure_login_allowed("203.0.113.9")  # 不抛
+
+
+def test_spoofed_seeded_device_only_shows_preset_text() -> None:
+    """访客走 Jellyfin 登录时自报设备标识，冒用演示设备也只能显示预设文案。"""
+    from movieclaw_api.services import demo_activity
+
+    assert demo_activity.display_client("demo-family-atv", "不当文字", "不当文字") == (
+        "Infuse",
+        "客厅 Apple TV",
+    )
+    # 只是前缀相同不算演示设备，按访客脱敏
+    assert not demo_activity.is_seeded_device("demo-anything")
+    assert demo_activity.display_client("demo-anything", "不当文字", "不当文字") == (
+        "第三方播放器",
+        "访客设备",
+    )

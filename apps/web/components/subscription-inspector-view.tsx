@@ -105,7 +105,7 @@ export function SubscriptionInspectorView({
   const confirm = useConfirm();
   // 暂停/取消订阅会改变全站订阅状态（海报卡片的「已订阅」徽标），操作后同步刷新
   const { canSubscribe, refresh: refreshSubscriptions } = useSubscribeEntry();
-  const { canManageSubscriptions, canSearch, isAdmin } = usePermissions();
+  const { canManageSubscriptions, canSearchTorrents, isAdmin } = usePermissions();
   const [detail, setDetail] = useState<SubscriptionDetail | null>(null);
   const [activities, setActivities] = useState<SubscriptionActivity[]>([]);
   const [ruleSets, setRuleSets] = useState<RuleSet[]>([]);
@@ -521,7 +521,7 @@ export function SubscriptionInspectorView({
               )}
               {/* 有缺口，或配了洗版目标且有已入库单元（手选换版本，§13.8）时展示 */}
               {canSubscribe &&
-                canSearch &&
+                canSearchTorrents &&
                 (detail.progress.wanted > 0 || detail.wanted.some((w) => w.upgrade)) && (
                 <Link
                   href={

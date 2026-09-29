@@ -33,6 +33,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.services import demo as demo_service
 from movieclaw_api.services.rule_sets import RuleSetService
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import (
@@ -142,9 +143,30 @@ class _LiveChannel:
 _live_channels: tuple[_LiveChannel, ...] = ()
 
 
+def _seeded_devices() -> dict[str, _Device]:
+    return {d.device_id: d for v in _VIEWERS for d in v.devices}
+
+
 def is_seeded_device(device_id: str) -> bool:
-    """这条播放记录 / 会话是不是演示数据（而不是访客的真实播放）。"""
-    return device_id.startswith(SEEDED_DEVICE_PREFIX)
+    """这个设备标识是不是演示数据用的那几台（而不是访客的真实设备）。
+
+    按完整标识精确匹配，不看前缀：访客走 Jellyfin 兼容层登录时设备标识是
+    客户端自报的，能随便填 ``demo-xxx``。即便填中了某台演示设备的标识也无妨——
+    展示时一律换成那台演示设备的预设文案（见 ``display_client``）。
+    """
+    return device_id in _seeded_devices()
+
+
+def display_client(device_id: str, client: str, device_name: str) -> tuple[str, str]:
+    """活动页 / 播放记录里一行的（客户端名, 设备名）该怎么展示。
+
+    演示设备：用预设文案，**不信库里或会话里存的文字**——访客冒用演示设备标识
+    时，自报的客户端名也只会被换成预设值；其他设备：按访客脱敏规则处理。
+    """
+    seeded = _seeded_devices().get(device_id)
+    if seeded is not None:
+        return seeded.client, seeded.device_name
+    return demo_service.anonymous_playback_client(client, device_name)
 
 
 def seeded_client_names() -> frozenset[str]:

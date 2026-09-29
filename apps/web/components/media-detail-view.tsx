@@ -91,7 +91,7 @@ export function MediaDetailView({
   id: string;
   source?: MediaSource;
 }) {
-  const { canSearch } = usePermissions();
+  const { canSearchTorrents } = usePermissions();
   const [detail, setDetail] = useState<MediaDetailData | null>(null);
   // 详情拉取失败状态：仅在无 seed（硬刷新/分享直达）时才需要整页兜底
   const [loadFailed, setLoadFailed] = useState(false);
@@ -343,7 +343,7 @@ export function MediaDetailView({
   const ownedMovie = isMovie && libraryLinks.length > 0;
   // 已订阅的在库电影仍保留状态键：它是「管理 / 取消订阅」入口，不是再订一次的号召。
   const showSubscribeButton = canSubscribe && (Boolean(sub) || !ownedMovie);
-  const showSearchButton = canSearch && !ownedMovie;
+  const showSearchButton = canSearchTorrents && !ownedMovie;
   const directorCast =
     info?.directorCredits.length
       ? info.directorCredits.map((director) => ({

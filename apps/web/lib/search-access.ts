@@ -52,7 +52,7 @@ export function useSearchAccess(): SearchAccess {
   }, [permissions.isAdmin]);
 
   const canMedia = permissions.canSubscribe;
-  const canTorrent = permissions.canSearch;
+  const canTorrent = permissions.canSearchTorrents;
   const canLibrary = permissions.isAdmin || libraryAvailable === true;
   const ready = permissions.isAdmin || libraryAvailable !== null;
 

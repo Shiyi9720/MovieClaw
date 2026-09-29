@@ -10,6 +10,7 @@ const SIDEBAR_COLLAPSED_KEY = "movieclaw.sidebar-collapsed";
 const SETTINGS_RETURN_KEY = "movieclaw.settings-return";
 
 import { FeedbackProvider } from "@/components/feedback";
+import { DemoNotice } from "@/components/demo-notice";
 import { ChevronLeftIcon } from "@/components/icons";
 import { PAGE_NAV_BUTTON_CLASS } from "@/components/page-nav";
 import { SearchCommand, type SearchSubmitOptions } from "@/components/search-command";
@@ -369,6 +370,8 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
             )}
           </div>
         )}
+        {/* 公开演示站的只读提示（非演示站不渲染）；会话页底部是输入框，不挂 */}
+        {!isImmersive && <DemoNotice />}
       </PageChromeProvider>
     );
   }
@@ -450,6 +453,8 @@ function AppShellBody({ children }: { children: React.ReactNode }) {
       作为 .app-shell 的兄弟节点固定定位：外壳在命令面板打开时有缩放变换，
       fixed 元素挂在里面会被一起缩放、定位基准也会变（原抽屉同理挂在这里）。 */}
     {showGlassTabBar && <slots.mobileTabBar />}
+    {/* 公开演示站的只读提示（非演示站不渲染）；会话页底部是输入框，不挂 */}
+    {!isImmersive && <DemoNotice />}
     </PageChromeProvider>
   );
 }

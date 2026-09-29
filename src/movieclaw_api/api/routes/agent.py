@@ -257,6 +257,8 @@ async def _accept_user_message(
     # 会话记录落盘（转录文件 / 索引行）之前完成——否则校验失败时，前端虽然收到
     # 正确的错误提示，磁盘上却已残留一条空会话，下次刷新侧栏会冒出来。
     demo = demo_service.is_demo_mode()
+    if demo:
+        demo_agent.ensure_can_send(identity, new_session=not payload.session_id)
     llm_router = demo_agent.router() if demo else await acquire_llm_router(session)
 
     if payload.session_id:
@@ -497,6 +499,7 @@ async def download_session_attachment(
     只服务已绑定到会话的附件；附件内容不可变（编号即内容），响应带
     immutable 缓存头，浏览器缓存一次后翻历史会话零请求。
     """
+    _ensure_demo_visible(session_id, identity)
     store = get_agent_attachment_store()
     meta = store.read_meta(session_id, attachment_id)
     path = store.bound_file_path(session_id, attachment_id)
@@ -835,6 +838,7 @@ async def retry_session_message(
 
     # 供应商校验和运行所需上下文在删除轨迹前准备完成；下面才进入不可逆阶段。
     if demo_service.is_demo_mode():
+        demo_agent.ensure_can_send(identity, new_session=False)
         llm_router: LlmRouter = demo_agent.router()
         system_prompt = demo_agent.SYSTEM_PROMPT
         tools = demo_agent.tools()

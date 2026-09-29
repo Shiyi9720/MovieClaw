@@ -813,7 +813,8 @@ class PlaybackClientLogPayload(BaseModel):
     落进服务端日志。iPhone 上的播放故障没有任何本地可看的控制台，服务端
     日志是唯一能拿到客户端真相的地方。"""
 
-    event: str
+    # 事件名是固定的短标识；限长防止有人借上报把超长文本灌进服务端日志
+    event: str = Field(max_length=128)
     detail: dict = {}
 
 
@@ -823,8 +824,9 @@ class PlaybackMetricPayload(BaseModel):
     library_file_id: int | None = None
     tier: int
     degraded_from: int | None = None
-    engine: str = ""
-    hw_backend: str = ""
+    # 引擎 / 解码后端是固定的短标识；限长防止超长字符串落库
+    engine: str = Field(default="", max_length=64)
+    hw_backend: str = Field(default="", max_length=64)
     ttff_ms: int | None = None
     rebuffer_ms: int = 0
     rebuffer_count: int = 0

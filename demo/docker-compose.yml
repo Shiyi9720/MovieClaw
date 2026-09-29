@@ -7,8 +7,11 @@
 #   ./accounts.json    登录页公布的演示账号（与建站脚本用的是同一份）
 #   ./.env             DEMO_DOMAIN=演示站域名，MOVIECLAW_DEMO_IMAGE=镜像名
 #
-# 建站时要临时关掉演示模式（只读守卫会拒绝建库、建成员）：
+# 建站时要临时关掉演示模式（只读守卫会拒绝建库、建成员），并且**必须先停掉 Caddy**：
+# 非演示模式的实例一旦经 Caddy 暴露在公网，任何人都能抢先注册超管。
+#   docker compose down
 #   MOVIECLAW_DEMO_MODE=false docker compose up -d movieclaw
+# 建站完成后由 ./reset.sh snapshot 以演示模式重新拉起并自检，通过后才启动 Caddy。
 # =============================================================================
 name: movieclaw-demo
 
@@ -39,10 +42,20 @@ services:
       - SESSION_COOKIE_SECURE=true
       # 运行日志里有访客 IP：只留 7 天
       - LOG_RETENTION_DAYS=7
+      # 信任本网段（Caddy）转发的 X-Forwarded-For，服务端才看得到访客的真实 IP；
+      # 不配的话所有访客都是 Caddy 的地址，按 IP 的登录限频会退化成全站共用一个桶。
+      # Caddy 默认不信访客自带的 X-Forwarded-For，所以访客伪造不了
+      - FORWARDED_ALLOW_IPS=127.0.0.1,172.31.250.0/24
       # TMDB Key 在构建镜像时已烧入；要换 Key 取消注释：
       # - TMDB_API_KEY=你的 key
-    # 小机器上给 Caddy 与系统留点余量（按 VPS 规格调整）
-    # mem_limit: 3g
+    # 小机器上给 Caddy 与系统留点余量（按 VPS 规格调整；4 GB 内存的机器用 3g）
+    mem_limit: 3g
+    # 容器标准输出日志限量轮转：默认的 json-file 不限大小，时间一长能把磁盘写满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   caddy:
     image: caddy:2
@@ -60,6 +73,20 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    # 反代本身很省内存，给个上限防止异常流量把整机拖垮
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# 固定网段：FORWARDED_ALLOW_IPS 按它信任 Caddy。与服务器上已有的网段冲突时，两处一起改
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
 
 volumes:
   caddy-data:

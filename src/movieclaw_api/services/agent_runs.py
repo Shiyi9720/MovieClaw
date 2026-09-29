@@ -20,12 +20,17 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from movieclaw_agent import AgentEvent, AgentRunner, AgentStartParams
+from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
 
 logger = logging.getLogger("movieclaw_api.agent_runs")
 
 TERMINAL_EVENT_TYPES = {"agent_done", "agent_error", "agent_cancelled"}
 DEFAULT_RETENTION_SECONDS = 24 * 60 * 60
+#: 公开演示站的保留期：运行历史（含逐字事件）只留 10 分钟。演示站谁都能发消息，
+#: 24 小时的保留期会让内存随访客发的消息数一直上涨；已结束的运行重新打开时读
+#: 的是转录文件，不依赖这里，10 分钟足够覆盖断线重连后的跟随
+DEMO_RETENTION_SECONDS = 10 * 60
 #: 停机时等待全部运行收尾的总超时（秒）；超时强制放行，交给启动自愈
 CLOSE_TIMEOUT_SECONDS = 10
 #: 取消看门狗：首次 cancel 后任务仍未停下时，每隔该秒数再投递一次取消。
@@ -379,7 +384,10 @@ _registry: AgentRunRegistry | None = None
 def init_agent_run_registry() -> AgentRunRegistry:
     """为当前 FastAPI 生命周期初始化唯一的运行注册表。"""
     global _registry
-    _registry = AgentRunRegistry()
+    demo = get_settings().demo_mode
+    _registry = AgentRunRegistry(
+        retention_seconds=DEMO_RETENTION_SECONDS if demo else DEFAULT_RETENTION_SECONDS
+    )
     return _registry
 
 

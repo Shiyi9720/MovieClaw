@@ -26,8 +26,9 @@ import json
 import logging
 import random
 import re
+import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -37,6 +38,7 @@ from sqlalchemy import func, select
 from movieclaw_agent.toolkit import AgentTool
 from movieclaw_agent.tools.media_ui import TOOL_NAME as MEDIA_CARDS_TOOL
 from movieclaw_agent.tools.media_ui import make_media_ui_tool
+from movieclaw_api.exceptions import AppException
 from movieclaw_api.services.agent_sessions import (
     SessionHeader,
     SessionMessageEntry,
@@ -632,6 +634,7 @@ _NAMESPACE = uuid.UUID("4c6f7a66-6d6f-7669-6563-6c61772d6465")
 
 # 访客自己新开的会话 → 发起它的设备（只在进程内存里；重启后这些会话一律隐藏）
 _owners: dict[str, str] = {}
+_seed_lock = asyncio.Lock()
 
 
 def _device_key(principal) -> str:
@@ -656,6 +659,46 @@ def is_visible(session_id: str, principal) -> bool:
 def claim(session_id: str, principal) -> None:
     """记下访客新开的会话属于哪台设备。"""
     _owners[session_id] = _device_key(principal)
+
+
+# 每台设备的对话配额：演示站谁都能发消息，每条消息都会写转录、占运行历史内存。
+# 正常体验远用不到这个量；超了就明说，并引导回已有会话继续聊
+MAX_NEW_SESSIONS_PER_DEVICE = 20
+MESSAGE_WINDOW_SECONDS = 600
+MAX_MESSAGES_PER_WINDOW = 40
+_MAX_TRACKED_DEVICES = 20000
+_message_times: dict[str, deque[float]] = {}
+
+
+def ensure_can_send(principal, *, new_session: bool) -> None:
+    """发消息 / 重试前调用：超出本设备的会话数或消息频率配额时抛 429。"""
+    key = _device_key(principal)
+    if new_session and sum(1 for owner in _owners.values() if owner == key) >= (
+        MAX_NEW_SESSIONS_PER_DEVICE
+    ):
+        raise AppException(
+            status_code=429,
+            code="DEMO_QUOTA_EXCEEDED",
+            message=f"演示站每台设备最多新开 {MAX_NEW_SESSIONS_PER_DEVICE} 个会话，"
+            "可以在已有的会话里继续聊",
+        )
+    now = time.monotonic()
+    times = _message_times.get(key)
+    if times is None:
+        if len(_message_times) >= _MAX_TRACKED_DEVICES:
+            stale = [k for k, v in _message_times.items() if now - v[-1] > MESSAGE_WINDOW_SECONDS]
+            for k in stale or list(_message_times)[: _MAX_TRACKED_DEVICES // 2]:
+                del _message_times[k]
+        times = _message_times[key] = deque()
+    while times and now - times[0] > MESSAGE_WINDOW_SECONDS:
+        times.popleft()
+    if len(times) >= MAX_MESSAGES_PER_WINDOW:
+        raise AppException(
+            status_code=429,
+            code="DEMO_QUOTA_EXCEEDED",
+            message="演示站的 AI 助手发消息太频繁了，请过几分钟再试",
+        )
+    times.append(now)
 
 
 async def _transcript(question: str, start: datetime) -> list[SessionMessageEntry]:
@@ -699,7 +742,9 @@ async def ensure_device_sessions(principal) -> None:
     key = _device_key(principal)
     store = get_agent_session_store()
     now = datetime.now(UTC)
-    async with get_database().session() as session:
+    # 串行化：同一台新设备同时发两次列表请求时，两边都会发现预置对话缺席、
+    # 都去插同一个主键——加锁后第二个请求会看到第一个已经写好的记录直接跳过
+    async with _seed_lock, get_database().session() as session:
         for case, question, days in _CASES:
             session_id = _case_session_id(key, case)
             if await session.get(AgentSession, session_id) is not None:

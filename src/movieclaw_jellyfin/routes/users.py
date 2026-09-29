@@ -8,7 +8,9 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
+from movieclaw_api.api.client_address import client_address
 from movieclaw_api.services import auth as auth_service
+from movieclaw_api.services import demo as demo_service
 from movieclaw_api.services.library.access import member_visible_ids
 from movieclaw_api.settings.schemas import get_jellyfin_compat
 from movieclaw_db.engine import get_database
@@ -52,6 +54,8 @@ async def authenticate_by_name(request: Request) -> JSONResponse:
     if not username:
         raise bad_request_text()
 
+    # 公开演示站按来源地址限登录频率（超限 429）；未开演示模式时什么都不做
+    demo_service.ensure_login_allowed(client_address(request))
     try:
         identity = await auth_service.authenticate(username, str(password))
     except Exception:

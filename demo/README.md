@@ -21,7 +21,7 @@
 | `provision.py` | 建站：超管、媒体库、成员角色、精选合集，最后逐个验证账号能登录 |
 | `docker-compose.yml` | 演示站 + Caddy（自动 HTTPS） |
 | `Caddyfile` | HTTPS 反代配置 |
-| `reset.sh` | 黄金快照（`snapshot`）与每日还原（`restore`） |
+| `reset.sh` | 黄金快照（`snapshot`）与每日还原（`restore`），都会以演示模式重启并自检 |
 | `CREDITS.md` | 署名清单（由 `fetch_content.py --credits` 生成） |
 
 ## 演示账号
@@ -36,11 +36,36 @@
 另有一个已停用的成员 `former`，只为让成员管理页有「停用」状态可看，不能登录。
 改账号只改 `accounts.json`，然后重新建站（见下文「改内容 / 改账号」）。
 
+> **安全红线：公网上绝不能出现非演示模式的实例。** 超管密码是公开的，非演示模式下
+> 谁都能用它登录一个没有只读守卫的超管；还没初始化的实例更糟，任何人都能抢先注册
+> 超管。建站（第 4 步）必须先 `docker compose down` 停掉 Caddy，只起 movieclaw；
+> 之后一律用 `./reset.sh` 启动服务，它会确认处于演示模式后才启动 Caddy。
+
 ## 部署
 
 服务器上的演示站目录（例如 `/srv/movieclaw-demo`）就是本目录的一份拷贝，
 `data/`、`media/` 会建在它旁边。以下命令都在这个目录里执行，需要 root。
 服务器建议 2 核 / 4 GB / 40 GB 磁盘起步，带宽越大越好（影片码率 2～6 Mbps）。
+
+**前提**
+
+- Docker 与 Compose v2 插件（`docker compose`，不是老的 `docker-compose`），
+  版本 2.3 以上（`docker-compose.yml` 顶层的 `name:` 需要它；`docker compose version`
+  查看）。Debian / Ubuntu 用 Docker 官方脚本一次装齐：
+
+  ```bash
+  curl -fsSL https://get.docker.com | sh
+  docker compose version
+  ```
+
+- `curl`（`reset.sh` 启动后自检用；没有 curl 时用 wget 也行）。
+- 服务器要能访问 TMDB（`api.themoviedb.org` 与 `image.tmdb.org`）：建站时靠它识别影片、
+  下载海报，演示站运行时「发现」页也要用。
+
+**磁盘怎么算**：内容约 2.5 GB，下载时下载缓存与整理好的媒体目录同时存在，峰值约
+2 倍（5 GB 左右，跑完删掉 `.demo-cache` 就回到 2.5 GB）；每日还原时快照包、新解出的
+`data/` 与旧 `data/` 同时存在，约占 `data/` 的 3 倍（建站后用 `du -sh data` 看一眼）；
+再加上镜像本身几个 GB。40 GB 的盘足够，至少留出 20 GB 空闲。
 
 ### 1. 构建镜像（在开发机上）
 
@@ -48,10 +73,15 @@
 iOS App 需要的设备登录接口。
 
 ```bash
-# 服务器是 x86_64 就加 PLATFORM；Apple Silicon 上交叉构建会慢一些
-TAG=demo-$(git rev-parse --short HEAD) PLATFORM=linux/amd64 ./scripts/build-image.sh
+# TMDB Key 必填：构建脚本读环境变量 TMDB_API_KEY（或仓库根目录 .env 里的同名项），
+# 找不到就退出。服务器是 x86_64 就加 PLATFORM；Apple Silicon 上交叉构建会慢一些
+TMDB_API_KEY=你的key TAG=demo-$(git rev-parse --short HEAD) PLATFORM=linux/amd64 \
+    ./scripts/build-image.sh
 docker save movieclaw:demo-<sha> | gzip | ssh root@<VPS> 'gunzip | docker load'
 ```
+
+> TMDB Key 以环境变量（`ENV`）的形式写进了镜像，`docker inspect` 就能看到。
+> **带 Key 的镜像不要推到公开的镜像仓库**，按上面的 `docker save | docker load` 直接传到服务器。
 
 ### 2. 准备目录
 
@@ -83,9 +113,12 @@ docker run --rm --entrypoint python -v "$PWD:/work" -w /work "$MOVIECLAW_DEMO_IM
 - 首次运行若生成了新的指纹，把 `content.lock.json` 拷回仓库提交；
 - 跑完可以删掉 `.demo-cache`。
 
-### 4. 建站（演示模式关闭）
+### 4. 建站（演示模式关闭，Caddy 必须停着）
 
 ```bash
+# 先停掉全部服务，尤其是 Caddy：接下来的实例不在演示模式，绝不能暴露在公网
+docker compose down
+# 只起 movieclaw（它只监听 127.0.0.1:3000，没有 Caddy 就进不来公网）
 MOVIECLAW_DEMO_MODE=false docker compose up -d movieclaw
 python3 provision.py --server http://127.0.0.1:3000 --media-root /media
 # 服务器上没有 python3 时，借镜像里的：
@@ -94,16 +127,32 @@ python3 provision.py --server http://127.0.0.1:3000 --media-root /media
 ```
 
 脚本会等扫描、TMDB 刮削、缩略图与进度条预览都生成完（十来分钟），期间可以重跑，
-已完成的步骤会跳过。最后应当看到每个库「已识别 N / 期望 N」和 4 个账号都能登录。
+已完成的步骤会跳过。最后应当看到每个库「已识别 N / 期望 N」、4 个账号都能登录和
+「建站完成」。
 
-> 注意：这一步服务以普通模式运行、只监听 127.0.0.1，不要在这时开放公网访问。
+- 任何一个库的条目数与清单不符，脚本会报错退出（退出码非 0）：**这时不要打快照**，
+  按提示修好（多半是 TMDB 访问不了或媒体目录没准备好）后重跑；
+- 在宿主机上跑时，脚本发现 Caddy 容器在运行会直接拒绝执行（借镜像跑时查不了，
+  只能靠上面的 `docker compose down`）。
+
+> **在第 5 步完成之前不要启动 Caddy、不要执行不带参数的 `docker compose up -d`**：
+> 这时的实例不在演示模式，一旦暴露在公网，任何人都能抢注超管或用公开密码登录。
 
 ### 5. 打黄金快照，打开演示模式
 
 ```bash
-./reset.sh snapshot          # 停服务 → data/ 打包成 golden-data.tar.gz → 启动
-docker compose up -d         # 默认 MOVIECLAW_DEMO_MODE=true，同时拉起 Caddy
+./reset.sh snapshot
 ```
+
+它会：停 movieclaw → 把 `data/` 打包成 `golden-data.tar.gz` → 以
+`MOVIECLAW_DEMO_MODE=true` 重新创建并启动 movieclaw → 自检（轮询
+`http://127.0.0.1:3000/api/v1/auth/bootstrap`，要求已初始化、且带演示账号）→
+通过后才启动 Caddy。自检 180 秒内没通过，就把 movieclaw 与 Caddy 都停掉并报错退出，
+按提示看 `docker compose logs --tail 100 movieclaw` 排查。
+
+之后需要手动重启服务时也用 `./reset.sh restore`（顺带还原一次），不要用
+`docker compose start`：它沿用容器创建时的环境，若容器是建站时以演示模式关闭
+创建的，拉起来的就是非演示实例。
 
 ### 6. 每天还原
 
@@ -112,6 +161,16 @@ crontab -e
 # 每天 4:17 还原到黄金快照
 17 4 * * * cd /srv/movieclaw-demo && ./reset.sh restore >> reset.log 2>&1
 ```
+
+cron 按**宿主机的时区**计时，而很多 VPS 默认是 UTC（北京时间 4:17 = UTC 20:17）。
+用 `timedatectl` 查看，要按北京时间就先 `timedatectl set-timezone Asia/Shanghai`
+（改完重启 cron 服务，Debian / Ubuntu 上是 `systemctl restart cron`），或者直接按 UTC
+换算写时间。CentOS / Fedora 的 cronie 也可以在 crontab 第一行写
+`CRON_TZ=Asia/Shanghai`；Debian / Ubuntu 自带的 cron 不一定认这个变量，别依赖它。
+
+还原失败（解包、换目录出错，或启动后自检没通过）时 `reset.log` 里有中文说明：
+中途出错会把服务按演示模式重新拉起来；自检没通过则 movieclaw 与 Caddy 都是停着的，
+演示站暂时打不开，但不会以非演示模式暴露在公网。
 
 还原会让当天所有访客的登录失效（设备记录也在快照之外），这是预期行为。
 订阅、播放记录、「正在播放」这些演示数据不在快照里，是每次以演示模式启动时按当天
@@ -131,7 +190,9 @@ crontab -e
 - [ ] 「我的订阅」有订阅、「刚刚入库」有卡片；活动页有正在播放、最近播放与观看统计；
 - [ ] 小朋友账号只看得到「动画短片」「图片」；朋友账号只看得到「电影」；
 - [ ] iOS App 填 `https://<域名>` 能登录、能播放、能逛「发现」，订阅确认时显示同样的提示；
-- [ ] `https://<域名>/docs`、`/api/v1/openapi.json` 返回 404。
+- [ ] `https://<域名>/docs`、`/api/v1/openapi.json` 返回 404；
+- [ ] 登录后在同一个浏览器打开 `https://<域名>/api/v1/spec`，返回 403（演示站不开放
+      完整接口清单）。
 
 ## 改内容 / 改账号
 
@@ -139,6 +200,17 @@ crontab -e
    `CREDITS.md`：`python3 demo/fetch_content.py --credits demo/CREDITS.md`），提交后
    再同步到服务器；
 2. 重跑第 3 步（只会下载新增的内容）；
-3. 删掉 `data/` 与 `golden-data.tar.gz`，从第 4 步重新建站并打快照。
+3. 删掉 `data/` 与 `golden-data.tar.gz`，从第 4 步重新建站并打快照——**第 4 步的
+   `docker compose down` 不能省**：此时 Caddy 还在跑，删掉 `data/` 后的实例是全新未
+   初始化的，经 Caddy 暴露在公网就会被人抢注超管：
 
-只改登录页的说明文字或账号描述时，改完 `accounts.json` 重启容器即可，不用重新建站。
+   ```bash
+   docker compose down
+   rm -rf data golden-data.tar.gz
+   MOVIECLAW_DEMO_MODE=false docker compose up -d movieclaw
+   python3 provision.py --server http://127.0.0.1:3000 --media-root /media
+   ./reset.sh snapshot
+   ```
+
+只改登录页的说明文字或账号描述时，改完 `accounts.json` 执行 `./reset.sh restore` 即可
+（以演示模式重启并自检，顺带还原一次），不用重新建站。

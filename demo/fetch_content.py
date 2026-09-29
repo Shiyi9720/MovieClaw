@@ -17,7 +17,8 @@
   重新下载都必须一致，否则中止（防镜像站被替换内容）。首次运行生成锁文件，
   请把它提交进仓库；
 - **只做技术性转换**：影片只换封装（MP4 + faststart，保证网页与 iOS 直接播放、
-  不触发服务器转码），音频统一成 AAC 立体声；来源不是 H.264 的才重新编码视频。
+  不触发服务器转码），音频统一成 AAC 立体声；来源不是 H.264、或超过 1080p / 6 Mbps
+  的才重新编码视频（缩进 1920×1080、码率封顶 6 Mbps）。
   CC BY 协议允许为适配媒介做的技术性修改，简介里仍如实注明。
 
 依赖：Python 3.10+、ffmpeg / ffprobe；处理图片 EXIF 需要 Pillow。MovieClaw 镜像
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -56,6 +58,11 @@ PHOTO_LICENSES = {"CC0", "Public domain"}
 # 下载分块与重试
 CHUNK = 1024 * 1024
 RETRIES = 6
+# 网页与 App 直接播放的上限：画面不超过 1920×1080、视频码率不超过 6 Mbps。
+# 超出的来源（比如 Charge 是 1608p）即便已是 H.264 也重新编码，免得小带宽的
+# VPS 被一两路播放占满；重编码用 CRF 控画质、maxrate / bufsize 封顶码率
+MAX_WIDTH, MAX_HEIGHT = 1920, 1080
+MAX_VIDEO_BITRATE = 6_000_000
 
 # ffprobe 的三字母语言码 → MovieClaw 字幕文件名认得的语言 token
 # （services/library/subtitles.py 的 LANGUAGE_TOKENS）；认不得的原样保留当标题
@@ -125,9 +132,18 @@ def download(url: str, dest: Path) -> Path:
                             last_report = time.monotonic()
                             pct = f"{have * 100 // total_bytes}%" if total_bytes else "?"
                             log(f"  下载中 {dest.name}：{have // CHUNK} MB（{pct}）")
+            if total_bytes is not None and have != total_bytes:
+                # 连接被提前关掉时 read() 不一定报错：按服务器声明的长度核对，防止截断
+                raise ConnectionError(f"只收到 {have} / {total_bytes} 字节，下载不完整")
             part.rename(dest)
             return dest
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,  # 含 IncompleteRead：连接中途断开
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ) as exc:
             if isinstance(exc, urllib.error.HTTPError) and exc.code == 416 and part.exists():
                 # 已经下完（Range 越界）：直接收尾
                 part.rename(dest)
@@ -197,14 +213,35 @@ def safe_name(title: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', " -", title).replace("  ", " ").strip()
 
 
-def ffprobe_streams(ffprobe: str, path: Path) -> list[dict]:
+def ffprobe_info(ffprobe: str, path: Path) -> dict:
+    """ffprobe 的流与容器信息（``streams`` / ``format``）。"""
     out = subprocess.run(
-        [ffprobe, "-v", "error", "-show_streams", "-of", "json", str(path)],
+        [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
         check=True,
         capture_output=True,
         text=True,
     ).stdout
-    return json.loads(out).get("streams", [])
+    return json.loads(out)
+
+
+def ensure_readable(ffprobe: str, path: Path) -> None:
+    """把影片从头到尾解封装一遍（不解码，很快），有任何报错就中止。
+
+    首次记录指纹前用：截断或损坏的文件一旦被记进 content.lock.json，之后每台机器
+    都会把这份坏文件当成「正确答案」。只看文件头的 ffprobe 发现不了尾部被截断。
+    """
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-count_packets", "-show_entries", "stream=nb_read_packets",
+         "-of", "json", str(path)],
+        capture_output=True,
+        text=True,
+    )  # fmt: skip
+    if result.returncode != 0 or result.stderr.strip():
+        detail = result.stderr.strip()[:500] or f"ffprobe 退出码 {result.returncode}"
+        fail(
+            f"{path.name} 无法完整读取，可能下载不完整或来源文件损坏：{detail}。"
+            f"删掉下载缓存里的这个文件后重跑"
+        )
 
 
 def decode_subtitle(raw: bytes) -> str:
@@ -302,7 +339,10 @@ def prepare_film(film: dict, *, out: Path, cache: Path, lock: Lock, tools: dict)
     source = film["source"]
     url = source["url"]
     raw = download(url, cache / "films" / urllib.parse.unquote(url.rsplit("/", 1)[-1]))
-    lock.verify(f"film:{film['id']}", raw, url)
+    lock_key = f"film:{film['id']}"
+    first_download = lock_key not in lock.data
+    if not first_download:
+        lock.verify(lock_key, raw, url)
 
     media = raw
     if raw.suffix == ".zip":
@@ -323,21 +363,41 @@ def prepare_film(film: dict, *, out: Path, cache: Path, lock: Lock, tools: dict)
                 with archive.open(member) as src, media.open("wb") as dst:
                     shutil.copyfileobj(src, dst, CHUNK)
 
-    streams = ffprobe_streams(tools["ffprobe"], media)
+    if first_download:
+        # 首次下载：确认影片能完整读出再记指纹（压缩包在上面解压时已校验过 CRC）
+        ensure_readable(tools["ffprobe"], media)
+        lock.verify(lock_key, raw, url)
+
+    probe = ffprobe_info(tools["ffprobe"], media)
+    streams = probe.get("streams", [])
     video = next((s for s in streams if s["codec_type"] == "video"), None)
     audio = next((s for s in streams if s["codec_type"] == "audio"), None)
     if video is None or audio is None:
         fail(f"{media.name} 缺少视频或音频轨")
 
-    transcode = bool(source.get("transcode")) or not (
+    # 视频流没报码率（MKV 常见）时用整个文件的码率兜底，含音频、偏保守
+    bitrate = int(video.get("bit_rate") or probe.get("format", {}).get("bit_rate") or 0)
+    reasons = []
+    if source.get("transcode") or not (
         video["codec_name"] == "h264" and video.get("pix_fmt") == "yuv420p"
-    )
+    ):
+        reasons.append("来源不是 H.264")
+    if int(video.get("width") or 0) > MAX_WIDTH or int(video.get("height") or 0) > MAX_HEIGHT:
+        reasons.append(f"分辨率 {video.get('width')}×{video.get('height')} 超过 1080p")
+    if bitrate > MAX_VIDEO_BITRATE:
+        reasons.append(f"码率 {bitrate / 1_000_000:.1f} Mbps 超过 6 Mbps")
+    transcode = bool(reasons)
     if transcode:
-        log("  来源不是 H.264：重新编码视频（libx264，最高 1080p），耗时较长")
+        log(f"  {'、'.join(reasons)}：重新编码视频（libx264，最高 1080p、6 Mbps），耗时较长")
         video_args = [
             "-c:v", "libx264", "-preset", "slow", "-crf", "20",
+            "-maxrate", "6M", "-bufsize", "12M",
             "-pix_fmt", "yuv420p", "-profile:v", "high",
-            "-vf", "scale=-2:'min(1080,ih)'",
+            # 等比缩进 1920×1080 的框里（宽银幕的 1608p 缩成 1920×804），宽高取偶数
+            "-vf", (
+                f"scale='min({MAX_WIDTH},iw)':'min({MAX_HEIGHT},ih)'"
+                ":force_original_aspect_ratio=decrease:force_divisible_by=2"
+            ),
         ]  # fmt: skip
     else:
         video_args = ["-c:v", "copy"]
@@ -528,8 +588,10 @@ def write_credits(path: Path) -> None:
         "",
         "## 影片",
         "",
-        "影片仅为网页与 App 直接播放转换了封装格式（MP4），音频统一为 AAC 立体声；",
-        "Spring、The Daily Dweebs 的来源是 WebM，重新编码成了 H.264。画面与声音内容均未改动。",
+        "影片为网页与 App 直接播放统一转换成 MP4 封装，音频统一为 AAC 立体声；",
+        "Spring、The Daily Dweebs 的来源是 WebM，重新编码成了 H.264；分辨率超过 1080p",
+        "或码率超过 6 Mbps 的（如 Charge 的 1608p 版本）也重新编码、缩到 1080p 以内，",
+        "每部影片是否重新编码以详情页简介里的说明为准。画面与声音内容均未改动。",
         "",
         "| 影片 | 年份 | 授权 | 署名 | 官方页面 | 下载来源 |",
         "|---|---|---|---|---|---|",
@@ -597,6 +659,22 @@ def main() -> None:
                     prepare_film(film, out=out, cache=cache, lock=lock, tools=tools)
         if args.only in (None, "photos"):
             prepare_photos(out=out, cache=cache, lock=lock)
+    # 以下都是运行环境或网络的问题：给出看得懂的中文说明，不抛英文调用栈
+    except subprocess.CalledProcessError as exc:
+        fail(
+            f"ffmpeg / ffprobe 处理失败（退出码 {exc.returncode}）：{' '.join(map(str, exc.cmd))}。"
+            "多半是来源文件损坏或磁盘空间不足；删掉下载缓存里对应的文件后重跑"
+        )
+    except FileNotFoundError as exc:
+        if exc.filename in tools.values():
+            fail(f"找不到 {exc.filename}：请安装 ffmpeg，或按 README 在 MovieClaw 镜像里运行本脚本")
+        fail(f"文件不存在：{exc.filename}")
+    except zipfile.BadZipFile as exc:
+        fail(f"压缩包损坏（{exc}）：删掉下载缓存里的这个压缩包后重跑")
+    except (urllib.error.URLError, http.client.HTTPException) as exc:
+        fail(f"网络请求失败（{exc}）：请检查服务器能否访问来源站点后重跑，已下载的部分会续传")
+    except OSError as exc:
+        fail(f"读写文件失败（{exc}）：请检查磁盘空间与目录权限后重跑")
     finally:
         lock.save()
     log(f"全部完成。媒体目录：{out}；下载缓存可删除：{cache}")

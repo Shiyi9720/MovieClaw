@@ -15,8 +15,10 @@ def create_app() -> FastAPI:
     configure_logging(settings.log_level, settings.log_dir, settings.log_retention_days)
 
     # API 文档只在本地开发环境开放：生产部署（APP_ENV 非 local）关闭 /docs、
-    # /redoc 与 openapi.json，避免向匿名访问者暴露完整接口面。
-    docs_enabled = settings.app_env == "local"
+    # /redoc 与 openapi.json，避免向匿名访问者暴露完整接口面。公开演示站
+    # （MOVIECLAW_DEMO_MODE）无论 APP_ENV 是什么都关闭——换个方式启动镜像
+    # 漏设 APP_ENV 时，文档页不能跟着敞开。
+    docs_enabled = settings.app_env == "local" and not settings.demo_mode
 
     app = FastAPI(
         title=settings.app_name,

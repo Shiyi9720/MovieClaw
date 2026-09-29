@@ -4,9 +4,10 @@
 按 demo/accounts.json 建超管与成员（几种典型角色），按 demo/content.json 建媒体库、
 等扫描与刮削完成、建一个跨库精选合集，最后逐个验证公开账号能登录。
 
-**必须在演示模式关闭时运行**：演示模式的只读守卫会拒绝建库、建成员。标准流程是
-先以普通模式启动容器 → 跑本脚本 → 停容器、给 data/ 打「黄金快照」→ 打开
-MOVIECLAW_DEMO_MODE 重新启动（见 demo/README.md）。
+**必须在演示模式关闭、且 Caddy 停止时运行**：演示模式的只读守卫会拒绝建库、建成员；
+而非演示模式的实例若经 Caddy 暴露在公网，任何人都能抢注超管。标准流程是
+docker compose down → 只以普通模式启动 movieclaw → 跑本脚本 → ./reset.sh snapshot
+（打「黄金快照」、以演示模式重启并自检、再启动 Caddy，见 demo/README.md）。
 
 幂等：已存在的库、成员、合集会跳过或按清单更新，失败后可以直接重跑。
 只依赖 Python 标准库，在宿主机或 MovieClaw 镜像里都能跑。
@@ -20,6 +21,8 @@ from __future__ import annotations
 import argparse
 import json
 import secrets
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -105,6 +108,34 @@ def wait_until_healthy(client: Client, timeout: int) -> None:
             if time.monotonic() > deadline:
                 fail(f"服务在 {timeout} 秒内没有就绪：{client.server}")
             time.sleep(5)
+
+
+def refuse_if_caddy_running() -> None:
+    """建站期间 Caddy 必须是停着的。
+
+    建站时服务以非演示模式运行、超管密码又是公开的：此时若 Caddy 在跑，公网上的
+    任何人都能抢先注册超管（尚未初始化时），或用公开密码登录一个没有只读守卫的
+    超管。只在宿主机上能调 docker 命令时检查；在镜像里跑本脚本时没有 docker，
+    只能靠 README 的步骤保证。
+    """
+    docker = shutil.which("docker")
+    if docker is None:
+        return
+    try:
+        running = subprocess.run(
+            [docker, "ps", "-q", "--filter", "name=^movieclaw-demo-caddy$"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return  # docker 命令不可用（没权限等）：跳过这项检查
+    if running:
+        fail(
+            "Caddy（movieclaw-demo-caddy）正在运行，非演示模式的实例会经它暴露在公网，"
+            "任何人都能抢注超管或用公开密码登录。请先执行 docker compose down，"
+            "再 MOVIECLAW_DEMO_MODE=false docker compose up -d movieclaw 后重跑本脚本"
+        )
 
 
 def ensure_admin(client: Client, admin: dict, nickname: str) -> None:
@@ -203,6 +234,7 @@ def settle_library_counts(client: Client, content: dict, timeout: int) -> dict[s
         for name in short:
             client.call("POST", f"/libraries/{libraries[name]['id']}/scan", ok_status=(200, 202))
         wait_for_background_work(client, names, timeout=timeout)
+    mismatched = []
     for name, count in expected.items():
         stats = libraries[name].get("stats", {})
         got = stats.get("item_count", 0)
@@ -210,7 +242,13 @@ def settle_library_counts(client: Client, content: dict, timeout: int) -> dict[s
         mark = "✓" if got == count else "✗"
         log(f"{mark} 「{name}」已识别 {got} / 期望 {count}（待识别 {pending}）")
         if got != count:
-            log("  数量不符：多半是 TMDB 访问失败或媒体目录没准备好，修好后重跑本脚本即可")
+            mismatched.append(name)
+    if mismatched:
+        # 条目不齐的站不能打成黄金快照：之后每天都会还原成这个缺片的样子
+        fail(
+            f"{'、'.join(mismatched)} 的条目数与清单不符，建站未完成，不要打黄金快照。"
+            "多半是 TMDB 访问失败或媒体目录没准备好，修好后重跑本脚本即可（已完成的步骤会跳过）"
+        )
     return libraries
 
 
@@ -304,6 +342,7 @@ def main() -> None:
     if admin is None:
         fail("accounts.json 里没有 role=admin 的账号")
 
+    refuse_if_caddy_running()
     client = Client(args.server)
     log(f"等待服务就绪：{args.server}")
     wait_until_healthy(client, timeout=600)
@@ -321,7 +360,7 @@ def main() -> None:
     )
     client.call("DELETE", "/auth/devices/current")
     verify_public_accounts(args.server, accounts)
-    log("建站完成。下一步：停容器、打黄金快照、打开 MOVIECLAW_DEMO_MODE 重启（见 demo/README.md）")
+    log("建站完成。下一步：./reset.sh snapshot（打快照、以演示模式重启并启动 Caddy，见 README）")
 
 
 if __name__ == "__main__":

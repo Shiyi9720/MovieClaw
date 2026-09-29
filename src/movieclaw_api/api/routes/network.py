@@ -18,6 +18,7 @@ from movieclaw_api.schemas.network import (
     NetworkTestResult,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
+from movieclaw_api.services import demo as demo_service
 from movieclaw_api.services import network_config
 from movieclaw_db.engine import get_session
 
@@ -33,7 +34,12 @@ router = APIRouter(prefix="/network", tags=["network"])
 async def get_network_config(
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[NetworkConfigView]:
-    return ok(await network_config.build_config_view(session))
+    view = await network_config.build_config_view(session)
+    if demo_service.is_demo_mode():
+        # 公开演示站：代理地址可能带账号密码，访客（公开的超管）看不到
+        view.proxy_url = ""
+        view.env_proxy_detected = ""
+    return ok(view)
 
 
 @router.put(

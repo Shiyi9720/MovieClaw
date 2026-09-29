@@ -337,6 +337,7 @@ async def login(
     登录成功的账号同时并入账号袋（docs/design/account-switching.md §3）：
     浏览器里其余已登录账号原样保留，用户菜单里可一键切换。
     """
+    demo_service.ensure_login_allowed(client_address(request))
     identity = await auth_service.authenticate(payload.username, payload.password)
     if isinstance(identity, Member):
         token, max_age = await _issue_web_session(
@@ -677,6 +678,7 @@ async def device_login(
     ``Authorization: Bearer``。令牌长期有效（不再「满 30 天必须重新输密码」），
     失效只靠注销或改密；这台设备随之出现在「我的设备」里，写明是谁在用。
     """
+    demo_service.ensure_login_allowed(client_address(request))
     identity = await auth_service.authenticate(payload.username, payload.password)
     owner_id = (identity.id or 0) if isinstance(identity, Member) else 0
     client = payload.client

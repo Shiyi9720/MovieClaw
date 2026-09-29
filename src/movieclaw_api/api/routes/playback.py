@@ -503,16 +503,16 @@ async def get_media_activity(
     )
     if demo:
         for row in (*overview.sessions, *overview.downloads):
-            if demo_activity.is_seeded_device(row.device_id):
+            if demo_activity.is_seeded_device(row.device_id) and isinstance(
+                row, ActivePlaybackSessionView
+            ):
                 # 演示数据的「正在播放」没有真实取流：速率按已传输折算
-                if isinstance(row, ActivePlaybackSessionView):
-                    row.rate_bytes_per_second = demo_activity.live_rate(
-                        row.device_id, row.bytes_sent, row.position_ms
-                    )
-                continue
-            # 公开演示站：其他访客的第三方播放器自报的客户端名 / 设备名不原样展示
-            row.client, row.device_name = demo_service.anonymous_playback_client(
-                row.client, row.device_name
+                row.rate_bytes_per_second = demo_activity.live_rate(
+                    row.device_id, row.bytes_sent, row.position_ms
+                )
+            # 公开演示站：访客的第三方播放器自报的客户端名 / 设备名不原样展示
+            row.client, row.device_name = demo_activity.display_client(
+                row.device_id, row.client, row.device_name
             )
     return ok(overview)
 
@@ -583,21 +583,19 @@ async def list_playback_history(
     )
     if demo_service.is_demo_mode():
         # 同活动页：演示站不原样展示访客自报的客户端名 / 设备名（演示数据除外）
-        seeded_ids = set(
+        device_ids = dict(
             (
                 await session.execute(
-                    select(PlaybackLog.id).where(
-                        PlaybackLog.id.in_([e.id for e in history.entries]),
-                        PlaybackLog.device_id.like(f"{demo_activity.SEEDED_DEVICE_PREFIX}%"),
+                    select(PlaybackLog.id, PlaybackLog.device_id).where(
+                        PlaybackLog.id.in_([e.id for e in history.entries])
                     )
                 )
-            ).scalars()
+            ).tuples()
         )
         for entry in history.entries:
-            if entry.id not in seeded_ids:
-                entry.client, entry.device_name = demo_service.anonymous_playback_client(
-                    entry.client, entry.device_name
-                )
+            entry.client, entry.device_name = demo_activity.display_client(
+                device_ids.get(entry.id, ""), entry.client, entry.device_name
+            )
     return ok(history)
 
 
@@ -2599,7 +2597,8 @@ async def report_playback_client_log(
     import json as _json
 
     if payload.event == "startup":
-        logger.info("起播分段：%s", _startup_summary(payload.detail))
+        # 与下面的通用事件一样截断：detail 由客户端决定，键可以任意多
+        logger.info("起播分段：%s", _startup_summary(payload.detail)[:2000])
         return ok({"logged": True})
     # 纯信息性的调参记录（网页按码率调整回看缓冲）不是异常：起播时一连好几条，
     # 记 WARNING 会让看日志的人以为出了问题

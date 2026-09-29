@@ -1,14 +1,29 @@
 # MovieClaw 公开演示站的 HTTPS 入口（域名来自 .env 的 DEMO_DOMAIN，证书自动申请）。
 # iOS App 连接公网服务器必须是有效证书的 https 地址。
 {$DEMO_DOMAIN} {
-	# 只压缩文本类响应；视频流与图片本身已压缩，压了只会白费 CPU
+	# 请求体上限：演示站的上传（头像、背景、封面等）都被只读守卫拒绝，剩下的
+	# 登录、播放心跳、打点上报都只有几 KB，2MB 绰绰有余，挡掉大包灌流量
+	request_body {
+		max_size 2MB
+	}
+
+	# 只压缩明确列出的文本类响应；视频流与图片本身已压缩，压了只会白费 CPU。
+	# 刻意不写 text/*：AI 助手与任务中心的 SSE 事件流（text/event-stream）经压缩
+	# 会被攒成块再发，页面上的逐字输出和进度就卡住了（响应匹配器不支持「排除」，
+	# 只能逐个列出要压缩的类型）
 	encode {
 		zstd
 		gzip
 		match {
-			header Content-Type text/*
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type text/plain*
+			header Content-Type text/javascript*
+			header Content-Type text/xml*
+			header Content-Type text/vtt*
 			header Content-Type application/json*
 			header Content-Type application/javascript*
+			header Content-Type application/manifest+json*
 			header Content-Type image/svg+xml*
 		}
 	}
