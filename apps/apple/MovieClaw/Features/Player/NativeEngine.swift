@@ -122,6 +122,14 @@ final class NativeEngine: NSObject, PlayerEngine {
         #else
         AetherPlayback.installLogHandler(mirror: false)
         #endif
+        // 音频会话由 App 自己管：点播放时就以「长视频」策略设好类别、声明多声道并激活（`PlaybackController.activateAudioSession`），
+        // 引擎建实例时不再用默认策略重设一遍（引擎补丁 P47）
+        var hostManagesAudio = true
+        #if DEBUG
+        // -mcEngineAudioSession YES：照旧由引擎在建实例时设类别（P47 之前的行为，真机新旧对照用）
+        if UserDefaults.standard.bool(forKey: "mcEngineAudioSession") { hostManagesAudio = false }
+        #endif
+        AetherPlayback.hostManagesAudioSessionCategory = hostManagesAudio
         core = try AetherPlayback()
         super.init()
         Self.sweepStaleCachesOnce()

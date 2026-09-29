@@ -2078,6 +2078,8 @@ final class PlaybackController {
     nonisolated private static func activateAudioSession() {
         let audio = AVAudioSession.sharedInstance()
         try? audio.setCategory(.playback, mode: .moviePlayback, policy: .longFormVideo)
+        // 多声道（5.1 / 全景声经 HDMI、AirPlay 原样送出）：原来由引擎建实例时声明，现在类别只由这里设（引擎补丁 P47）
+        try? audio.setSupportsMultichannelContent(true)
         try? audio.setActive(true)
     }
 }

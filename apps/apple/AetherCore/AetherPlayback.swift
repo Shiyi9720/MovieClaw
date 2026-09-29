@@ -215,6 +215,12 @@ public final class AetherPlayback {
         AetherEngine.cuePrewarmTargetsStart = on
     }
 
+    /// 宿主自己管音频会话的类别、策略与多声道支持（引擎补丁 P47）：设为 true 后引擎建实例时不再重设类别
+    public static var hostManagesAudioSessionCategory: Bool {
+        get { AetherEngine.hostManagesAudioSessionCategory }
+        set { AetherEngine.hostManagesAudioSessionCategory = newValue }
+    }
+
     /// 探测流时是否跳过第二条起的 TrueHD（引擎补丁 P34，默认开；真机新旧对照时关掉）
     public static func setParkSecondaryTrueHD(_ on: Bool) {
         AetherEngine.parkSecondaryTrueHDDuringProbe = on

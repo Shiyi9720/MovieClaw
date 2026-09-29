@@ -3502,6 +3502,9 @@ public final class AetherEngine: ObservableObject {
     /// leaves the main thread. The closure captures no engine state, so it holds no reference to `self`.
     private var audioSessionCategoryTask: Task<Void, Never>?
 
+    /// [MovieClaw P47] 宿主自己设音频会话的类别、策略与多声道支持（并负责激活）时设为 true：引擎建实例时不再声明类别
+    nonisolated(unsafe) public static var hostManagesAudioSessionCategory = false
+
     #if os(iOS) || os(tvOS)
     /// Pending off-main deactivation (#215). See `scheduleAudioSessionDeactivation()`.
     private var audioSessionDeactivationTask: Task<Void, Never>?
@@ -3558,14 +3561,18 @@ public final class AetherEngine: ObservableObject {
         //
         // Issue #114: the declaration runs off the main thread. See `audioSessionCategoryTask`.
         #if os(iOS) || os(tvOS)
-        audioSessionCategoryTask = Task.detached(priority: .userInitiated) {
-            let session = AVAudioSession.sharedInstance()
-            do {
-                try session.setCategory(.playback, mode: .moviePlayback, policy: AetherEngine.audioSessionRouteSharingPolicy)
-                try session.setSupportsMultichannelContent(true)
-                EngineLog.emit("[AetherEngine] AVAudioSession: category set off-main, not activated (AVKit drives activation) policy=\(AetherEngine.audioSessionRouteSharingPolicy.rawValue) maxChannels=\(session.maximumOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
-            } catch {
-                EngineLog.emit("[AetherEngine] AVAudioSession setup error: \(error)", category: .engine)
+        // [MovieClaw P47] 宿主自己管音频会话（点播放就按自己的策略设好类别并激活）：引擎不再每建一个实例就重设一遍。
+        // 原来这里用默认策略重设，会把宿主要的「长视频」策略改掉；会话已激活时换策略要重新协商路由，装载还要先等这次跨进程调用
+        if !AetherEngine.hostManagesAudioSessionCategory {
+            audioSessionCategoryTask = Task.detached(priority: .userInitiated) {
+                let session = AVAudioSession.sharedInstance()
+                do {
+                    try session.setCategory(.playback, mode: .moviePlayback, policy: AetherEngine.audioSessionRouteSharingPolicy)
+                    try session.setSupportsMultichannelContent(true)
+                    EngineLog.emit("[AetherEngine] AVAudioSession: category set off-main, not activated (AVKit drives activation) policy=\(AetherEngine.audioSessionRouteSharingPolicy.rawValue) maxChannels=\(session.maximumOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
+                } catch {
+                    EngineLog.emit("[AetherEngine] AVAudioSession setup error: \(error)", category: .engine)
+                }
             }
         }
         #endif
