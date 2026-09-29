@@ -11,6 +11,9 @@
 等 ``PAGE_BUDGET_S``；超时没算完的这一页先跳过，计算在后台照常跑完落盘。返回一页后
 顺手在后台把下一页要用的片段算好——App 翻到下一页时基本都是现成的。
 
+**按类型筛**：App 顶部的「全部 / 某个类型」只在抽样池上做一次过滤（条目档案里的类型列表），
+类型列表本身由 ``list_genres`` 从本人可见、可抽的池子里数出来，只列真有片的类型。
+
 **怎么放和放哪段分开**：``segment`` 永远是原片时间轴上的起止；``play`` 说明这一条
 怎么放（一期只有 ``seek``：自研引擎从原片中间起播）。App 用 ``modes`` 声明自己会放
 哪几种，服务端只发它会放的——将来加「预剪好的片段文件」（``clip``）时老版本 App
@@ -40,6 +43,7 @@ from movieclaw_api.services.library.access import (
 from movieclaw_api.services.library.content_rating import ratings_at_or_below
 from movieclaw_api.services.library.items import backdrop_facts_many, poster_facts_many
 from movieclaw_api.services.media_scrape import asset_version
+from movieclaw_api.services.playback import marks as playback_marks
 from movieclaw_api.services.playback.signing import issue_stream_token
 from movieclaw_api.services.reels.segments import FileRef, ReelSegment, get_segment
 from movieclaw_api.services.reels.tracks import choose_audio, choose_subtitle
@@ -138,6 +142,40 @@ async def _title_pool(
     return sorted(kinds.items())
 
 
+async def _genres_of(session: AsyncSession, item_ids: Sequence[int]) -> dict[int, list[str]]:
+    """条目 → 档案里的类型列表（本地化后的中文名，如「剧情」「动作」）。"""
+    if not item_ids:
+        return {}
+    rows = await session.execute(
+        select(MediaMetadata.media_item_id, MediaMetadata.genres).where(
+            MediaMetadata.media_item_id.in_(list(item_ids))  # type: ignore[union-attr]
+        )
+    )
+    return {int(item_id): [str(g) for g in (genres or []) if g] for item_id, genres in rows.all()}
+
+
+async def _filter_by_genre(
+    session: AsyncSession, pool: list[tuple[int, str]], genre: str | None
+) -> list[tuple[int, str]]:
+    if not genre:
+        return pool
+    genres = await _genres_of(session, [item_id for item_id, _ in pool])
+    return [(item_id, kind) for item_id, kind in pool if genre in genres.get(item_id, [])]
+
+
+async def list_genres(session: AsyncSession, principal: Principal) -> list[tuple[str, int]]:
+    """本人刷片能刷到的类型及每类几部，多的在前（顶部「全部」下拉的选项）。"""
+    libraries = await _playable_library_kinds(session, principal)
+    if not libraries:
+        return []
+    pool = await _title_pool(session, libraries, await content_limit_for(session, principal))
+    counts: dict[str, int] = {}
+    for names in (await _genres_of(session, [item_id for item_id, _ in pool])).values():
+        for name in set(names):
+            counts[name] = counts.get(name, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+
 _HEIGHT = re.compile(r"(\d{3,4})")
 
 
@@ -231,8 +269,9 @@ async def build_feed(
     offset: int,
     limit: int,
     modes: set[str],
+    genre: str | None = None,
 ) -> ReelPage:
-    """组一页。``modes`` 里没有本服务能出的放法时返回空页。"""
+    """组一页。``modes`` 里没有本服务能出的放法时返回空页；``genre`` 只抽这个类型的片。"""
     seed = seed if seed is not None else secrets.randbelow(2**31)
     if MODE_SEEK not in modes:
         return ReelPage(seed=seed, next_offset=offset, has_more=False)
@@ -240,6 +279,7 @@ async def build_feed(
     if not libraries:
         return ReelPage(seed=seed, next_offset=offset, has_more=False)
     pool = await _title_pool(session, libraries, await content_limit_for(session, principal))
+    pool = await _filter_by_genre(session, pool, genre)
     random.Random(seed).shuffle(pool)
 
     window = pool[offset : offset + limit * SCAN_FACTOR]
@@ -327,7 +367,7 @@ async def _assemble(
     }
     posters = await poster_facts_many(session, item_ids)
     backdrops = await backdrop_facts_many(session, item_ids)
-    episode_names = await _episode_names(session, candidates)
+    episodes = await _episode_facts(session, candidates)
 
     out = []
     for c in candidates:
@@ -342,13 +382,27 @@ async def _assemble(
         backdrop = backdrops.get(c.media_item_id)
         poster = posters.get(c.media_item_id)
         episode = None
+        runtime = (meta.runtime_minutes if meta else None) or _minutes(file.duration_seconds)
+        # 收藏落在整部（电影 / 整剧）上；已看电影看整部、剧集看这一集
+        favorite_target = playback_marks.MarkTarget(c.media_item_id, None, None)
+        played_target = favorite_target
         if c.kind == "episode":
             key = (c.media_item_id, file.season_number or 0, file.episode_number or 0)
+            name, overview, minutes = episodes.get(key, ("", None, None))
             episode = {
                 "season": key[1],
                 "episode": key[2],
-                "name": episode_names.get(key) or None,
+                "name": name or None,
+                "overview": overview or None,
             }
+            runtime = minutes or _minutes(file.duration_seconds)
+            played_target = playback_marks.MarkTarget(c.media_item_id, key[1], key[2])
+        favorite = await playback_marks.get_state(session, favorite_target, member_id=member_id)
+        played = (
+            favorite
+            if played_target is favorite_target
+            else await playback_marks.get_state(session, played_target, member_id=member_id)
+        )
         subtitle_ordinal = choose_subtitle(file.subtitle_streams)
         subtitle = None
         if subtitle_ordinal is not None:
@@ -365,12 +419,17 @@ async def _assemble(
                 "id": reel_id(segment.file_id, segment.start_ms),
                 "title": {
                     "media_item_id": c.media_item_id,
+                    "library_id": file.library_id,
                     "kind": "tv" if c.kind == "episode" else "movie",
                     "name": item.title,
                     "year": item.year,
                     "rating": meta.vote_average if meta else None,
+                    "runtime_minutes": runtime,
                     "genres": list(meta.genres or [])[:3] if meta else [],
                     "tagline": (meta.tagline or None) if meta else None,
+                    "overview": (meta.overview or None) if meta else None,
+                    "favorite": favorite.is_favorite,
+                    "played": played.played,
                     "poster_url": poster.url if poster else None,
                     "backdrop_url": backdrop,
                     "logo_url": _asset_url(meta.logo_file) if meta and meta.logo_file else None,
@@ -399,9 +458,14 @@ async def _assemble(
     return out
 
 
-async def _episode_names(
+def _minutes(seconds: float | int | None) -> int | None:
+    return int(round(seconds / 60)) if seconds else None
+
+
+async def _episode_facts(
     session: AsyncSession, candidates: list[ReelCandidate]
-) -> dict[tuple[int, int, int], str]:
+) -> dict[tuple[int, int, int], tuple[str, str | None, int | None]]:
+    """(条目, 季, 集) → (集名, 分集简介, 单集时长分钟)。"""
     series = {c.media_item_id for c in candidates if c.kind == "episode"}
     if not series:
         return {}
@@ -411,9 +475,14 @@ async def _episode_names(
             MediaEpisode.season_number,
             MediaEpisode.episode_number,
             MediaEpisode.name,
+            MediaEpisode.overview,
+            MediaEpisode.runtime_minutes,
         ).where(MediaEpisode.media_item_id.in_(sorted(series)))  # type: ignore[attr-defined]
     )
-    return {(int(i), int(s), int(e)): str(n or "") for i, s, e, n in rows.all()}
+    return {
+        (int(i), int(s), int(e)): (str(n or ""), o or None, r or None)
+        for i, s, e, n, o, r in rows.all()
+    }
 
 
 # --- 事件 ------------------------------------------------------------------------

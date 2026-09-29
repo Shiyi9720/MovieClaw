@@ -29,6 +29,7 @@ from movieclaw_db.models import (
     FileState,
     LibraryFile,
     MediaItem,
+    MediaMetadata,
     PlaybackState,
     ReelEvent,
 )
@@ -330,3 +331,66 @@ def test_events_are_recorded_without_touching_watch_history(client, tmp_path):
         ("leave", 0, None, 12_000),
     ]
     assert states == 0
+
+
+async def _set_metadata(genres: dict[int, list[str]]) -> None:
+    async with get_database().session() as session:
+        for item_id, names in genres.items():
+            session.add(
+                MediaMetadata(
+                    media_item_id=item_id,
+                    genres=names,
+                    overview=f"条目 {item_id} 的简介",
+                    runtime_minutes=101,
+                )
+            )
+        await session.commit()
+
+
+def test_genres_list_and_genre_filter(client, tmp_path):
+    ids = seed(client, tmp_path, movies=3, episodes=2, extras=False)
+    a, b, c = ids["movies"]
+    client.portal.call(  # type: ignore[attr-defined]
+        partial(
+            _set_metadata, {a: ["剧情", "爱情"], b: ["动作"], c: ["剧情"], ids["show"]: ["剧情"]}
+        )
+    )
+    resp = client.get("/api/v1/reels/genres")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == [
+        {"name": "剧情", "count": 3},
+        {"name": "动作", "count": 1},
+        {"name": "爱情", "count": 1},
+    ]
+    got = {i["title"]["media_item_id"] for i in feed(client, genre="剧情")["items"]}
+    assert got == {a, c, ids["show"]}
+    assert feed(client, genre="科幻")["items"] == []
+
+
+def test_feed_carries_marks_overview_and_runtime(client, tmp_path):
+    ids = seed(client, tmp_path, movies=1, episodes=1, extras=False)
+    movie = ids["movies"][0]
+    client.portal.call(partial(_set_metadata, {movie: ["剧情"]}))  # type: ignore[attr-defined]
+    marks = client.post("/api/v1/playback/marks", json={"media_item_id": movie, "favorite": True})
+    assert marks.status_code == 200, marks.text
+    marks = client.post(
+        "/api/v1/playback/marks",
+        json={
+            "media_item_id": ids["show"],
+            "season_number": 1,
+            "episode_number": 1,
+            "played": True,
+        },
+    )
+    assert marks.status_code == 200, marks.text
+
+    items = {i["title"]["media_item_id"]: i["title"] for i in feed(client)["items"]}
+    assert items[movie]["favorite"] is True
+    assert items[movie]["played"] is False
+    assert items[movie]["overview"] == f"条目 {movie} 的简介"
+    assert items[movie]["runtime_minutes"] == 101
+    assert items[movie]["library_id"] == ids["movie_library"]
+    show = items[ids["show"]]
+    assert show["favorite"] is False
+    assert show["played"] is True  # 这一集看过了
+    assert show["runtime_minutes"] == 60  # 没有分集档案：按文件时长

@@ -19,18 +19,26 @@ class ReelEpisodeView(BaseModel):
     season: int = Field(description="季号")
     episode: int = Field(description="集号")
     name: str | None = Field(default=None, description="集名")
+    overview: str | None = Field(default=None, description="分集简介")
 
 
 class ReelTitleView(BaseModel):
     """这一条属于哪部片：展示用的信息。图片地址都是不带 /api/v1 的相对路径或完整外链。"""
 
     media_item_id: int = Field(description="条目 id")
+    library_id: int = Field(description="这一条的文件所在的媒体库（分享要用）")
     kind: Literal["movie", "tv"] = Field(description="电影 / 剧集")
     name: str = Field(description="片名")
     year: int | None = Field(default=None, description="年份")
     rating: float | None = Field(default=None, description="评分（0～10）")
+    runtime_minutes: int | None = Field(default=None, description="片长；剧集是这一集的时长")
     genres: list[str] = Field(default_factory=list, description="类型，最多 3 个")
     tagline: str | None = Field(default=None, description="宣传语")
+    overview: str | None = Field(
+        default=None, description="简介（剧集是整剧的，分集简介在 episode 里）"
+    )
+    favorite: bool = Field(default=False, description="本人收藏了没有（电影 / 整剧）")
+    played: bool = Field(default=False, description="本人看过没有（电影看整部，剧集看这一集）")
     poster_url: str | None = Field(default=None, description="海报")
     backdrop_url: str | None = Field(default=None, description="横版剧照")
     logo_url: str | None = Field(default=None, description="片名 Logo（本地资产）")
@@ -93,6 +101,11 @@ class ReelFeedView(BaseModel):
     next_offset: int = Field(description="下一页的 offset")
     has_more: bool = Field(description="后面还有没有")
     items: list[ReelItemView] = Field(default_factory=list)
+
+
+class ReelGenreView(BaseModel):
+    name: str = Field(description="类型名（如「剧情」）")
+    count: int = Field(description="能刷到的片有几部")
 
 
 class ReelEventIn(BaseModel):
