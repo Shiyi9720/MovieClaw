@@ -133,6 +133,31 @@ struct MainTabView: View {
         .fullScreenCover(item: $router.player) { request in
             PlayerScreen(request: request)
         }
+        .onAppear {
+            #if DEBUG
+            // -mcNoEarlyStart YES：播放器视图出现才起播（提前起播之前的行为，真机新旧对照用）
+            if UserDefaults.standard.bool(forKey: "mcNoEarlyStart") { return }
+            #endif
+            // 点播放就开始起播（见 Router.startPlaybackEarly）。API 客户端在点击那一刻取：换过账号用的是新的
+            router.startPlaybackEarly = { [router, model] request in
+                if let current = router.activePlayback, current.isClosed || (!current.viewAttached && current.request.id != request.id) {
+                    current.close()
+                    router.activePlayback = nil
+                }
+                guard router.activePlayback?.request.id != request.id else { return }
+                let controller = PlaybackController(
+                    request: request, api: model.api ?? EnvironmentValues().api, requestedAt: router.playRequestedAt)
+                router.activePlayback = controller
+                controller.start()
+            }
+        }
+        .onChange(of: router.player?.id) { _, presented in
+            // 提前起播了、播放器却没弹出来就被撤掉（视图从没出现过，不会走它的收尾）：这里关掉，免得会话与引擎空跑
+            if let early = router.activePlayback, !early.viewAttached, early.request.id != presented {
+                early.close()
+                router.activePlayback = nil
+            }
+        }
         .modifier(FeedbackHost(feedback: feedback))
         #if DEBUG
         .task {
@@ -143,6 +168,7 @@ struct MainTabView: View {
             if let delay = DebugLaunch.routeDelay, delay > 0 {
                 try? await Task.sleep(for: .seconds(delay))
             }
+            MainThreadProbe.run()  // -mcMainProbe YES：打开播放器后 3 秒内主线程的忙碌段
             router.open(webPath: path)
             // -mcRouteReopenAfter <秒>：到点关掉播放器、2 秒后原样再打开（验证退出再进同一部片的起播与流量）
             let reopenAfter = UserDefaults.standard.double(forKey: "mcRouteReopenAfter")
