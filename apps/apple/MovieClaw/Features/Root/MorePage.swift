@@ -3,9 +3,9 @@ import SwiftUI
 /// 「我的」页：标签栏最右的头像页签（Web `/my` 与 components/more-page.tsx）。
 ///
 /// iOS 设置式分组列表（2026-09-29 按 iOS 设置 App 的惯例重排：分组不写标题，靠间距区分）：
-/// - 账户卡：头像 + 昵称 + 身份小字（和昵称不同时才带 `@用户名`、角色）；登录了不止一台服务器时，服务器
-///   再单起一行更淡的小字（和身份挤一行信息太密，用户反馈）。点进「个人信息」，同 iOS 设置 App 顶部的账户卡；
-///   返回直接回到本页，不垫设置列表。
+/// - 账户卡：头像 + 昵称 + 身份小字（和昵称不同时才带 `@用户名`、角色）。不显示服务器：登录了多台服务器时
+///   在哪台只在切换抽屉（按服务器分组）与跨服务器的切换提示里出现（2026-09-29 用户决定）。点进「个人信息」，
+///   同 iOS 设置 App 顶部的账户卡；返回直接回到本页，不垫设置列表。
 ///   切换账号是高频操作，走底部头像页签的长按 / 双击（见 TabBarAccountGestures），不在这里占一行；
 ///   能看见的兜底入口「切换账号」与「退出登录」一起放在个人信息页最底部（iOS 账户详情页惯例）；
 /// - 提醒组（仅管理员、有事才出现，同 iOS 设置 App 账户卡下的「有可用更新」）：待处理（30 秒轮询）/
@@ -51,12 +51,6 @@ struct MorePage: View {
                                     .font(.subheadline)
                                     .foregroundStyle(Theme.textMuted)
                                     .lineLimit(1)
-                                if let host = serverLabel {
-                                    Text(host)
-                                        .font(.caption)
-                                        .foregroundStyle(Theme.textFaint)
-                                        .lineLimit(1)
-                                }
                             }
                             Spacer()
                             Image(systemName: "chevron.right")
@@ -155,11 +149,6 @@ struct MorePage: View {
         session.nickname != session.username ? "@\(session.username) · \(session.roleLabel)" : session.roleLabel
     }
 
-    /// 本机登录了不止一台服务器时标出当前是哪台（免得分不清自己在哪台上）；只有一台时不占地方
-    private var serverLabel: String? {
-        guard let server = model.server, model.savedServers.filter({ !$0.accounts.isEmpty }).count > 1 else { return nil }
-        return server.hostLabel
-    }
 
     /// 会话行按 iOS 列表惯例处理操作（同邮件 / 信息）：行上不放「⋯」，左滑出三个纯图标按钮——
     /// 分支（在新会话中继续）/ 铅笔（重命名）/ 垃圾桶（删除）；续接与删除点了先确认、重命名先弹输入框，

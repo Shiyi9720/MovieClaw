@@ -289,6 +289,10 @@ final class AppModel {
         do {
             let session = try await APIClient(server: address, token: saved).authMe()
             resumePoint = tab.map { ResumePoint(tab: $0, path: []) }
+            // 换完弹「已切换到「某某」」（主界面整棵重建，只能经 pendingNotice 带过去）；换到另一台服务器时
+            // 写上是哪台——账户卡上不显示服务器，只在切换提示与切换抽屉里出现（2026-09-29 用户决定）
+            let changesServer = address != server
+            pendingNotice = "已切换到「\(session.nickname)」" + (changesServer ? " · \(address.hostLabel)" : "")
             activate(address, session: session, token: saved)
         } catch let error as APIError where error.isUnauthorized {
             TokenVault.delete(server: address, username: username)
@@ -299,7 +303,7 @@ final class AppModel {
     /// 双击头像页签：切回上一个账号（上一次从它切走的那个，跨服务器也算），在最近用的两个账号之间来回切
     /// ——结果可预期，再双击一次就回来（同 Instagram）。上一个账号已不在本机、或就是当前账号时，改切本机
     /// 另一个还能用的账号。本机只有当前这一个账号时返回 false、什么都不做；登录失效照样抛 `needsPassword`。
-    /// 切过去后新主界面会弹「已切换到「某某」」（界面整棵重建，提示只能经 `pendingNotice` 带过去）。
+    /// 切过去后新主界面会弹「已切换到「某某」」（见 `switchAccount`）。
     func switchToPreviousAccount() async throws -> Bool {
         let others = savedServers.flatMap { saved in
             saved.accounts.map { SavedAccount(server: saved.address, account: $0) }
@@ -309,13 +313,7 @@ final class AppModel {
             $0.server.origin == previous?.origin && $0.account.username == previous?.username
         }) ?? others.first(where: { hasToken(for: $0.account.username, on: $0.server) }) ?? others.first
         else { return false }
-        pendingNotice = "已切换到「\(target.account.nickname)」"
-        do {
-            try await switchAccount(to: target.account.username, on: target.server, landingOn: .more)
-        } catch {
-            pendingNotice = nil
-            throw error
-        }
+        try await switchAccount(to: target.account.username, on: target.server, landingOn: .more)
         return true
     }
 
