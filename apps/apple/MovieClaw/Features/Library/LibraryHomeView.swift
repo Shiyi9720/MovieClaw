@@ -82,10 +82,8 @@ struct LibraryHomeView: View {
     /// 现算 `Date.now < busyUntil`：数据不变时 body 不会重算，间隔就会一直停在 3 秒
     @State private var recentlyBusy = false
     @State private var clearingLibrary = false
-    /// 刷片（docs/design/reels.md）：沉浸页是否展开、蜂窝网络下的确认、收起后要起播的请求
-    @State private var showingReels = false
+    /// 片段（docs/design/reels.md）：蜂窝网络下进入前的确认
     @State private var confirmingReelsOnCellular = false
-    @State private var reelsPlayRequest: PlayRequest?
 
     var body: some View {
         ScrollView {
@@ -102,12 +100,12 @@ struct LibraryHomeView: View {
             // 页面级动作都是低频的配置入口，收进一个 ⋯ 菜单：顶栏与发现、订阅页一致，
             // 只有「一个页面按钮 + 最右的搜索圆钮」。原先平铺的 list.bullet / 齿轮图标
             // 在 iOS 里分别像「切列表视图」「App 设置」，含义对不上（2026-09-26 用户要求整理）
-            // 「刷片」是 2026-09-29 用户要求放在媒体库顶部试验的入口（docs/design/reels.md），排在 ⋯ 左边
+            // 「片段」是 2026-09-29 用户要求放在媒体库顶部试验的入口（docs/design/reels.md），排在 ⋯ 左边
             ToolbarItem(placement: .topBarTrailing) {
                 Button { openReels() } label: {
                     Image(systemName: "play.square.stack")
                 }
-                .accessibilityLabel("刷片")
+                .accessibilityLabel("片段")
                 .accessibilityIdentifier("library-reels")
             }
             ToolbarItem(placement: .topBarTrailing) {
@@ -147,34 +145,21 @@ struct LibraryHomeView: View {
         .sheet(isPresented: $clearingLibrary) {
             ClearLibraryHistorySheet(libraries: visibleLibraries) { Task { await reload() } }
         }
-        .fullScreenCover(isPresented: $showingReels, onDismiss: {
-            // 播放器页是根部的全屏弹层，要等刷片页收起之后才能弹
-            if let request = reelsPlayRequest {
-                reelsPlayRequest = nil
-                router.play(request)
-            }
-        }) {
-            ReelsView(api: api, metered: NetworkCost.shared.isMetered) { request in
-                reelsPlayRequest = request
-                showingReels = false
-            }
-            .sheetFeedback()
-        }
         .alert("正在使用移动网络", isPresented: $confirmingReelsOnCellular) {
-            Button("进入") { showingReels = true }
+            Button("进入") { router.push(.reels) }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("刷片直接播放原片，可能很耗流量：4K 影片看完一段约 300MB。确定进入吗？")
+            Text("片段直接播放原片，可能很耗流量：4K 影片看完一段约 300MB。确定进入吗？")
         }
     }
 
-    /// 蜂窝 / 计费网络先确认一次（一期不限网络，只提醒）
+    /// 片段在媒体库的导航栈里压栈打开（底部标签栏保留）；蜂窝 / 计费网络先确认一次（一期不限网络，只提醒）
     private func openReels() {
         let network = NetworkCost.shared
         if network.interface == "cellular" || network.isMetered {
             confirmingReelsOnCellular = true
         } else {
-            showingReels = true
+            router.push(.reels)
         }
     }
 

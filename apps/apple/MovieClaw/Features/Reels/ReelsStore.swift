@@ -12,6 +12,14 @@ import SwiftUI
 ///
 /// **事件**：曝光、出画面（带等待时长）、滑走（带看了多久）、看完、接着看、看正片、放不出，
 /// 攒满 10 条或离开页面时批量上报；上报失败直接丢弃（只是统计，不重试）。
+///
+/// **类型筛选**：顶部「全部 ⌄」换类型时整个信息流重来（新种子、从头抽）。
+///
+/// **收藏 / 已看**：接口给出每条的初始状态，点按钮走播放器页同一个标记接口，界面先按点击结果
+/// 显示、失败再改回去。收藏落在整部（电影 / 整剧），已看电影是整部、剧集是这一集。
+///
+/// **挂起 / 恢复**：页面被切走（换标签、盖上播放器页）时收掉播放器与预取，回来时当前这条从片段
+/// 起点重新起播——引擎不能留在后台占着解码器和内存。
 @Observable
 @MainActor
 final class ReelsStore {
@@ -24,6 +32,13 @@ final class ReelsStore {
     private(set) var player: ReelPlayer?
     private(set) var playerState: ReelPlayer.State = .loading
     private(set) var firstFrameShown = false
+    /// 当前筛选的类型；nil = 全部
+    private(set) var genre: String?
+    /// 能刷到的类型（顶部下拉的选项）
+    private(set) var genres: [API.ReelGenreView] = []
+    /// 点过收藏 / 已看后的最新状态（接口给的是初始状态，条目是不可变的结构体）
+    private var favoriteOverrides: [Int: Bool] = [:]
+    private var playedOverrides: [String: Bool] = [:]
 
     @ObservationIgnored private let api: APIClient
     @ObservationIgnored private let metered: Bool
@@ -47,9 +62,24 @@ final class ReelsStore {
     // MARK: - 翻页
 
     func start() async {
+        if genres.isEmpty, let list = try? await api.reelsGenres() { genres = list }
         if items.isEmpty { await loadMore() }
         if currentID == nil { currentID = items.first?.id }
         settle()
+    }
+
+    /// 换类型：整个信息流重来
+    func selectGenre(_ name: String?) {
+        guard name != genre else { return }
+        suspend()
+        genre = name
+        items = []
+        currentID = nil
+        seed = nil
+        nextOffset = 0
+        exhausted = false
+        errorMessage = nil
+        Task { await start() }
     }
 
     func loadMore() async {
@@ -57,7 +87,8 @@ final class ReelsStore {
         loading = true
         defer { loading = false }
         do {
-            let page = try await api.reelsFeed(seed: seed, offset: nextOffset, limit: Self.pageSize, modes: "seek")
+            let page = try await api.reelsFeed(seed: seed, offset: nextOffset, limit: Self.pageSize,
+                                               modes: "seek", genre: genre)
             seed = page.seed
             nextOffset = page.nextOffset
             exhausted = !page.hasMore
@@ -126,12 +157,57 @@ final class ReelsStore {
                            episode: item.title.episode?.episode)
     }
 
-    /// 离开刷片页：收掉播放器与预取，把攒着的事件报上去
-    func stop() {
+    /// 页面被切走（换标签、返回、盖上播放器页）：收掉播放器与预取，把攒着的事件报上去
+    func suspend() {
         leaveCurrent()
         for task in prefetchTasks.values { task.cancel() }
         prefetchTasks.removeAll()
         Task { await flush() }
+    }
+
+    /// 回到页面：当前这条从片段起点重新起播
+    func resume() {
+        guard player == nil else { return }
+        settle()
+    }
+
+    // MARK: - 收藏 / 已看
+
+    func isFavorite(_ item: API.ReelItemView) -> Bool {
+        favoriteOverrides[item.title.mediaItemId] ?? item.title.favorite
+    }
+
+    func isPlayed(_ item: API.ReelItemView) -> Bool {
+        playedOverrides[item.id] ?? item.title.played
+    }
+
+    /// 收藏：落在整部（电影 / 整剧）上
+    func toggleFavorite(_ item: API.ReelItemView) async {
+        let target = !isFavorite(item)
+        favoriteOverrides[item.title.mediaItemId] = target
+        do {
+            let state = try await api.playbackMarksSet(body: API.PlaybackMarksRequest(
+                mediaItemId: item.title.mediaItemId, favorite: target
+            ))
+            favoriteOverrides[item.title.mediaItemId] = state.isFavorite
+        } catch {
+            favoriteOverrides[item.title.mediaItemId] = !target
+        }
+    }
+
+    /// 已看：电影标整部，剧集标这一集
+    func togglePlayed(_ item: API.ReelItemView) async {
+        let target = !isPlayed(item)
+        playedOverrides[item.id] = target
+        do {
+            let state = try await api.playbackMarksSet(body: API.PlaybackMarksRequest(
+                mediaItemId: item.title.mediaItemId, seasonNumber: item.title.episode?.season,
+                episodeNumber: item.title.episode?.episode, played: target
+            ))
+            playedOverrides[item.id] = state.played
+        } catch {
+            playedOverrides[item.id] = !target
+        }
     }
 
     private func leaveCurrent() {

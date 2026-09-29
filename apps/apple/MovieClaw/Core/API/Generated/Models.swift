@@ -7240,11 +7240,14 @@ nonisolated extension API {
         var episode: Int
         /// 集名
         var name: String?
+        /// 分集简介
+        var overview: String?
 
         enum CodingKeys: String, CodingKey {
             case season
             case episode
             case name
+            case overview
         }
     }
 
@@ -7311,6 +7314,18 @@ nonisolated extension API {
             case nextOffset = "next_offset"
             case hasMore = "has_more"
             case items
+        }
+    }
+
+    struct ReelGenreView: Codable, Hashable, Sendable {
+        /// 类型名（如「剧情」）
+        var name: String
+        /// 能刷到的片有几部
+        var count: Int
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case count
         }
     }
 
@@ -7395,6 +7410,8 @@ nonisolated extension API {
     struct ReelTitleView: Codable, Hashable, Sendable {
         /// 条目 id
         var mediaItemId: Int
+        /// 这一条的文件所在的媒体库（分享要用）
+        var libraryId: Int
         /// 电影 / 剧集
         var kind: String
         /// 片名
@@ -7403,10 +7420,18 @@ nonisolated extension API {
         var year: Int?
         /// 评分（0～10）
         var rating: Double?
+        /// 片长；剧集是这一集的时长
+        var runtimeMinutes: Int?
         /// 类型，最多 3 个
         var genres: [String]
         /// 宣传语
         var tagline: String?
+        /// 简介（剧集是整剧的，分集简介在 episode 里）
+        var overview: String?
+        /// 本人收藏了没有（电影 / 整剧）
+        var favorite: Bool
+        /// 本人看过没有（电影看整部，剧集看这一集）
+        var played: Bool
         /// 海报
         var posterUrl: String?
         /// 横版剧照
@@ -7418,12 +7443,17 @@ nonisolated extension API {
 
         enum CodingKeys: String, CodingKey {
             case mediaItemId = "media_item_id"
+            case libraryId = "library_id"
             case kind
             case name
             case year
             case rating
+            case runtimeMinutes = "runtime_minutes"
             case genres
             case tagline
+            case overview
+            case favorite
+            case played
             case posterUrl = "poster_url"
             case backdropUrl = "backdrop_url"
             case logoUrl = "logo_url"

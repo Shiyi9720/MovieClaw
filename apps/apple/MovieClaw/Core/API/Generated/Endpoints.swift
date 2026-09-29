@@ -1762,12 +1762,13 @@ nonisolated extension APIClient {
 
     /// 刷片：取一页片段
     /// `GET /reels`
-    func reelsFeed(seed: Int? = nil, offset: Int? = nil, limit: Int? = nil, modes: String? = nil) async throws -> API.ReelFeedView {
+    func reelsFeed(seed: Int? = nil, offset: Int? = nil, limit: Int? = nil, modes: String? = nil, genre: String? = nil) async throws -> API.ReelFeedView {
         var query: [URLQueryItem] = []
         if let seed { query.append(URLQueryItem(name: "seed", value: "\(seed)")) }
         if let offset { query.append(URLQueryItem(name: "offset", value: "\(offset)")) }
         if let limit { query.append(URLQueryItem(name: "limit", value: "\(limit)")) }
         if let modes { query.append(URLQueryItem(name: "modes", value: "\(modes)")) }
+        if let genre { query.append(URLQueryItem(name: "genre", value: "\(genre)")) }
         return try await send("GET", "/reels", query: query)
     }
 
@@ -1775,6 +1776,12 @@ nonisolated extension APIClient {
     /// `POST /reels/events`
     func reelsEvents(body: API.ReelEventBatch) async throws -> API.ReelEventResult {
         return try await send("POST", "/reels/events", body: body)
+    }
+
+    /// 刷片：能刷到的类型
+    /// `GET /reels/genres`
+    func reelsGenres() async throws -> [API.ReelGenreView] {
+        return try await send("GET", "/reels/genres")
     }
 
     /// 规则组列表（首次访问自动创建默认组）
