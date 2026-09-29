@@ -104,7 +104,8 @@ EOF
 
 ```bash
 source .env
-docker run --rm --entrypoint python -v "$PWD:/work" -w /work "$MOVIECLAW_DEMO_IMAGE" \
+# --cpus：个别影片要重新编码，限一下 CPU，免得同机的其他服务被拖慢
+docker run --rm --cpus 1.5 --entrypoint python -v "$PWD:/work" -w /work "$MOVIECLAW_DEMO_IMAGE" \
     fetch_content.py --out /work/media --cache /work/.demo-cache
 ```
 

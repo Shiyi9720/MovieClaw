@@ -1,11 +1,43 @@
 {
+  "film:big-buck-bunny": {
+    "sha256": "e320fef389ec749117d0c1583945039266a40f25483881c2ff0d33207e62b362",
+    "url": "https://download.blender.org/demo/movies/BBB/bbb_sunflower_1080p_30fps_normal.mp4.zip"
+  },
+  "film:caminandes-gran-dillama": {
+    "sha256": "2e54abfb18dcb0a25d41e7b5d97fd51b226cec58d2fbcad101cf6deecea8c48b",
+    "url": "https://download.blender.org/demo/movies/caminandes_gran_dillama.mp4.zip"
+  },
   "film:caminandes-llama-drama": {
     "sha256": "90cbebdd3ce684a7f8716d45dee1f52d2b1608fd22966637b4d26af1a6db0ebf",
     "url": "https://archive.org/download/Caminandes1LlamaDrama/01_llama_drama_1080p.mp4"
   },
+  "film:caminandes-llamigos": {
+    "sha256": "826513349ecf02d83b22f414514704e3bba10ff28fb45408a6cdf6cc57bacc06",
+    "url": "https://archive.org/download/CaminandesLlamigos/Caminandes_%20Llamigos-1080p.mp4"
+  },
+  "film:charge": {
+    "sha256": "4288be5a6737379b1c16b95b56708bd288c72097665797b2beff1c40ec5ba3e2",
+    "url": "https://archive.org/download/charge-blender-open-movie-1608p/Charge%20-%20Blender%20Open%20Movie%201608p.mp4"
+  },
   "film:coffee-run": {
     "sha256": "314243812998fb5b8c237273f08539c86589e91dff71ab319df88cbdb2798b9e",
     "url": "https://archive.org/download/coffee-run/Coffee%20Run.mp4"
+  },
+  "film:elephants-dream": {
+    "sha256": "a462c56d921fb24bbdde02470b34ee4ca8e866bde938090791e13207db39136c",
+    "url": "https://download.blender.org/ED/elephantsdream-1024-h264-st-aac.mov"
+  },
+  "film:glass-half": {
+    "sha256": "64acb994a45943febc470550657a137fa32222046d9a296082f90681c497415a",
+    "url": "https://archive.org/download/GlassHalf1080p/Glass%20Half-1080p.mp4"
+  },
+  "film:sintel": {
+    "sha256": "d252f898641b20f51c64206f31063e659c28b152a9d988936736d1b56e6e4db3",
+    "url": "https://download.blender.org/durian/movies/Sintel.2010.720p.mkv.zip"
+  },
+  "film:spring": {
+    "sha256": "d691a199035cc7d295210b286f8f6734893c7d4358d228081af6f0da98a56343",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/a/a5/Spring_-_Blender_Open_Movie.webm"
   },
   "film:tears-of-steel": {
     "sha256": "efa9062d9cdb7a338e40ad530dfdf234806743f29ae6a1a136b97ece4e588e8f",
@@ -14,6 +46,10 @@
   "film:the-daily-dweebs": {
     "sha256": "c68845fe300818a36a277afe6043820ccfc5b2306522e17773b8be2a1e8575d3",
     "url": "https://upload.wikimedia.org/wikipedia/commons/b/b2/The_Daily_Dweebs_-_Blender_Open_Movie-full_movie.webm"
+  },
+  "film:wing-it": {
+    "sha256": "6e57e8d0a0d746c04ae1024f1680a53c3b4b24e4cb58ae0bd24e28a9385ee124",
+    "url": "https://archive.org/download/wing_it/wing_it.mp4"
   },
   "photo:File:Aegina sunset.jpg": {
     "sha1": "b03632063b574ff01d45d5d4f0ec4e8997084f70",
@@ -246,6 +282,10 @@
   "photo:File:Yellow-billed stork (Mycteria ibis).jpg": {
     "sha1": "1923e78622acdb480d0bfa02ef0288ed512f5fbc",
     "url": "https://commons.wikimedia.org/wiki/File:Yellow-billed_stork_(Mycteria_ibis).jpg"
+  },
+  "subtitle:sintel:简体中文.chs": {
+    "sha256": "459c14dfd101dee30cb8271e2b68667c657c5dc976bba73a4259d9794efa45dd",
+    "url": "https://download.blender.org/durian/subs/sintel_chs.srt"
   },
   "subtitle:tears-of-steel:en": {
     "sha256": "ce9578f6fe098a5821045a38884b229160f9e7ba27890448a92f5be330c6e6fe",

@@ -62,7 +62,10 @@ RETRIES = 6
 # 超出的来源（比如 Charge 是 1608p）即便已是 H.264 也重新编码，免得小带宽的
 # VPS 被一两路播放占满；重编码用 CRF 控画质、maxrate / bufsize 封顶码率
 MAX_WIDTH, MAX_HEIGHT = 1920, 1080
-MAX_VIDEO_BITRATE = 6_000_000
+# 触发重编码的码率：明显超标才重编码。MKV 往往不单报视频码率，只能用含音频的
+# 整体码率兜底（Sintel 的 720p 就这样被算成 6.1 Mbps）；为这点出入整片重编码
+# 既损画质、在 2 核的机器上又要跑几十分钟，不划算
+REENCODE_ABOVE_BITRATE = 8_000_000
 
 # ffprobe 的三字母语言码 → MovieClaw 字幕文件名认得的语言 token
 # （services/library/subtitles.py 的 LANGUAGE_TOKENS）；认不得的原样保留当标题
@@ -384,13 +387,14 @@ def prepare_film(film: dict, *, out: Path, cache: Path, lock: Lock, tools: dict)
         reasons.append("来源不是 H.264")
     if int(video.get("width") or 0) > MAX_WIDTH or int(video.get("height") or 0) > MAX_HEIGHT:
         reasons.append(f"分辨率 {video.get('width')}×{video.get('height')} 超过 1080p")
-    if bitrate > MAX_VIDEO_BITRATE:
-        reasons.append(f"码率 {bitrate / 1_000_000:.1f} Mbps 超过 6 Mbps")
+    if bitrate > REENCODE_ABOVE_BITRATE:
+        reasons.append(f"码率 {bitrate / 1_000_000:.1f} Mbps 超过 8 Mbps")
     transcode = bool(reasons)
     if transcode:
         log(f"  {'、'.join(reasons)}：重新编码视频（libx264，最高 1080p、6 Mbps），耗时较长")
         video_args = [
-            "-c:v", "libx264", "-preset", "slow", "-crf", "20",
+            # veryfast：比 slow 快数倍；码率有 maxrate 封顶，体积与画质对演示站足够
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-maxrate", "6M", "-bufsize", "12M",
             "-pix_fmt", "yuv420p", "-profile:v", "high",
             # 等比缩进 1920×1080 的框里（宽银幕的 1608p 缩成 1920×804），宽高取偶数
