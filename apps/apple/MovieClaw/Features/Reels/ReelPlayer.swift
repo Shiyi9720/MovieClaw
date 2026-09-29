@@ -45,8 +45,7 @@ final class ReelPlayer {
         core = try AetherPlayback()
         NativeEngine.sweepStaleCachesOnce()
         self.item = item
-        // 竖屏时画面只是一条横带，字幕按画面高度的比例算会很小：刷片里放大一些
-        core.setTextStyle(.init(fontScale: 8, bottomPercent: 6, background: false))
+        setFullscreen(false)
         core.onPhase = { [weak self] phase in self?.handle(phase) }
         core.onFailure = { [weak self] failure in self?.state = .failed(failure.message) }
         core.onTracksChanged = { [weak self] in self?.applySubtitle() }
@@ -82,6 +81,12 @@ final class ReelPlayer {
                 }
             }
         }
+    }
+
+    /// 字幕字号：竖屏时画面只是一条横带，字幕按画面高度的比例算会很小，放大一些；
+    /// 全屏（横屏）时画面铺满，回到播放器页的默认字号
+    func setFullscreen(_ fullscreen: Bool) {
+        core.setTextStyle(fullscreen ? .init() : .init(fontScale: 8, bottomPercent: 6, background: false))
     }
 
     func play() {
