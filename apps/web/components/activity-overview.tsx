@@ -122,8 +122,8 @@ export function ActivityPages({
 }
 
 /**
- * 桌面标题行：总览是「活动」大字标题，二级页是返回键 + 页名（回总览，能按历史回就按历史回）；
- * 右侧是二级页的页面操作。字形与订阅首页等桌面页内标题一致。
+ * 桌面标题行：总览是「活动」大字标题（字形同订阅首页等桌面页内标题），二级页是返回键 +
+ * 正文字号页名（回总览，能按历史回就按历史回）；右侧是二级页的页面操作。
  */
 function DesktopHeader({ page, actions }: { page: ActivityPageName | null; actions: ReactNode }) {
   const back = useBackNavigation("/activity" as Route);
@@ -139,7 +139,14 @@ function DesktopHeader({ page, actions }: { page: ActivityPageName | null; actio
           <ChevronLeftIcon className="size-[22px]" />
         </button>
       )}
-      <h1 className="text-on-image min-w-0 flex-1 truncate text-[26px] font-bold leading-tight tracking-[-0.02em] text-white">
+      {/* 字号层级同手机顶栏 / iOS：标签根页（总览）大字标题，二级页正文字号小标题 */}
+      <h1
+        className={
+          page
+            ? "text-on-image min-w-0 flex-1 truncate text-body font-semibold tracking-[-0.01em] text-[var(--text)]"
+            : "text-on-image min-w-0 flex-1 truncate text-[26px] font-bold leading-tight tracking-[-0.02em] text-white"
+        }
+      >
         {page ? ACTIVITY_PAGE_TITLES[page] : "活动"}
       </h1>
       {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
