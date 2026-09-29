@@ -1826,6 +1826,9 @@ extension AetherEngine {
         preopenedDemuxer: Demuxer?,
         generation: UInt64
     ) async throws {
+        // [MovieClaw P39] 起播吸附只给主力通路：软件通路自己按时间表定位，这次的一次性开关在这里作废，
+        // 免得留到之后某次主力通路的重建里被误用
+        startSnapArmed = false
         let deinterlaceMode = loadedOptions.deinterlaceMode
         let waitStarted = DispatchTime.now()
         if let outcome = await DeinterlaceHardwareWarmup.shared.waitIfNeeded(
