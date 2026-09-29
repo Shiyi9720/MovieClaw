@@ -440,8 +440,9 @@ final class SourceByteCache: @unchecked Sendable {
         }
         var total = complete.reduce(0) { $0 + $1.bytes }
         let budget = persistedBudgetBytes
-        // [MovieClaw P51] 超了保留上限：先从旧到新把每份缩到只剩元数据区（P46 的文件头 8 MiB、文件尾 32 MiB——moov、Cues、
-        // SeekHead 所在，续播一打开就要读），缩完仍超才从旧到新整条删。原来直接整条删：看一会儿高码率片缓存就涨到几百 MB，
+        // [MovieClaw P51] 超了保留上限：先从旧到新缩——每份丢元数据区（P46 的文件头 8 MiB、文件尾 32 MiB——moov、Cues、
+        // SeekHead 所在，续播一打开就要读）以外的块，按块的最近使用从旧到新丢，丢够超额就停（最近看到的那几分钟、也就是续播点
+        // 附近的留着），缩完仍超才从旧到新整条删。原来直接整条删：看一会儿高码率片缓存就涨到几百 MB，
         // 超过上限（运行预算的一半，至多 512 MiB），下次启动这一份——正是要续播的那部——连头尾一起没了，续播又得全部重下
         // （真机：4K60 片热身 18 秒写了 398 MB，下次启动整理赶在装载之前跑完就整条删掉，开容器重下 10 MB 的 moov，415 毫秒）
         complete.sort { $0.usedAt < $1.usedAt }
@@ -452,7 +453,7 @@ final class SourceByteCache: @unchecked Sendable {
                 guard let after = shrinkIfNotLive(
                     bin: dir.appendingPathComponent(complete[i].stem + ".bin").path,
                     idx: dir.appendingPathComponent(complete[i].stem + ".idx").path,
-                    usedAt: complete[i].usedAt) else { continue }
+                    usedAt: complete[i].usedAt, excess: total - budget) else { continue }
                 total -= complete[i].bytes - after
                 complete[i].bytes = after
                 shrunk += 1
@@ -467,23 +468,23 @@ final class SourceByteCache: @unchecked Sendable {
         if shrunk + dropped > 0 {
             EngineLog.emit(
                 "[SourceByteCache] [MovieClaw P51] 启动整理：跨启动缓存 \(before >> 20) MB 超过上限 \(budget >> 20) MB，"
-                + "\(shrunk) 份缩到只剩文件头尾、\(dropped) 份整条删，剩 \(total >> 20) MB", category: .demux)
+                + "\(shrunk) 份缩小（文件头尾留着）、\(dropped) 份整条删，剩 \(total >> 20) MB", category: .demux)
         }
     }
 
     /// [MovieClaw P51] 持锁缩：装载时的恢复（`restoreLocked`）也在这把锁里，两者不会交错——先缩完的，恢复读到的就是缩过的
     /// 记账；先恢复的，这里看到它已经开着就不动。不能只靠开头取的「正开着」快照：整理在后台线程上跑，与第一次装载几乎同时，
     /// 恢复要是落在快照之后、打洞之前，恢复出来的那份会把刚打成洞的块当成数据，读出全零（整条删没有这个问题：已打开的文件删了照样能读）
-    private func shrinkIfNotLive(bin: String, idx: String, usedAt: Date) -> Int64? {
+    private func shrinkIfNotLive(bin: String, idx: String, usedAt: Date, excess: Int64) -> Int64? {
         lock.lock(); defer { lock.unlock() }
         guard !entries.values.contains(where: { $0.path == bin }) else { return nil }
-        return Self.shrinkToMetadata(bin: bin, idx: idx, usedAt: usedAt)
+        return Self.shrinkKeepingMetadata(bin: bin, idx: idx, usedAt: usedAt, excess: excess)
     }
 
-    /// [MovieClaw P51] 把一份跨启动缓存缩到只剩元数据区的块：先写缩过的记账（保留原来的修改时间，新旧次序不变），
-    /// 再给丢掉的块打洞——同淘汰，记账先于打洞，进程在中间被杀也只是少认几块。返回缩完的实际占用；
-    /// 记账读不出、不知道文件大小（算不出文件尾）、本来就只有元数据区的，返回 nil 不动
-    private static func shrinkToMetadata(bin: String, idx: String, usedAt: Date) -> Int64? {
+    /// [MovieClaw P51] 缩一份跨启动缓存：元数据区以外的块按最近使用从旧到新丢，丢够 `excess` 字节就停。先写缩过的记账
+    /// （保留原来的修改时间，新旧次序不变），再给丢掉的块打洞——同淘汰，记账先于打洞，进程在中间被杀也只是少认几块。
+    /// 返回缩完的实际占用；记账读不出、不知道文件大小（算不出文件尾）、本来就只有元数据区的，返回 nil 不动
+    private static func shrinkKeepingMetadata(bin: String, idx: String, usedAt: Date, excess: Int64) -> Int64? {
         guard let data = FileManager.default.contents(atPath: idx),
               var file = try? JSONDecoder().decode(IndexFile.self, from: data), file.version == 1,
               let length = file.contentLength, length > 0 else { return nil }
@@ -491,9 +492,18 @@ final class SourceByteCache: @unchecked Sendable {
             guard row.count == 4 else { return false }
             return row[0] * blockSize < pinnedHeadBytes || (row[0] + 1) * blockSize > length - pinnedTailBytes
         }
-        let dropped = file.blocks.filter { !isMetadata($0) }
+        var dropped: [[Int64]] = []
+        var freed: Int64 = 0
+        // 最近使用相同（同一次写入的几块）时先丢文件里靠前的：续播点在后面的可能大
+        for row in file.blocks.filter({ $0.count == 4 && !isMetadata($0) })
+            .sorted(by: { $0[3] != $1[3] ? $0[3] < $1[3] : $0[0] < $1[0] }) {
+            guard freed < excess else { break }
+            dropped.append(row)
+            freed += row[2] - row[1]
+        }
         guard !dropped.isEmpty else { return nil }
-        file.blocks = file.blocks.filter(isMetadata)
+        let droppedIndexes = Set(dropped.map { $0[0] })
+        file.blocks = file.blocks.filter { $0.count == 4 && !droppedIndexes.contains($0[0]) }
         guard let encoded = try? JSONEncoder().encode(file) else { return nil }
         writeIndex(encoded, to: idx)
         try? FileManager.default.setAttributes([.modificationDate: usedAt], ofItemAtPath: idx)

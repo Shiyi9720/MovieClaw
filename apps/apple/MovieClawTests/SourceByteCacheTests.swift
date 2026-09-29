@@ -336,16 +336,20 @@ struct SourceByteCacheTests {
         withExtendedLifetime(previous) {}
     }
 
-    /// [MovieClaw P51] 启动整理超额时先缩到只剩元数据区：看了一会儿的高码率片，下次启动文件头、文件尾还在
-    /// （续播一打开就要读），中间那段丢掉；原来整条删，续播全部重下
-    @Test func launchTrimShrinksAnOversizedSourceToItsMetadata() {
+    /// [MovieClaw P51] 启动整理超额时先缩：看了一会儿的高码率片，下次启动文件头、文件尾还在（续播一打开就要读），
+    /// 中间的按最近使用从旧到新丢、丢够超额就停，最后看到的那一块（续播点附近）留着；原来整条删，续播全部重下
+    @Test func launchTrimShrinksAnOversizedSourceKeepingMetadata() {
         let dir = persistentDir()
         let key = "file-3-\(UUID())"
         let length = Int64(block) * 64   // 64 MiB：头 8 块、尾 32 块是元数据区，第 8～31 块不是
         let previous = SourceByteCache(budgetBytes: Int64(block) * 128, persistentDirectory: dir)
         previous.noteContentLength(key: key, length: length)
         previous.write(key: key, offset: 0, data: bytes(block * 2, seed: 5))                  // 文件头
-        previous.write(key: key, offset: Int64(block) * 16, data: bytes(block * 8, seed: 6))  // 续播点那一段
+        let middle = bytes(block * 8, seed: 6)   // 续播点那一段：像网络送达那样一块一块写，最近使用依次变新
+        for index in 0 ..< 8 {
+            previous.write(key: key, offset: Int64(block) * Int64(16 + index),
+                           data: middle.subdata(in: block * index ..< block * (index + 1)))
+        }
         previous.write(key: key, offset: length - Int64(block), data: bytes(block, seed: 7))  // 文件尾
         previous.flushIndexes()
         previous.drain()
@@ -356,8 +360,11 @@ struct SourceByteCacheTests {
         #expect(read(launch, key, at: 0, max: 100) == bytes(100, seed: 5))
         #expect(launch.contiguousEnd(key: key, from: length - Int64(block)) == length)
         #expect(read(launch, key, at: length - Int64(block), max: 100) == bytes(100, seed: 7))
-        #expect(launch.contiguousEnd(key: key, from: Int64(block) * 16) == Int64(block) * 16)   // 中间那段不认了
-        #expect(launch.cachedBytes == Int64(block) * 3)
+        // 中间 8 块超额 7 块：最早写的 7 块丢掉，最后写的第 23 块（续播点附近）留着
+        #expect(launch.contiguousEnd(key: key, from: Int64(block) * 16) == Int64(block) * 16)
+        #expect(launch.contiguousEnd(key: key, from: Int64(block) * 23) == Int64(block) * 24)
+        #expect(read(launch, key, at: Int64(block) * 23, max: 100) == middle.subdata(in: block * 7 ..< block * 7 + 100))
+        #expect(launch.cachedBytes == Int64(block) * 4)
         withExtendedLifetime(previous) {}
     }
 
