@@ -29,7 +29,9 @@ from movieclaw_db.models import (
     FileState,
     LibraryFile,
     MediaItem,
+    MediaItemPerson,
     MediaMetadata,
+    Person,
     PlaybackState,
     ReelEvent,
 )
@@ -394,3 +396,35 @@ def test_feed_carries_marks_overview_and_runtime(client, tmp_path):
     assert show["favorite"] is False
     assert show["played"] is True  # 这一集看过了
     assert show["runtime_minutes"] == 60  # 没有分集档案：按文件时长
+
+
+async def _set_directors(movie_id: int, fallback_id: int) -> None:
+    async with get_database().session() as session:
+        person = Person(tmdb_person_id=4321, name="姜文", profile_path="/jiangwen.jpg")
+        session.add(person)
+        await session.flush()
+        session.add(
+            MediaItemPerson(
+                media_item_id=movie_id, person_id=person.id, department="director", credit_order=0
+            )
+        )
+        session.add(MediaMetadata(media_item_id=movie_id, directors=["不该用到的名字"]))
+        session.add(MediaMetadata(media_item_id=fallback_id, directors=["甲", "乙", "丙"]))
+        await session.commit()
+
+
+def test_feed_carries_directors_and_film_duration(client, tmp_path):
+    ids = seed(client, tmp_path, movies=2, episodes=0, extras=False)
+    structured, fallback = ids["movies"]
+    client.portal.call(partial(_set_directors, structured, fallback))  # type: ignore[attr-defined]
+    items = {i["title"]["media_item_id"]: i for i in feed(client)["items"]}
+    # 关系表里有的用关系表（带头像与人物 id）
+    [director] = items[structured]["title"]["directors"]
+    assert director["name"] == "姜文"
+    assert director["tmdb_person_id"] == 4321
+    assert director["avatar_url"].endswith("/w185/jiangwen.jpg")
+    # 没有关系行的旧条目退回档案里的姓名，最多两位
+    assert [d["name"] for d in items[fallback]["title"]["directors"]] == ["甲", "乙"]
+    assert items[fallback]["title"]["directors"][0]["tmdb_person_id"] is None
+    # 原片总长（台账探测时长）
+    assert items[structured]["segment"]["duration_ms"] == 3600 * 1000

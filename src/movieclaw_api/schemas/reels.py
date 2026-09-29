@@ -22,6 +22,14 @@ class ReelEpisodeView(BaseModel):
     overview: str | None = Field(default=None, description="分集简介")
 
 
+class ReelPersonView(BaseModel):
+    name: str = Field(description="姓名")
+    tmdb_person_id: int | None = Field(
+        default=None, description="TMDB 影人 ID（打开人物页用）；只有姓名时为空"
+    )
+    avatar_url: str | None = Field(default=None, description="头像（TMDB 图床地址）")
+
+
 class ReelTitleView(BaseModel):
     """这一条属于哪部片：展示用的信息。图片地址都是不带 /api/v1 的相对路径或完整外链。"""
 
@@ -39,6 +47,9 @@ class ReelTitleView(BaseModel):
     )
     favorite: bool = Field(default=False, description="本人收藏了没有（电影 / 整剧）")
     played: bool = Field(default=False, description="本人看过没有（电影看整部，剧集看这一集）")
+    directors: list[ReelPersonView] = Field(
+        default_factory=list, description="电影是导演、剧集是主创，最多两位"
+    )
     poster_url: str | None = Field(default=None, description="海报")
     backdrop_url: str | None = Field(default=None, description="横版剧照")
     logo_url: str | None = Field(default=None, description="片名 Logo（本地资产）")
@@ -51,6 +62,7 @@ class ReelSegmentView(BaseModel):
     file_id: int = Field(description="原片文件（台账行 id）")
     start_ms: int = Field(description="起点（落在关键帧上）")
     end_ms: int = Field(description="终点（落在两句对白之间）")
+    duration_ms: int | None = Field(default=None, description="原片总长（剧集是这一集）")
     method: str = Field(
         description="挑法：bitrate 码率最高段 / chapter 章节起点 / position 固定位置"
     )

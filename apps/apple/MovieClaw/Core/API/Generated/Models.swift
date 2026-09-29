@@ -7347,6 +7347,21 @@ nonisolated extension API {
         }
     }
 
+    struct ReelPersonView: Codable, Hashable, Sendable {
+        /// 姓名
+        var name: String
+        /// TMDB 影人 ID（打开人物页用）；只有姓名时为空
+        var tmdbPersonId: Int?
+        /// 头像（TMDB 图床地址）
+        var avatarUrl: String?
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case tmdbPersonId = "tmdb_person_id"
+            case avatarUrl = "avatar_url"
+        }
+    }
+
     /// 怎么放这一条。mode=seek：自研引擎打开原片、从 segment.start_ms 起播。
     struct ReelPlayView: Codable, Hashable, Sendable {
         /// 放法：seek=从原片中间起播（一期仅此一种）
@@ -7380,6 +7395,8 @@ nonisolated extension API {
         var startMs: Int
         /// 终点（落在两句对白之间）
         var endMs: Int
+        /// 原片总长（剧集是这一集）
+        var durationMs: Int?
         /// 挑法：bitrate 码率最高段 / chapter 章节起点 / position 固定位置
         var method: String
 
@@ -7387,6 +7404,7 @@ nonisolated extension API {
             case fileId = "file_id"
             case startMs = "start_ms"
             case endMs = "end_ms"
+            case durationMs = "duration_ms"
             case method
         }
     }
@@ -7432,6 +7450,8 @@ nonisolated extension API {
         var favorite: Bool
         /// 本人看过没有（电影看整部，剧集看这一集）
         var played: Bool
+        /// 电影是导演、剧集是主创，最多两位
+        var directors: [API.ReelPersonView]
         /// 海报
         var posterUrl: String?
         /// 横版剧照
@@ -7454,6 +7474,7 @@ nonisolated extension API {
             case overview
             case favorite
             case played
+            case directors
             case posterUrl = "poster_url"
             case backdropUrl = "backdrop_url"
             case logoUrl = "logo_url"

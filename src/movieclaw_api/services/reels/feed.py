@@ -53,7 +53,9 @@ from movieclaw_db.models import (
     LibraryFile,
     MediaEpisode,
     MediaItem,
+    MediaItemPerson,
     MediaMetadata,
+    Person,
     ReelEvent,
 )
 
@@ -368,6 +370,7 @@ async def _assemble(
     posters = await poster_facts_many(session, item_ids)
     backdrops = await backdrop_facts_many(session, item_ids)
     episodes = await _episode_facts(session, candidates)
+    directors = await _directors_of(session, item_ids)
 
     out = []
     for c in candidates:
@@ -430,6 +433,12 @@ async def _assemble(
                     "overview": (meta.overview or None) if meta else None,
                     "favorite": favorite.is_favorite,
                     "played": played.played,
+                    # 电影是导演、剧集是主创；关系表还没有（旧条目没刷新）时退回档案里的姓名
+                    "directors": directors.get(c.media_item_id)
+                    or [
+                        {"name": name, "tmdb_person_id": None, "avatar_url": None}
+                        for name in (meta.directors if meta else [])[:MAX_DIRECTORS]
+                    ],
                     "poster_url": poster.url if poster else None,
                     "backdrop_url": backdrop,
                     "logo_url": _asset_url(meta.logo_file) if meta and meta.logo_file else None,
@@ -440,6 +449,9 @@ async def _assemble(
                     "file_id": segment.file_id,
                     "start_ms": segment.start_ms,
                     "end_ms": segment.end_ms,
+                    "duration_ms": int(file.duration_seconds * 1000)
+                    if file.duration_seconds
+                    else None,
                     "method": segment.method,
                 },
                 "play": {
@@ -455,6 +467,44 @@ async def _assemble(
                 },
             }
         )
+    return out
+
+
+#: 每部最多给几位导演（左下角只放得下一两个名字）
+MAX_DIRECTORS = 2
+
+
+async def _directors_of(
+    session: AsyncSession, item_ids: Sequence[int]
+) -> dict[int, list[dict[str, Any]]]:
+    """条目 → 导演（剧集为主创），取自与详情页同一张影人关系表，按署名顺序。"""
+    from movieclaw_api.core.config import get_settings
+
+    if not item_ids:
+        return {}
+    base = get_settings().tmdb_image_base_url.rstrip("/")
+    rows = await session.execute(
+        select(
+            MediaItemPerson.media_item_id, Person.name, Person.profile_path, Person.tmdb_person_id
+        )
+        .join(Person, Person.id == MediaItemPerson.person_id)  # type: ignore[arg-type]
+        .where(
+            MediaItemPerson.media_item_id.in_(list(item_ids)),  # type: ignore[attr-defined]
+            MediaItemPerson.department == "director",
+        )
+        .order_by(MediaItemPerson.credit_order, MediaItemPerson.id)
+    )
+    out: dict[int, list[dict[str, Any]]] = {}
+    for item_id, name, profile, tmdb_id in rows.all():
+        people = out.setdefault(int(item_id), [])
+        if len(people) < MAX_DIRECTORS:
+            people.append(
+                {
+                    "name": name,
+                    "tmdb_person_id": tmdb_id,
+                    "avatar_url": f"{base}/w185{profile}" if profile else None,
+                }
+            )
     return out
 
 

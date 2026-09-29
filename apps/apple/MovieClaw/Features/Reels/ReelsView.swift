@@ -10,8 +10,9 @@ import SwiftUI
 /// - 纯黑底，影片居中成一条 16:9 的横带；没出第一帧前先显示封面（服务端抓的就是起点那一帧）；
 /// - 右下角一列**无底色**的白色图标按钮（不用毛玻璃，和画面融在一起，带投影保证亮画面上也看得清）：
 ///   收藏、播放、已看、分享；
-/// - 左下角左对齐：片名 + 年份、评分 · 片长 · 类型、剧集的季集与集名、两行简介；
-/// - 最底下一条细进度线（片段内进度）。
+/// - 左下角左对齐：最上面一行是导演（剧集是主创）——对应 TikTok / Instagram 里作者头像与名字的位置，
+///   点了进人物页；然后是片名 + 年份、评分 · 类型、剧集的季集与集名、两行简介；
+/// - 最底下一条细进度线（片段内进度），右边是「在片中的位置 / 片长」。
 ///
 /// 播放按钮：点一下从当前位置转到播放器页（同一个文件，刷片下过的字节直接复用），长按可选「从头看」。
 /// 点画面暂停 / 继续，放到片段终点停下、再点重播。
@@ -136,7 +137,8 @@ struct ReelsView: View {
                         onShare: {
                             store.pause()
                             sharing = item
-                        }
+                        },
+                        onOpenPerson: { router.push(.person(tmdbId: $0)) }
                     )
                     .frame(width: size.width + insets.leading + insets.trailing,
                            height: size.height + insets.top + insets.bottom)
@@ -197,6 +199,7 @@ private struct ReelPage: View {
     let onPlay: () -> Void
     let onPlayFromStart: () -> Void
     let onShare: () -> Void
+    let onOpenPerson: (Int) -> Void
 
     @Environment(\.api) private var api
 
@@ -327,6 +330,44 @@ private struct ReelPage: View {
     // MARK: 左下角信息
 
     private var info: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !item.title.directors.isEmpty { directorRow }
+            titleBlock
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// 导演（剧集是主创）：头像 + 名字 + 描边小标签，对应 Instagram「头像 · 作者名 · 关注」那一行
+    private var directorRow: some View {
+        let people = item.title.directors
+        let lead = people[0]
+        return Button {
+            if let id = lead.tmdbPersonId { onOpenPerson(id) }
+        } label: {
+            HStack(spacing: 8) {
+                RemoteImage(url: api.image(lead.avatarUrl), placeholderSymbol: "person.fill")
+                    .frame(width: 28, height: 28)
+                    .clipShape(Circle())
+                    .overlay(Circle().stroke(.white.opacity(0.25), lineWidth: 0.5))
+                Text(people.map(\.name).joined(separator: " / "))
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Text(item.title.kind == "tv" ? "主创" : "导演")
+                    .font(.caption2.weight(.semibold))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .overlay(Capsule().stroke(.white.opacity(0.7), lineWidth: 1))
+            }
+            .foregroundStyle(.white)
+            .shadow(color: .black.opacity(0.55), radius: 3, y: 1)
+        }
+        .buttonStyle(.plain)
+        .disabled(lead.tmdbPersonId == nil)
+        .accessibilityLabel("\(item.title.kind == "tv" ? "主创" : "导演")：\(people.map(\.name).joined(separator: "、"))")
+        .accessibilityIdentifier("reels-director")
+    }
+
+    private var titleBlock: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(item.title.name)
@@ -368,19 +409,12 @@ private struct ReelPage: View {
         item.title.episode?.overview ?? item.title.overview
     }
 
-    /// 评分 · 片长 · 类型
+    /// 评分 · 类型（片长不再重复写：进度线右边的总时长就是）
     private var facts: String {
         var parts: [String] = []
         if let rating = item.title.rating, rating > 0 { parts.append(String(format: "★ %.1f", rating)) }
-        if let minutes = item.title.runtimeMinutes, minutes > 0 { parts.append(Self.duration(minutes)) }
         if !item.title.genres.isEmpty { parts.append(item.title.genres.prefix(2).joined(separator: " / ")) }
         return parts.joined(separator: " · ")
-    }
-
-    private static func duration(_ minutes: Int) -> String {
-        guard minutes >= 60 else { return "\(minutes) 分钟" }
-        let rest = minutes % 60
-        return rest == 0 ? "\(minutes / 60) 小时" : "\(minutes / 60) 小时 \(rest) 分"
     }
 
     private func episodeLine(_ episode: API.ReelEpisodeView) -> String {
@@ -391,19 +425,44 @@ private struct ReelPage: View {
 
     // MARK: 进度线
 
+    /// 细线是这一段的进度；右边的时间是「在整部片里放到哪 / 整部片多长」（剧集是这一集），
+    /// 让人知道这一段出自片子的什么位置
     private var progressLine: some View {
         TimelineView(.periodic(from: .now, by: 0.25)) { _ in
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(.white.opacity(0.22))
-                    Capsule().fill(.white.opacity(0.9))
-                        .frame(width: geo.size.width * (player?.progress ?? 0))
+            HStack(spacing: 10) {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(.white.opacity(0.22))
+                        Capsule().fill(.white.opacity(0.9))
+                            .frame(width: geo.size.width * (player?.progress ?? 0))
+                    }
                 }
+                .frame(height: 2)
+                Text(timeText)
+                    .font(.caption2.weight(.medium).monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.78))
+                    .shadow(color: .black.opacity(0.5), radius: 2, y: 1)
+                    .fixedSize()
+                    .accessibilityIdentifier("reels-time")
             }
         }
-        .frame(height: 2)
+        .frame(height: 14)
         .allowsHitTesting(false)
-        .accessibilityHidden(true)
+    }
+
+    private var timeText: String {
+        let position = player?.position ?? Double(item.segment.startMs) / 1000
+        let total = item.segment.durationMs.map { Double($0) / 1000 } ?? player?.core.duration
+        guard let total, total > 0 else { return Self.clock(position, long: position >= 3600) }
+        let long = total >= 3600
+        return "\(Self.clock(position, long: long)) / \(Self.clock(total, long: long))"
+    }
+
+    /// 1:36:17 / 45:08：一小时以上的片子两边都带小时位，对齐不跳
+    private static func clock(_ seconds: Double, long: Bool) -> String {
+        let total = max(0, Int(seconds.rounded(.down)))
+        let h = total / 3600, m = total % 3600 / 60, s = total % 60
+        return long ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
     }
 }
 
