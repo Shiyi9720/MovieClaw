@@ -9,7 +9,7 @@ from alembic import command
 from movieclaw_api.core.config import get_settings
 from movieclaw_db.migrations import _build_config
 
-_BEFORE = "b6e2d8f4a193"  # 本迁移的前一版
+_BEFORE = "c4d9e2a7b613"  # 本迁移的前一版
 _REVISION = "0641cc32b069"
 
 

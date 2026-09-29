@@ -18,7 +18,7 @@ docs/design/video-chapters.md §4.5：章节场景图每个文件要 seek 抓帧
 回退（downgrade）不恢复旧值：迁移前哪些库是用户主动打开的已无从得知。
 
 Revision ID: 0641cc32b069
-Revises: b6e2d8f4a193
+Revises: c4d9e2a7b613
 Create Date: 2026-09-29 10:00:00.000000
 """
 
@@ -30,7 +30,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0641cc32b069"
-down_revision: str | None = "b6e2d8f4a193"
+down_revision: str | None = "c4d9e2a7b613"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
