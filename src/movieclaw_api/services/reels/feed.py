@@ -61,8 +61,8 @@ SUPPORTED_CONTAINERS = ("mkv", "webm", "mp4", "m4v", "mov")
 PAGE_BUDGET_S = 3.0
 #: 一页最多往后看多少部（很多部挑不出片段时不至于无限往后翻）
 SCAN_FACTOR = 3
-#: 剧集太短（片花、特辑）不抽
-MIN_EPISODE_SECONDS = 300
+#: 剧集太短（片花、预告）不抽。不能定太高：《小猪佩奇》一集只有 5 分钟左右
+MIN_EPISODE_SECONDS = 120
 #: App 目前会放的方式
 MODE_SEEK = "seek"
 
