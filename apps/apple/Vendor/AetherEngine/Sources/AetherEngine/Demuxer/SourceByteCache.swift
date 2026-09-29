@@ -642,27 +642,59 @@ final class SourceByteCache: @unchecked Sendable {
         punch(eviction.holes)
     }
 
+    /// [MovieClaw P46] 片源头尾的「元数据区」：文件头 8 MiB、文件尾 32 MiB——MP4 的 moov（放头或放尾，大片十几 MB）、
+    /// MKV 的 SeekHead 与 Cues、TS 的时长都在这里。它们只在打开时读一次，按最近使用总是最先被挤掉：看一个多小时高码率片，
+    /// 1 GiB 预算只装得下最后几分钟，下次续播（P42）就得重下文件头和索引。淘汰时这些块排在最后
+    static let pinnedHeadBytes: Int64 = 8 << 20
+    static let pinnedTailBytes: Int64 = 32 << 20
+
+    private func isPinnedLocked(_ entry: Entry, block index: Int64) -> Bool {
+        if index * Self.blockSize < Self.pinnedHeadBytes { return true }
+        guard let length = entry.contentLength else { return false }
+        return (index + 1) * Self.blockSize > length - Self.pinnedTailBytes
+    }
+
     /// 超了预算：按最近使用从旧到新丢块，丢到预算的九成（成批丢，免得每写一块都扫一遍）。
-    /// 只在账上删、返回要打的洞，由调用方在锁外打（P32）
+    /// 只在账上删、返回要打的洞，由调用方在锁外打（P32）。[MovieClaw P46] 元数据区的块自己超过预算四分之一时先丢到四分之一，
+    /// 然后先丢普通块，普通块丢光仍超预算才轮到它们
     private func evictOverBudgetLocked() -> Eviction {
         let budget = budgetLocked()
         guard totalBytes > budget else { return Eviction() }
         var eviction = Eviction()
         var touched: [ObjectIdentifier: Entry] = [:]
-        var candidates: [(key: String, index: Int64, lastUse: UInt64)] = []
+        typealias Candidate = (key: String, index: Int64, lastUse: UInt64)
+        var normal: [Candidate] = []
+        var pinned: [Candidate] = []
+        var pinnedBytes: Int64 = 0
         for (key, entry) in entries {
-            for (index, block) in entry.blocks { candidates.append((key, index, block.lastUse)) }
-        }
-        candidates.sort { $0.lastUse < $1.lastUse }
-        let target = budget / 10 * 9
-        for candidate in candidates where totalBytes > target {
-            guard let entry = entries[candidate.key], let block = entry.blocks.removeValue(forKey: candidate.index) else {
-                continue
+            for (index, block) in entry.blocks {
+                if isPinnedLocked(entry, block: index) {
+                    pinned.append((key, index, block.lastUse))
+                    pinnedBytes += block.hi - block.lo
+                } else {
+                    normal.append((key, index, block.lastUse))
+                }
             }
-            totalBytes -= block.hi - block.lo
+        }
+        normal.sort { $0.lastUse < $1.lastUse }
+        pinned.sort { $0.lastUse < $1.lastUse }
+        /// 丢一块，返回腾出的字节（已经丢过的返回 0）
+        func evict(_ candidate: Candidate) -> Int64 {
+            guard let entry = entries[candidate.key], let block = entry.blocks.removeValue(forKey: candidate.index) else {
+                return 0
+            }
+            let freed = block.hi - block.lo
+            totalBytes -= freed
             eviction.holes.append((entry, candidate.index * Self.blockSize))
             touched[ObjectIdentifier(entry)] = entry
+            return freed
         }
+        let target = budget / 10 * 9
+        // 元数据区最多占预算四分之一（至少容得下一个片源的头尾），超了先按最近使用丢最旧片源的
+        let pinnedCap = max(budget / 4, Self.pinnedHeadBytes + Self.pinnedTailBytes)
+        for candidate in pinned where pinnedBytes > pinnedCap { pinnedBytes -= evict(candidate) }
+        for candidate in normal where totalBytes > target { _ = evict(candidate) }
+        for candidate in pinned where totalBytes > target { _ = evict(candidate) }
         // 块丢光的片源整条删（关文件、删文件），免得看过的片子多了文件句柄越攒越多
         for (key, entry) in entries where entry.blocks.isEmpty {
             entries.removeValue(forKey: key)
@@ -688,6 +720,9 @@ extension AetherEngine {
 
     /// [MovieClaw P34] 探测流时把第二条起的 TrueHD 暂当附件（默认开，见 `Demuxer.parkUnsizedPGS`）。宿主做新旧对照时可关
     nonisolated(unsafe) public static var parkSecondaryTrueHDDuringProbe = true
+
+    /// [MovieClaw P45] MKV 索引预热跳到起播点而不是片中间（默认开，见 `HLSVideoEngine.start()` 的 cue prewarm）。宿主做新旧对照时可关
+    nonisolated(unsafe) public static var cuePrewarmTargetsStart = true
 
     /// [MovieClaw P42] 片源字节缓存跨启动保留（默认开）。只在共享实例第一次用到之前改才有效（宿主在建第一个引擎前设），
     /// 真机新旧对照用

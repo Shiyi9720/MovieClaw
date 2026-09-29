@@ -110,6 +110,8 @@ final class NativeEngine: NSObject, PlayerEngine {
         if UserDefaults.standard.object(forKey: "mcSeekSnapBudget") != nil {
             AetherPlayback.seekSnapDecodeBudgetSeconds = UserDefaults.standard.double(forKey: "mcSeekSnapBudget")
         }
+        // -mcCuePrewarmMiddle YES：MKV 索引预热照旧跳到片中间（引擎补丁 P45 之前的行为，真机新旧对照用）
+        AetherPlayback.setCuePrewarmTargetsStart(!UserDefaults.standard.bool(forKey: "mcCuePrewarmMiddle"))
         // -mcWitnessInterval <秒>：起播 / 跳转后看缓冲过没过开播线的间隔（引擎补丁 P28，默认 0.025，原来 0.1；真机对照用）
         let witness = UserDefaults.standard.double(forKey: "mcWitnessInterval")
         if witness > 0 { AetherPlayback.vodStartWitnessIntervalSeconds = witness }

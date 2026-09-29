@@ -156,6 +156,48 @@ struct SourceByteCacheTests {
         #expect(cache.key(for: first) == nil)
     }
 
+    // MARK: - P46 元数据区后淘汰
+
+    @Test func metadataBlocksOutliveThePlayback() {
+        // 文件头、文件尾（moov / Cues 所在）打开时读一次，之后顺序播放写了一大段：超预算先丢播放的旧块，头尾留着给下次续播
+        let cache = SourceByteCache(budgetBytes: Int64(block) * 8)
+        let key = "t-\(UUID())"
+        let length = Int64(block) * 200
+        cache.noteContentLength(key: key, length: length)
+        cache.write(key: key, offset: 0, data: bytes(block, seed: 1))
+        cache.write(key: key, offset: length - Int64(block), data: bytes(block, seed: 2))
+        for index in 50 ..< 62 {
+            cache.write(key: key, offset: Int64(block * index), data: bytes(block, seed: UInt8(index)))
+        }
+        #expect(read(cache, key, at: 0, max: 10) == bytes(10, seed: 1))
+        #expect(read(cache, key, at: length - Int64(block), max: 10) == bytes(10, seed: 2))
+        #expect(read(cache, key, at: Int64(block * 50), max: 10).isEmpty)
+        #expect(read(cache, key, at: Int64(block * 61), max: 10) == bytes(10, seed: 61))
+        cache.purgeAll()
+    }
+
+    @Test func metadataShareIsCapped() {
+        // 元数据区也不能无限占（最多预算四分之一，至少一个片源的头尾 40 块）：六部旧片的文件头共 48 块，
+        // 再播一部把总量推过预算时，先按最近使用丢最旧那部的文件头
+        let cache = SourceByteCache(budgetBytes: Int64(block) * 48)
+        let length = Int64(block) * 400
+        let old = (0 ..< 6).map { _ in "t-\(UUID())" }
+        for (index, key) in old.enumerated() {
+            cache.noteContentLength(key: key, length: length)
+            cache.write(key: key, offset: 0, data: Data(repeating: UInt8(index + 1), count: block * 8))
+        }
+        let playing = "t-\(UUID())"
+        cache.noteContentLength(key: playing, length: length)
+        for index in 100 ..< 102 {
+            cache.write(key: playing, offset: Int64(block * index), data: Data(repeating: 0xAA, count: block))
+        }
+        #expect(read(cache, old[0], at: 0, max: 10).isEmpty)
+        #expect(read(cache, old[1], at: 0, max: 10) == Data(repeating: 2, count: 10))
+        #expect(read(cache, playing, at: Int64(block * 101), max: 10) == Data(repeating: 0xAA, count: 10))
+        #expect(cache.cachedBytes <= Int64(block) * 48)
+        cache.purgeAll()
+    }
+
     // MARK: - P42 跨启动保留
 
     /// 每个用例一个空目录，模拟 Caches 下的缓存目录。上一场的实例要留到用例结束（实例释放时会删掉它开着的片源，

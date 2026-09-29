@@ -210,6 +210,11 @@ public final class AetherPlayback {
         AetherEngine.preconnect(url: url, httpHeaders: headers)
     }
 
+    /// MKV 索引预热是否跳到起播点（引擎补丁 P45，默认开；关掉即上游的跳到片中间，真机新旧对照用）
+    public static func setCuePrewarmTargetsStart(_ on: Bool) {
+        AetherEngine.cuePrewarmTargetsStart = on
+    }
+
     /// 探测流时是否跳过第二条起的 TrueHD（引擎补丁 P34，默认开；真机新旧对照时关掉）
     public static func setParkSecondaryTrueHD(_ on: Bool) {
         AetherEngine.parkSecondaryTrueHDDuringProbe = on
