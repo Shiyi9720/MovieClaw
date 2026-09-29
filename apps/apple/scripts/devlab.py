@@ -15,6 +15,7 @@
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -115,8 +116,14 @@ def run_one(batch, name, extra=(), tag=None, seconds=66, close_at=56, at="keep",
             time.sleep(
                 seconds + max(0.0, ROUTE_DELAY - 2) + (ROUTE_THEN_DELAY if ROUTE_FIRST else 0)
             )
-            p.kill()
-            p.wait()
+            # 先 SIGINT 让 devicectl 正常断开控制台连接，2 秒没退再强杀：直接 SIGKILL 会在设备上留下没断开的控制台，
+            # 接下来带 --console 的启动一阵子都报 CoreDeviceError 10002「Invalid argument」（日志为空）
+            p.send_signal(signal.SIGINT)
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
         t = Path(path).read_text(encoding="utf-8", errors="replace")
         if "[NativeEngine" in t or "[PlayerError]" in t:
             break
