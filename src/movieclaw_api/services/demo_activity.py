@@ -536,25 +536,43 @@ _LIVE_GAP_SECONDS = 90  # 一部放完到下一部开播之间的空档
 def live_sessions(now_epoch: float | None = None) -> list[PlaySession]:
     """此刻「正在播放」的几路会话（与真实会话同形，交给活动快照统一装配）。
 
-    每一路把自己的片单按「片长 + 空档」切成时间块轮播：块号由当前时间算出，
-    同一时刻多次调用结果一致，进度随时间连续推进。``presence`` 控制这一路在
-    某个块里是否出现，让路数有起有落。
+    每一路把自己的片单排成一轮：每部片占「片长 + 空档」的时段，一轮放完再按新
+    顺序开下一轮。位置由当前时间算出，同一时刻多次调用结果一致，进度随时间连续
+    推进。``presence`` 按「这一轮的这部片」决定这一路是否出现，让路数有起有落。
+
+    时段按每部片自己的长度切，而不是统一按最长的片：片单里多是两三分钟的短片，
+    统一按十几分钟切的话大半时间都是空档，活动页约四分之一的时候一路都没有。
     """
     now_epoch = now_epoch if now_epoch is not None else time.time()
     now = datetime.fromtimestamp(now_epoch, UTC).replace(tzinfo=None)
     sessions: list[PlaySession] = []
     for index, channel in enumerate(_live_channels):
-        block_seconds = max(u.duration_ms for u in channel.units) // 1000 + _LIVE_GAP_SECONDS
+        slots = [u.duration_ms // 1000 + _LIVE_GAP_SECONDS for u in channel.units]
+        cycle = sum(slots)
+        if cycle <= 0:
+            continue
         # 各路错开相位，避免同时开播、同时结束
-        shifted = now_epoch + index * block_seconds / len(_live_channels)
-        block = int(shifted // block_seconds)
-        roll = zlib.crc32(f"{channel.device.device_id}:{block}".encode())
+        shifted = now_epoch + index * cycle / len(_live_channels)
+        round_no = int(shifted // cycle)
+        offset = shifted - round_no * cycle
+        # 每一轮换一个播放顺序（按轮次确定性打乱），免得每轮都是同一个次序
+        order = sorted(
+            range(len(channel.units)),
+            key=lambda k, r=round_no: zlib.crc32(f"{channel.device.device_id}:{r}:{k}".encode()),
+        )
+        pick = order[-1]
+        for k in order:
+            if offset < slots[k]:
+                pick = k
+                break
+            offset -= slots[k]
+        unit = channel.units[pick]
+        roll = zlib.crc32(f"{channel.device.device_id}:{round_no}:{pick}".encode())
         if (roll % 1000) / 1000 >= channel.presence:
             continue
-        unit = channel.units[roll % len(channel.units)]
-        elapsed_ms = int((shifted - block * block_seconds) * 1000)
+        elapsed_ms = int(offset * 1000)
         if elapsed_ms >= unit.duration_ms:
-            continue  # 这一块里的片子已经放完，处在空档
+            continue  # 这部片已经放完，处在到下一部之间的空档
         started = now - timedelta(milliseconds=elapsed_ms)
         client = ClientInfo(
             name=channel.device.client,

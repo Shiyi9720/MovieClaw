@@ -115,3 +115,29 @@ async def test_live_sessions_are_deterministic_and_within_runtime(db) -> None:
         follow = later.get(session.device_id)
         if follow is not None and follow.unit == session.unit:
             assert follow.position_ms == (session.position_ms or 0) + 30_000
+
+
+def test_live_sessions_rarely_all_idle(monkeypatch) -> None:
+    """按演示站的真实片长（多是两三分钟的短片）算一整天：「正在播放」一路都没有
+    的时候要少见——访客打开活动页，多数时候应当看得到有人在看。"""
+    films = [11, 10, 15, 12, 8, 4, 3]  # 分钟：电影库
+    shorts = [4, 1.5, 2.5, 2.5, 3, 2]  # 分钟：动画短片库
+
+    def units(minutes: list[float]) -> tuple:
+        return tuple(
+            demo_activity._Unit(i, "movie", f"片{i}", 1, i, int(m * 60_000), 10**8)
+            for i, m in enumerate(minutes, start=1)
+        )
+
+    devices = {d.device_id: d for v in demo_activity._VIEWERS for d in v.devices}
+    channels = (
+        demo_activity._LiveChannel(0, devices["demo-admin-mac"], units(films + shorts), 0.5),
+        demo_activity._LiveChannel(1, devices["demo-family-atv"], units(films + shorts), 0.85),
+        demo_activity._LiveChannel(2, devices["demo-kids-ipad"], units(shorts), 0.85),
+        demo_activity._LiveChannel(3, devices["demo-guest-pc"], units(films), 0.3),
+    )
+    monkeypatch.setattr(demo_activity, "_live_channels", channels)
+    epoch = NOW.timestamp()
+    counts = [len(demo_activity.live_sessions(epoch + minute * 60)) for minute in range(1440)]
+    assert counts.count(0) / len(counts) < 0.12
+    assert max(counts) >= 3, "路数要有起有落，高峰时能看到好几路"
