@@ -16,6 +16,11 @@ final class ReelPlayer {
     enum State: Equatable {
         case loading, playing, paused, ended
         case failed(String)
+
+        var isFailed: Bool {
+            if case .failed = self { return true }
+            return false
+        }
     }
 
     let item: API.ReelItemView
@@ -26,6 +31,8 @@ final class ReelPlayer {
     var onStateChange: ((State) -> Void)?
     var onFirstFrame: (() -> Void)?
     private(set) var hasFirstFrame = false
+    /// 预起中：装载到起点停着，等 `play()`（见 `start(server:autoplay:)`）
+    private var prerolling = false
     private var subtitleApplied = false
     private var monitor: Task<Void, Never>?
 
@@ -61,12 +68,14 @@ final class ReelPlayer {
         item.play.sizeBytes.map { PlaybackController.sourceCacheKey(fileId: item.segment.fileId, size: $0) }
     }
 
-    func start(server: ServerAddress) {
+    /// - Parameter autoplay: false = 预起（装载到起点、停在第一帧，等 `play()`）
+    func start(server: ServerAddress, autoplay: Bool = true) {
         guard let raw = item.play.streamUrl, let url = server.resolve(raw) else {
             state = .failed("这一条缺少取流地址")
             return
         }
-        core.load(source: .file(url), start: startSeconds, autoplay: true,
+        prerolling = !autoplay
+        core.load(source: .file(url), start: startSeconds, autoplay: autoplay,
                   headers: ["User-Agent": APIClient.userAgent],
                   audioOrdinal: item.play.audioOrdinal,
                   sourceCacheKey: Self.cacheKey(for: item))
@@ -90,6 +99,10 @@ final class ReelPlayer {
     }
 
     func play() {
+        if prerolling {
+            prerolling = false
+            core.setPrefetchSuspended(false)
+        }
         if state == .ended { replay() } else { core.play() }
     }
 
@@ -124,6 +137,8 @@ final class ReelPlayer {
             if state != .ended { state = .playing }
         case .paused:
             if state == .playing { state = .paused }
+            // 预起的那条装载好了就停止往前下：滑不滑过去还不知道，别占着当前这条的带宽
+            if prerolling { core.setPrefetchSuspended(true) }
         case .ended:
             state = .ended
         case .loading, .buffering:

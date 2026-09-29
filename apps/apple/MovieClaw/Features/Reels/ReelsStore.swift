@@ -3,8 +3,12 @@ import SwiftUI
 
 /// 刷片页的状态：翻页、当前这条的播放器、预取窗口、事件上报（docs/design/reels.md §4、§6）。
 ///
-/// **只有当前这条有播放器**：滑动停稳后销毁上一条、为新的一条建引擎并从片段起点起播。
-/// 同时存在两个引擎（4K 杜比视界每个约 135MB 内存）的「预起下一条」留到测出来确实不够快再做。
+/// **当前这条 + 预起的下一条**：当前这条出画 1 秒后（且下一条的预取已下完），为下一条另建一个引擎，
+/// 装载到片段起点停着、不再往前下载（`standby`）。滑过去时只要「播放」：不用现建引擎、打开、探测、
+/// 等第一帧。换条时旧引擎先停声、半秒后再拆（拆引擎要在主线程上花几十毫秒，别赶在滑动收尾时）。
+/// 往回滑、一次跳过好几条时没有预起，退回现建引擎。代价是同时多一个引擎（4K 杜比视界约 135MB 内存）。
+/// 2026-09-30 模拟器实测（软件解码通路、字节都已预取，10 次换条中位数）：停稳到开播 139 → 36 毫秒，
+/// 到出画 184 → 79 毫秒（剩下的是软件通路停着时不解第一帧、以及旧引擎停声本身）。
 ///
 /// **预取窗口**：当前这条出第一个画面后（不和它抢起播的线路），后台把接下来几条要读的字节
 /// 按服务端给的范围写进引擎的片源字节缓存：下一条全量（文件头 + 索引 + 起点后约 4 秒），
@@ -32,6 +36,10 @@ final class ReelsStore {
     private(set) var player: ReelPlayer?
     private(set) var playerState: ReelPlayer.State = .loading
     private(set) var firstFrameShown = false
+    /// 预起好的下一条：已装载到片段起点、停在第一帧上，滑过去直接播（见 `scheduleStandby`）
+    private(set) var standby: ReelPlayer?
+    /// 预起的那条出了第一帧
+    private(set) var standbyReady = false
     /// 当前筛选的类型；nil = 全部
     private(set) var genre: String?
     /// 能刷到的类型（顶部下拉的选项）
@@ -45,6 +53,7 @@ final class ReelsStore {
     @ObservationIgnored private var seed: Int?
     @ObservationIgnored private var nextOffset = 0
     @ObservationIgnored private var prefetchTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var standbyTask: Task<Void, Never>?
     @ObservationIgnored private var pendingEvents: [API.ReelEventIn] = []
     @ObservationIgnored private var shownAt: ContinuousClock.Instant?
     /// 当前这条已经「接着看 / 看正片」转去播放器页了
@@ -107,30 +116,60 @@ final class ReelsStore {
 
     // MARK: - 当前条
 
-    /// 滑动停稳：当前条变了就换播放器
+    /// 滑动停稳：当前条变了就换播放器。下一条预起好了（`standby`）就直接接着放，否则现建引擎
     func settle() {
         guard let id = currentID, player?.item.id != id,
               let index = items.firstIndex(where: { $0.id == id }) else { return }
-        leaveCurrent()
+        // 旧的先停声、稍后再拆：拆引擎要在主线程上花几十毫秒，正赶在滑动收尾时会顿一下
+        leaveCurrent(deferTeardown: true)
         let item = items[index]
-        firstFrameShown = false
-        playerState = .loading
         shownAt = .now
         record(item, kind: "impression", positionMs: item.segment.startMs)
-        do {
-            let player = try ReelPlayer(item: item)
-            player.onStateChange = { [weak self] state in self?.stateChanged(state, of: item) }
-            player.onFirstFrame = { [weak self] in self?.firstFrame(of: item, index: index) }
-            self.player = player
-            player.start(server: api.server)
-        } catch {
-            playerState = .failed("播放器创建失败")
-            record(item, kind: "fail", detail: ["reason": .string("engine_init")])
-            schedulePrefetch(after: index)
+        if let ready = standby, ready.item.id == id, !ready.state.isFailed {
+            standby = nil
+            standbyReady = false
+            adopt(ready, item: item, index: index)
+            ready.play()
+            // 第一帧早就出了，引擎不会再报：这里补上「出画面」的记录与后续预取
+            if ready.hasFirstFrame { firstFrame(of: item, index: index) }
+        } else {
+            dropStandby()
+            do {
+                let player = try ReelPlayer(item: item)
+                adopt(player, item: item, index: index)
+                player.start(server: api.server)
+            } catch {
+                playerState = .failed("播放器创建失败")
+                record(item, kind: "fail", detail: ["reason": .string("engine_init")])
+                schedulePrefetch(after: index)
+            }
         }
         if items.count - index <= Self.loadAheadThreshold {
             Task { await loadMore() }
         }
+    }
+
+    /// 让一个播放器成为当前这条（新建的，或预起好的）
+    private func adopt(_ player: ReelPlayer, item: API.ReelItemView, index: Int) {
+        player.onStateChange = { [weak self] state in self?.stateChanged(state, of: item) }
+        player.onFirstFrame = { [weak self] in self?.firstFrame(of: item, index: index) }
+        self.player = player
+        firstFrameShown = player.hasFirstFrame
+        playerState = .loading
+    }
+
+    /// 某一条现在由哪个播放器出画：当前这条，或预起好的下一条
+    func player(for item: API.ReelItemView) -> ReelPlayer? {
+        if let player, player.item.id == item.id { return player }
+        if let standby, standby.item.id == item.id { return standby }
+        return nil
+    }
+
+    /// 这一条的画面能不能直接显示（出了第一帧）；不能时页面先垫封面
+    func frameReady(for item: API.ReelItemView) -> Bool {
+        if player?.item.id == item.id { return firstFrameShown }
+        if standby?.item.id == item.id { return standbyReady }
+        return false
     }
 
     func togglePause() { player?.togglePause() }
@@ -159,7 +198,8 @@ final class ReelsStore {
 
     /// 页面被切走（换标签、返回、盖上播放器页）：收掉播放器与预取，把攒着的事件报上去
     func suspend() {
-        leaveCurrent()
+        leaveCurrent(deferTeardown: false)
+        dropStandby()
         for task in prefetchTasks.values { task.cancel() }
         prefetchTasks.removeAll()
         Task { await flush() }
@@ -210,13 +250,25 @@ final class ReelsStore {
         }
     }
 
-    private func leaveCurrent() {
+    /// - Parameter deferTeardown: 先停声，拆引擎放到半秒后（滑动收尾时不占主线程）；
+    ///   挂起页面时要立刻拆，把解码器与内存让给播放器页
+    private func leaveCurrent(deferTeardown: Bool) {
         guard let player else { return }
         // 已经接着看 / 看正片了：这一条是转去正片，不是滑走
         if player.state != .ended, !handedOff {
             record(player.item, kind: "leave", positionMs: Int(player.position * 1000), watchedMs: watchedMs(player))
         }
-        player.destroy()
+        player.onStateChange = nil
+        player.onFirstFrame = nil
+        if deferTeardown {
+            player.pause()
+            Task {
+                try? await Task.sleep(for: .milliseconds(500))
+                player.destroy()
+            }
+        } else {
+            player.destroy()
+        }
         self.player = nil
         handedOff = false
     }
@@ -246,6 +298,7 @@ final class ReelsStore {
         let waitMs = Int(waited.components.seconds * 1000 + waited.components.attoseconds / 1_000_000_000_000_000)
         record(item, kind: "first_frame", positionMs: item.segment.startMs, waitMs: waitMs)
         schedulePrefetch(after: index)
+        scheduleStandby(after: index)
     }
 
     // MARK: - 预取
@@ -275,6 +328,47 @@ final class ReelsStore {
                                                         headers: ["User-Agent": APIClient.userAgent])
             }
         }
+    }
+
+    // MARK: - 预起下一条
+
+    /// 当前这条放稳（出画 1 秒后，且下一条的预取已下完）再预起下一条：装载到片段起点、停在第一帧，
+    /// 之后不再往前下载。滑过去时只要「播放」，不用再建引擎、打开、探测、出第一帧。
+    /// 等 1 秒是让开滑动收尾：旧引擎半秒后才拆，新引擎也要在主线程上建
+    private func scheduleStandby(after index: Int) {
+        standbyTask?.cancel()
+        guard index + 1 < items.count else { return }
+        let next = items[index + 1]
+        guard standby?.item.id != next.id else { return }
+        let prefetch = prefetchTasks["\(next.id)#full"]
+        standbyTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            await prefetch?.value
+            guard let self, !Task.isCancelled, self.player != nil, self.currentID != next.id else { return }
+            self.prepareStandby(next)
+        }
+    }
+
+    private func prepareStandby(_ item: API.ReelItemView) {
+        dropStandby()
+        guard let standby = try? ReelPlayer(item: item) else { return }
+        standby.onFirstFrame = { [weak self, weak standby] in
+            guard let self, let standby, self.standby === standby else { return }
+            self.standbyReady = true
+        }
+        self.standby = standby
+        standbyReady = false
+        standby.start(server: api.server, autoplay: false)
+    }
+
+    private func dropStandby() {
+        standbyTask?.cancel()
+        standbyTask = nil
+        guard let standby else { return }
+        standby.onFirstFrame = nil
+        standby.destroy()
+        self.standby = nil
+        standbyReady = false
     }
 
     // MARK: - 事件

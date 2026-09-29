@@ -307,10 +307,8 @@ private struct ReelPage: View {
         }
     }
 
-    private var player: ReelPlayer? {
-        guard isCurrent, let player = store.player, player.item.id == item.id else { return nil }
-        return player
-    }
+    /// 这一条的播放器：当前这条，或预起好的下一条（滑动途中下一页就是它的第一帧，不是封面）
+    private var player: ReelPlayer? { store.player(for: item) }
 
     // MARK: 画面
 
@@ -321,7 +319,7 @@ private struct ReelPage: View {
             if showsVideo, let player {
                 ReelVideoSurface(engineView: player.core.view)
                     .id(ObjectIdentifier(player))
-                    .opacity(store.firstFrameShown ? 1 : 0)
+                    .opacity(store.frameReady(for: item) ? 1 : 0)
             }
             if showsVideo { overlay }
         }
