@@ -90,6 +90,17 @@ struct KeyframeSnapPolicyTests {
                 == 609.75 + KeyframeSnapPolicy.landingLeadSeconds)
     }
 
+    @Test func startNeverJumpsBackTooFar() {
+        // 关键帧隔 60 秒的片子：往回吸附等于续播点丢了，照旧精确落点（多等逐帧解码）
+        let sparse: [Double] = [0, 60, 120]
+        #expect(KeyframeSnapPolicy.startLanding(target: 100, keyframes: sparse,
+                                                costPerSecond: cost4K60, budget: 0.05) == nil)
+        // 10 秒以内照常吸附
+        #expect(KeyframeSnapPolicy.startLanding(target: 69, keyframes: sparse,
+                                                costPerSecond: cost4K60, budget: 0.05)
+                == 60 + KeyframeSnapPolicy.landingLeadSeconds)
+    }
+
     @Test func startLeadStaysWithinHalfTheGap() {
         // 关键帧只隔 0.3 秒时落点后移不超过一半
         let dense: [Double] = [100, 100.3, 110]

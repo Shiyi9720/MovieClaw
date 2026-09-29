@@ -67,6 +67,10 @@ enum KeyframeSnapPolicy {
     ///   - costPerSecond: `decodeCostPerSecond` 的结果
     ///   - budget: 逐帧解码的预算（秒），≤ 0 关闭
     /// - Returns: 吸附后的起播点；nil 表示照旧精确落点
+    /// [MovieClaw P39] 起播最多往回让多少秒。关键帧隔得特别远的片子（录屏之类几十秒一个）吸附过去等于续播点丢了，
+    /// 这种宁可多等逐帧解码；常见片源的关键帧间隔都在 10 秒以内（语料最长《绝命毒师》4K 8.7 秒）
+    static let maxStartSnapBackSeconds: Double = 10
+
     static func startLanding(target: Double, keyframes: [Double],
                              costPerSecond: Double, budget: Double) -> Double? {
         guard budget > 0, costPerSecond > 0, target.isFinite, target > 0, !keyframes.isEmpty else { return nil }
@@ -78,7 +82,7 @@ enum KeyframeSnapPolicy {
         }
         guard lo > 0 else { return nil }
         let previous = keyframes[lo - 1]
-        guard (target - previous) * costPerSecond > budget else { return nil }
+        guard (target - previous) * costPerSecond > budget, target - previous <= maxStartSnapBackSeconds else { return nil }
         let lead = lo < keyframes.count
             ? min(landingLeadSeconds, (keyframes[lo] - previous) / 2) : landingLeadSeconds
         let landing = previous + lead

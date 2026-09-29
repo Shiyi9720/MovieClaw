@@ -35,7 +35,8 @@ import Foundation
 /// （2026-09-30 NAS 播放记录），续播要读的正是上一场下过的字节：文件头、索引（MP4 的 moov、MKV 的 Cues）、
 /// 续播点所在的那一段。现在共享实例落在 Caches 目录，每个片源两个文件，按键的哈希命名：`.bin` 是稀疏数据，
 /// `.idx` 是记账（文件大小与每块的连续覆盖）。记账随写入在后台队列上防抖落盘；淘汰时先落记账、再打洞——
-/// 记账永远不会说一块在、数据却已被打了洞（读出全零就是花屏）。进程被杀时记账最多落后几秒，只会少认几块，不会多认。
+/// 记账永远不会说一块在、数据却已被打了洞（读出全零就是花屏）；写记账之前先对数据文件做写屏障同步，突然断电也不会
+/// 认下还没落到闪存的块。进程被杀时记账最多落后几秒，只会少认几块，不会多认。
 /// 某个片源第一次被访问时按需从磁盘恢复（连接报的文件大小对不上照样整份作废）；App 启动时 `sweep` 整理一次：
 /// 删孤儿文件、30 天没用过的，总量超过保留预算时按最近使用整条删。测试自建的实例不落盘（与原来一样用临时目录）。
 ///
@@ -67,8 +68,9 @@ final class SourceByteCache: @unchecked Sendable {
             .appendingPathComponent("aether-bytecache", isDirectory: true)
     }
 
-    /// [MovieClaw P42] 记账多久落一次盘（写入之后）。进程被杀最多丢这么久的记账：只会少认几块，不会多认
-    static let indexFlushDelay: TimeInterval = 3
+    /// [MovieClaw P42] 记账多久落一次盘（写入之后）。进程被杀最多丢这么久的记账：只会少认几块，不会多认。
+    /// 每次落盘前要对数据文件做写屏障同步（见 `flushIndexOnQueue`），所以不必太勤；App 进后台时另有一次立即落盘
+    static let indexFlushDelay: TimeInterval = 5
 
     private struct Block {
         var lo: Int64
@@ -95,6 +97,8 @@ final class SourceByteCache: @unchecked Sendable {
         /// [MovieClaw P42] 记账有没落盘的变化、是否已排了落盘
         var indexDirty = false
         var indexFlushScheduled = false
+        /// [MovieClaw P42] 被淘汰动过几次：落盘分两步（锁外同步数据、锁里写记账），中间被淘汰过就放弃这份快照
+        var evictionGeneration: UInt64 = 0
 
         init(key: String, fd: Int32, path: String, indexPath: String?) {
             self.key = key
@@ -426,16 +430,38 @@ final class SourceByteCache: @unchecked Sendable {
         }
     }
 
-    /// 把还没落盘的记账都写下去（宿主在 App 进后台时调）。在后台队列上排队，排在已交出的写入之后。
-    /// 记账文件一律持锁写：同步写盘模式下淘汰也在锁里写记账、打洞，这样两边不会交错（旧快照晚于打洞落盘）
+    /// 把还没落盘的记账都写下去（宿主在 App 进后台时调）。在后台队列上排队，排在已交出的写入之后
     func flushIndexes() {
         ioQueue.async { [self] in
-            lock.lock(); defer { lock.unlock() }
-            for entry in entries.values where entry.indexDirty {
-                entry.indexDirty = false
-                if let (path, data) = indexSnapshotLocked(entry) { Self.writeIndex(data, to: path) }
-            }
+            lock.lock()
+            let dirty = entries.values.filter { $0.indexDirty }
+            lock.unlock()
+            for entry in dirty { flushIndexOnQueue(entry) }
         }
+    }
+
+    /// 在后台队列上把一份的记账写下去，分两步：先在锁外对数据文件做写屏障同步，再在锁里核对这期间没被淘汰动过、
+    /// 按此刻的账写记账。这样记账落到闪存时，它认的数据一定已经在闪存上——突然断电（或内核崩溃）之后也不会认下
+    /// 还没写到闪存、读出来是全零的块。后台写盘模式下写入与淘汰都在这个队列上，两步之间账不会变；
+    /// 同步写盘模式（调试开关）下别的线程可能在中间淘汰，淘汰时已写过新记账，这份快照放弃
+    private func flushIndexOnQueue(_ entry: Entry) {
+        lock.lock()
+        guard entries[entry.key] === entry, entry.indexDirty, entry.indexPath != nil else {
+            lock.unlock()
+            return
+        }
+        let generation = entry.evictionGeneration
+        entry.indexDirty = false
+        lock.unlock()
+        Self.barrierSync(entry.fd)
+        lock.lock(); defer { lock.unlock() }
+        guard entries[entry.key] === entry, entry.evictionGeneration == generation else { return }
+        if let (path, data) = indexSnapshotLocked(entry) { Self.writeIndex(data, to: path) }
+    }
+
+    /// 数据先于记账落到闪存：APFS 的写屏障同步（比完整刷盘便宜），不支持时退回 fsync
+    private static func barrierSync(_ fd: Int32) {
+        if fcntl(fd, F_BARRIERFSYNC) == -1 { fsync(fd) }
     }
 
     /// 键 → 落盘文件名（不含扩展名）。键里有文件 id，不直接拿来当文件名
@@ -451,12 +477,11 @@ final class SourceByteCache: @unchecked Sendable {
         entry.indexFlushScheduled = true
         ioQueue.asyncAfter(deadline: .now() + Self.indexFlushDelay) { [weak self, weak entry] in
             guard let self, let entry else { return }
-            self.lock.lock(); defer { self.lock.unlock() }
+            self.lock.lock()
             entry.indexFlushScheduled = false
-            // 已经作废（整条删了、换成了新的一份）或已被别处写过：不写。持锁写，理由见 `flushIndexes`
-            guard self.entries[entry.key] === entry, entry.indexDirty else { return }
-            entry.indexDirty = false
-            if let (path, data) = self.indexSnapshotLocked(entry) { Self.writeIndex(data, to: path) }
+            self.lock.unlock()
+            // 已经作废（整条删了、换成了新的一份）或已被别处写过的，`flushIndexOnQueue` 里不写
+            self.flushIndexOnQueue(entry)
         }
     }
 
@@ -604,12 +629,16 @@ final class SourceByteCache: @unchecked Sendable {
     /// 一次淘汰要做的事：打哪些洞；[MovieClaw P42] 以及打洞之前要先写下去的记账（淘汰动过、还留着的那些片源）
     private struct Eviction {
         var holes: [Hole] = []
-        var indexes: [(path: String, data: Data)] = []
+        var indexes: [(entry: Entry, path: String, data: Data)] = []
     }
 
-    /// 执行一次淘汰：先写记账，再打洞。记账落在前面，进程在两步之间被杀也只是少认几块；反过来就会认下全零的洞
+    /// 执行一次淘汰：先同步数据、写记账，再打洞。记账落在前面，进程在两步之间被杀也只是少认几块；
+    /// 反过来就会认下全零的洞。记账认的留存块先写屏障同步到闪存（同 `flushIndexOnQueue`）
     private static func apply(_ eviction: Eviction) {
-        for index in eviction.indexes { writeIndex(index.data, to: index.path) }
+        for index in eviction.indexes {
+            barrierSync(index.entry.fd)
+            writeIndex(index.data, to: index.path)
+        }
         punch(eviction.holes)
     }
 
@@ -639,9 +668,11 @@ final class SourceByteCache: @unchecked Sendable {
             entries.removeValue(forKey: key)
         }
         // [MovieClaw P42] 还留着的片源：记账按淘汰后的样子重写（整条删了的，数据与记账随 Entry 一起删）
-        for entry in touched.values where entries[entry.key] === entry {
+        for entry in touched.values {
+            entry.evictionGeneration &+= 1
+            guard entries[entry.key] === entry else { continue }
             entry.indexDirty = false
-            if let snapshot = indexSnapshotLocked(entry) { eviction.indexes.append((snapshot.0, snapshot.1)) }
+            if let snapshot = indexSnapshotLocked(entry) { eviction.indexes.append((entry, snapshot.0, snapshot.1)) }
         }
         return eviction
     }
