@@ -1,30 +1,123 @@
 import SwiftUI
 import UIKit
 
+extension Notification.Name {
+    /// 长按了底部头像页签（由 AccountGestureHub 发，当前主界面收到后弹切换账号抽屉）
+    static let avatarTabLongPressed = Notification.Name("movieclaw.avatarTabLongPressed")
+    /// 双击了底部头像页签（当前主界面收到后切回上一个账号）
+    static let avatarTabDoubleTapped = Notification.Name("movieclaw.avatarTabDoubleTapped")
+}
+
 /// 头像页签上的账号手势（仿 Instagram，2026-09-29 用户拍板）：**长按**弹出切换账号抽屉，**双击**切回上一个账号。
 /// 家里几个人共用 App、切换账号是高频操作：不用先进「我的」页、不用再点一层，在哪个页签上都能直接切。
 ///
 /// 系统标签栏（iOS 26 液态玻璃的 `UITabBar`）没有给单个页签挂手势的接口，SwiftUI 的 `Tab` 也没有；
-/// 用户定过不自己绘制标签栏。这里从视图所在窗口找到标签栏，在**整条标签栏**上挂长按与双击两个识别器，
-/// 按手指落点在不在头像页签按钮里判断。头像页签按**位置**认：标签栏里并排着和页签数一样多的按钮
-/// （都是公开的 `UIControl`），最右边那个就是头像（头像页签永远在最右）。
-/// **不能按读屏名认**：没开读屏等辅助功能时系统不给页签按钮填读屏名、也不把它们当辅助元素——UI 测试
-/// 运行时辅助功能是开着的，模拟器上全都好使，真机上却一个都认不出（2026-09-29 真机反馈后查实）。
-/// 两个识别器都不吞触摸、与系统手势并存：
-/// - 单击照常切页签，在当前页签上再点照常回到顶层；
-/// - 按住时系统照常把选中光圈移到头像上并放大（按压反馈），0.45 秒后弹抽屉；松手后系统会顺带选中
-///   「我的」页签，落在抽屉后面，不影响；
-/// - 按住再拖是系统的「滑过页签切换」：手指一动（超过 10pt）长按就不成立，两者互不干扰。
+/// 用户定过不自己绘制标签栏。做法：
+/// - **识别器挂在窗口上，全局只挂一套**，每次触摸开始时系统问「这次触摸要不要」（`shouldReceive`），
+///   只要落在**手指下那条标签栏**的头像按钮里的触摸，其余一概不收——不参与、不干扰 App 里别的任何手势，
+///   开销只是每次按下时判断一下落点。
+/// - **不绑定某一条标签栏**：换账号时整个主界面重建，新旧两套界面（各带一条标签栏）会在窗口里同时待
+///   一小会儿，而新界面第一次去挂的时候它自己的标签栏往往还没上屏——按「挂到哪条标签栏」的做法，
+///   换几次账号手势就挂到了被丢掉的旧标签栏上、彻底失效（2026-09-29 真机反馈、模拟器诊断日志查实）。
+///   现在每次按下都现找手指下的那条，天然跟着屏幕上的走。
+/// - **头像按位置认**：标签栏里并排着和页签数一样多的按钮（公开的 `UIControl`），最右边那个就是头像
+///   （头像页签永远在最右）。**不能按读屏名认**：没开读屏等辅助功能时系统不给页签按钮填读屏名——UI 测试
+///   运行时辅助功能是开着的，模拟器上全都好使，真机上一个都认不出（同日真机反馈后查实）。
+/// - 识别到手势发全局通知，当前主界面收到后动作（旧界面此时已拆掉，不会重复响应）。
 ///
-/// 2026-09-29 在 iOS 26.5 模拟器上实测：长按命中头像；约 0.1 秒内点两下触发双击；间隔 1 秒点两下
-/// 不触发（只算两次普通点选）；按住期间系统光圈与抽屉不打架。
-struct TabBarAccountGestures: UIViewRepresentable {
-    let onLongPress: () -> Void
-    let onDoubleTap: () -> Void
-    /// 头像页签按钮在窗口里的位置（首次提示气泡对准它）
-    let onAvatarFrame: (CGRect) -> Void
+/// 与系统手势并存：单击照常切页签、在当前页签上再点照常回到顶层；按住时系统照常把选中光圈移到头像上
+/// （按压反馈），0.45 秒后弹抽屉，松手后系统会顺带选中「我的」页签、落在抽屉后面；按住再拖是系统的
+/// 「滑过页签切换」，手指一动（超过 10pt）长按就不成立。标签栏滑动收起时只剩一个页签按钮，手势不生效。
+@MainActor
+final class AccountGestureHub: NSObject, UIGestureRecognizerDelegate {
+    static let shared = AccountGestureHub()
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    private weak var window: UIWindow?
+    private var recognizers: [UIGestureRecognizer] = []
+
+    /// 挂到窗口上（同一个窗口只挂一次）
+    func install(on window: UIWindow) {
+        guard window !== self.window else { return }
+        recognizers.forEach { $0.view?.removeGestureRecognizer($0) }
+        self.window = window
+        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(longPressed(_:)))
+        longPress.minimumPressDuration = 0.45
+        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(doubleTapped(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        doubleTap.delaysTouchesEnded = false
+        recognizers = [longPress, doubleTap]
+        for recognizer in recognizers {
+            recognizer.cancelsTouchesInView = false
+            recognizer.delegate = self
+            window.addGestureRecognizer(recognizer)
+        }
+    }
+
+    @objc private func longPressed(_ recognizer: UILongPressGestureRecognizer) {
+        guard recognizer.state == .began else { return }
+        NotificationCenter.default.post(name: .avatarTabLongPressed, object: nil)
+    }
+
+    @objc private func doubleTapped(_ recognizer: UITapGestureRecognizer) {
+        guard recognizer.state == .ended else { return }
+        NotificationCenter.default.post(name: .avatarTabDoubleTapped, object: nil)
+    }
+
+    /// 只收落在手指下那条标签栏的头像按钮里的触摸
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        var view = touch.view
+        while let current = view, !(current is UITabBar) { view = current.superview }
+        guard let bar = view as? UITabBar, let avatar = Self.avatarButton(in: bar) else { return false }
+        return avatar.bounds.contains(touch.location(in: avatar))
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        true
+    }
+
+    /// 头像页签按钮：找到并排着和页签数一样多按钮（UIControl）的那一排，取最右边那个。
+    /// 标签栏收起时只剩一个选中页签的按钮，凑不齐一排，返回 nil
+    static func avatarButton(in bar: UITabBar) -> UIView? {
+        let count = bar.items?.count ?? 0
+        guard count > 0 else { return nil }
+        var row: [UIControl]?
+        func find(_ view: UIView) {
+            guard row == nil else { return }
+            let controls = view.subviews.compactMap { $0 as? UIControl }.filter { !$0.isHidden && $0.bounds.width > 0 }
+            if controls.count == count {
+                row = controls
+                return
+            }
+            view.subviews.forEach(find)
+        }
+        find(bar)
+        return row?.max { $0.convert($0.bounds, to: bar).midX < $1.convert($1.bounds, to: bar).midX }
+    }
+
+    /// 窗口里在屏的那条标签栏上头像按钮的位置（首次提示气泡对准它）。新旧界面交替的那一小会儿两条标签栏
+    /// 叠在同一个位置，取哪条都一样
+    static func avatarFrame(in window: UIWindow) -> CGRect? {
+        var queue: [UIView] = [window]
+        var index = 0
+        while index < queue.count {
+            let view = queue[index]
+            index += 1
+            if let bar = view as? UITabBar, bar.window != nil, let button = avatarButton(in: bar) {
+                return button.convert(button.bounds, to: nil)
+            }
+            queue.append(contentsOf: view.subviews)
+        }
+        return nil
+    }
+}
+
+/// 把 AccountGestureHub 挂到主界面所在的窗口上，并报告头像按钮的位置（首次提示用）。
+/// 冷启动时主界面可能比系统标签栏先上屏：找不到头像就隔 0.3 秒再找，最多找 10 次
+struct TabBarAccountGestures: UIViewRepresentable {
+    let onAvatarFrame: (CGRect) -> Void
 
     func makeUIView(context: Context) -> UIView {
         let view = UIView(frame: .zero)
@@ -33,93 +126,19 @@ struct TabBarAccountGestures: UIViewRepresentable {
     }
 
     func updateUIView(_ view: UIView, context: Context) {
-        let coordinator = context.coordinator
-        coordinator.parent = self
-        // 等视图进窗口、标签栏建好之后再挂（首次更新时窗口可能还是 nil）
-        DispatchQueue.main.async { coordinator.attach(from: view) }
+        let report = onAvatarFrame
+        DispatchQueue.main.async { Self.install(from: view, report: report, attempt: 0) }
     }
 
-    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
-        var parent: TabBarAccountGestures?
-        private weak var tabBar: UITabBar?
-
-        /// 冷启动时主界面可能比系统标签栏先上屏：找不到就隔 0.3 秒再找，最多找 10 次
-        func attach(from view: UIView, attempt: Int = 0) {
-            guard let root = view.window?.rootViewController, let bar = Self.findTabBar(from: root) else {
-                if attempt < 10 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self, weak view] in
-                        if let view { self?.attach(from: view, attempt: attempt + 1) }
-                    }
-                }
-                return
+    private static func install(from view: UIView, report: @escaping (CGRect) -> Void, attempt: Int) {
+        guard let window = view.window else { return }
+        AccountGestureHub.shared.install(on: window)
+        if let frame = AccountGestureHub.avatarFrame(in: window) {
+            report(frame)
+        } else if attempt < 10 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak view] in
+                if let view { install(from: view, report: report, attempt: attempt + 1) }
             }
-            if bar !== tabBar {
-                tabBar = bar
-                let longPress = UILongPressGestureRecognizer(target: self, action: #selector(longPressed(_:)))
-                longPress.minimumPressDuration = 0.45
-                longPress.cancelsTouchesInView = false
-                longPress.delegate = self
-                bar.addGestureRecognizer(longPress)
-                let doubleTap = UITapGestureRecognizer(target: self, action: #selector(doubleTapped(_:)))
-                doubleTap.numberOfTapsRequired = 2
-                doubleTap.cancelsTouchesInView = false
-                doubleTap.delaysTouchesEnded = false
-                doubleTap.delegate = self
-                bar.addGestureRecognizer(doubleTap)
-            }
-            if let button = avatarButton(in: bar) {
-                parent?.onAvatarFrame(button.convert(button.bounds, to: nil))
-            }
-        }
-
-        @objc private func longPressed(_ recognizer: UILongPressGestureRecognizer) {
-            guard recognizer.state == .began, hitsAvatar(recognizer) else { return }
-            parent?.onLongPress()
-        }
-
-        @objc private func doubleTapped(_ recognizer: UITapGestureRecognizer) {
-            guard recognizer.state == .ended, hitsAvatar(recognizer) else { return }
-            parent?.onDoubleTap()
-        }
-
-        /// 手指落点在不在头像页签按钮里
-        private func hitsAvatar(_ recognizer: UIGestureRecognizer) -> Bool {
-            guard let bar = tabBar, let avatar = avatarButton(in: bar) else { return false }
-            return avatar.bounds.contains(recognizer.location(in: avatar))
-        }
-
-        /// 头像页签按钮：找到并排着和页签数一样多按钮（UIControl）的那一排，取最右边那个。
-        /// 标签栏收起时只剩一个选中页签的按钮，凑不齐一排，手势就不生效（轻点先把标签栏展开）
-        private func avatarButton(in bar: UITabBar) -> UIView? {
-            let count = bar.items?.count ?? 0
-            guard count > 0 else { return nil }
-            var row: [UIControl]?
-            func find(_ view: UIView) {
-                guard row == nil else { return }
-                let controls = view.subviews.compactMap { $0 as? UIControl }.filter { !$0.isHidden && $0.bounds.width > 0 }
-                if controls.count == count {
-                    row = controls
-                    return
-                }
-                view.subviews.forEach(find)
-            }
-            find(bar)
-            return row?.max { $0.convert($0.bounds, to: bar).midX < $1.convert($1.bounds, to: bar).midX }
-        }
-
-        func gestureRecognizer(
-            _ gestureRecognizer: UIGestureRecognizer,
-            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
-        ) -> Bool {
-            true
-        }
-
-        private static func findTabBar(from controller: UIViewController) -> UITabBar? {
-            if let tabs = controller as? UITabBarController { return tabs.tabBar }
-            for child in controller.children {
-                if let found = findTabBar(from: child) { return found }
-            }
-            return nil
         }
     }
 }

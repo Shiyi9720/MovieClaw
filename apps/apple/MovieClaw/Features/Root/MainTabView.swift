@@ -89,12 +89,12 @@ struct MainTabView: View {
         }
         .tabBarMinimizeBehavior(.onScrollDown)
         .background { PageWarmup(tabs: warmupTabs) }
-        // 头像页签：长按弹切换账号抽屉、双击切回上一个账号（仿 Instagram，见 TabBarAccountGestures）
-        .background(TabBarAccountGestures(
-            onLongPress: openAccountSwitcher,
-            onDoubleTap: { Task { await switchToPreviousAccount() } },
-            onAvatarFrame: { avatarTabFrame = $0 }
-        ))
+        // 头像页签：长按弹切换账号抽屉、双击切回上一个账号（仿 Instagram，见 AccountGestureHub）
+        .background(TabBarAccountGestures(onAvatarFrame: { if avatarTabFrame != $0 { avatarTabFrame = $0 } }))
+        .onReceive(NotificationCenter.default.publisher(for: .avatarTabLongPressed)) { _ in openAccountSwitcher() }
+        .onReceive(NotificationCenter.default.publisher(for: .avatarTabDoubleTapped)) { _ in
+            Task { await switchToPreviousAccount() }
+        }
         .overlay {
             if showAccountTip, avatarTabFrame != .zero {
                 AccountGestureTip(avatarFrame: avatarTabFrame) { withAnimation { showAccountTip = false } }
