@@ -2,13 +2,13 @@ import SwiftUI
 
 /// 「我的」页：标签栏最右的头像页签（Web `/my` 与 components/more-page.tsx）。
 ///
-/// iOS 设置式分组列表：
-/// - 用户头：头像 + 昵称 + `@用户名 · 角色`，整张卡可点进「个人信息」（同 iOS 设置 App 顶部的账户卡），
-///   返回直接回到本页，不再像 Web 那样垫一层设置列表；因此常用组里不再单列「个人信息」行；
-/// - 常用：待处理（管理员且有事项时，30 秒轮询）/ 设置（仅管理员——成员的设置里只有个人信息，
-///   已由头像卡覆盖）/ 应用更新（管理员且有待更新时，文案「新版本 vX」或「新识别模型 X」）；
-/// - 账号：切换账号（可跨服务器，也在那里添加账号）/ 退出登录（同一台服务器上还有账号就自动切过去，
-///   新主界面弹提示说明换成了谁；都退完了回欢迎页）；
+/// iOS 设置式分组列表（2026-09-29 按 iOS 设置 App 的惯例重排：分组不写标题，靠间距区分）：
+/// - 账户组：头像卡（头像 + 昵称 + `@用户名 · 角色`，点进「个人信息」，同 iOS 设置 App 顶部的账户卡；
+///   返回直接回到本页，不垫设置列表）+「切换账号」（可跨服务器，也在那里添加账号）。
+///   「退出登录」不在这里：危险操作按 iOS 惯例放在账户详情页（个人信息）最底部；
+/// - 提醒组（仅管理员、有事才出现，同 iOS 设置 App 账户卡下的「有可用更新」）：待处理（30 秒轮询）/
+///   应用更新（文案「新版本 vX」或「新识别模型 X」）；
+/// - 服务器设置 / 关于 MovieClaw：「关于」按惯例该在最后，但管理员的末尾是按需续取的会话列表，放那里就滑不到了；
 /// - 最近会话（管理员）：首行「新会话」（顶栏的「+」已去掉，这里是发起新会话的入口），下面是 AI 会话，
 ///   每页 20 条、滑到末尾自动加载下一页（用户决定不要「显示全部 / 收起」，与 Web 的差异）；
 ///   操作走 iOS 列表惯例：左滑出续接 / 重命名 / 删除三个图标按钮，长按出完整菜单（与会话页右上角同图标、同顺序）。
@@ -64,65 +64,60 @@ struct MorePage: View {
                     .foregroundStyle(Theme.text)
                     .accessibilityIdentifier("more-profile-card")
                     .accessibilityHint("查看和修改个人信息")
+                    Button {
+                        router.present(.accountSwitcher)
+                    } label: {
+                        Label("切换账号", systemImage: "person.2")
+                    }
                 }
             }
 
-            Section("常用") {
-                if permissions.isAdmin, !notices.isEmpty {
-                    NavigationLink {
-                        NoticeCenterView()
-                    } label: {
-                        Label {
-                            HStack {
-                                Text("待处理").fontWeight(.medium)
-                                Spacer()
-                                Text("\(notices.count)")
-                                    .font(.caption2.weight(.semibold))
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Theme.danger, in: .capsule)
+            if permissions.isAdmin, !notices.isEmpty || badges.updateLabel != nil {
+                Section {
+                    if !notices.isEmpty {
+                        NavigationLink {
+                            NoticeCenterView()
+                        } label: {
+                            Label {
+                                HStack {
+                                    Text("待处理").fontWeight(.medium)
+                                    Spacer()
+                                    Text("\(notices.count)")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Theme.danger, in: .capsule)
+                                }
+                            } icon: {
+                                Image(systemName: "bell")
                             }
-                        } icon: {
-                            Image(systemName: "bell")
+                            .foregroundStyle(Theme.danger)
                         }
-                        .foregroundStyle(Theme.danger)
+                        .accessibilityIdentifier("more-notices")
                     }
-                    .accessibilityIdentifier("more-notices")
+                    if let label = badges.updateLabel {
+                        MoreRouteRow(routes: [.settingsSection(.app)], tint: Theme.info) {
+                            Label(label, systemImage: "arrow.down.app")
+                        }
+                        .accessibilityIdentifier("more-update")
+                    }
                 }
-                // 成员也有设置：个人信息与自己的设备（设置首页按身份过滤分区）
+            }
+
+            Section {
+                // 这里改的都是服务器上的配置，与 App 本机偏好区分开；成员进去只看得到自己的设备
                 MoreRouteRow(routes: [.settings]) {
-                    Label("设置", systemImage: "gearshape")
+                    Label("服务器设置", systemImage: "gearshape")
                 }
                 .accessibilityIdentifier("more-settings")
-                if permissions.isAdmin, let label = badges.updateLabel {
-                    MoreRouteRow(routes: [.settingsSection(.app)], tint: Theme.info) {
-                        Label(label, systemImage: "arrow.down.app")
-                    }
-                    .accessibilityIdentifier("more-update")
-                }
-                // 版本、开源许可与数据来源声明（上架必需，人人可见）。不放在列表末尾：
-                // 管理员的末尾是按需续取的会话列表，放那里就滑不到了
+                // 版本、开源许可与数据来源声明（上架必需，人人可见）
                 NavigationLink {
                     AboutView()
                 } label: {
                     Label("关于 MovieClaw", systemImage: "info.circle")
                 }
                 .accessibilityIdentifier("more-about")
-            }
-
-            Section("账号") {
-                Button {
-                    router.present(.accountSwitcher)
-                } label: {
-                    Label("切换账号", systemImage: "person.2")
-                }
-                Button(role: .destructive) {
-                    Task { await model.logout() }
-                } label: {
-                    Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
-                }
-                .accessibilityIdentifier("logout")
             }
 
             if permissions.isAdmin {
