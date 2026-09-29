@@ -21,6 +21,7 @@
 | `provision.py` | 建站：超管、媒体库、成员角色、精选合集，最后逐个验证账号能登录 |
 | `docker-compose.yml` | 演示站 + Caddy（自动 HTTPS） |
 | `Caddyfile` | HTTPS 反代配置 |
+| `nginx-site.conf.template` | 服务器上已有 nginx 时的站点配置（替代 Caddy，见「服务器上已有 nginx」） |
 | `reset.sh` | 黄金快照（`snapshot`）与每日还原（`restore`），都会以演示模式重启并自检 |
 | `CREDITS.md` | 署名清单（由 `fetch_content.py --credits` 生成） |
 
@@ -175,6 +176,61 @@ cron 按**宿主机的时区**计时，而很多 VPS 默认是 UTC（北京时�
 还原会让当天所有访客的登录失效（设备记录也在快照之外），这是预期行为。
 订阅、播放记录、「正在播放」这些演示数据不在快照里，是每次以演示模式启动时按当天
 生成的（见设计文档 §6），所以快照放多久都不会过期。
+
+## 服务器上已有 nginx（不用 Caddy）
+
+服务器上已经有 nginx 占着 80/443、跑着别的站点时，演示站不起 Caddy，只作为 nginx 的
+一个站点接入（`nginx-site.conf.template`）。以下是与上面步骤的差异，其余照旧。
+
+**`.env` 多三项：**
+
+```bash
+DEMO_PROXY=external        # reset.sh 不启动 Caddy
+DEMO_HTTP_PORT=3100        # 挑一个没被占用的本机端口（ss -ltn 看一眼）
+DEMO_MEM_LIMIT=1536m       # 与其他服务共用机器时调小
+```
+
+**第 4 步建站换一个 nginx 不转发的端口**：nginx 站点一旦配好就一直转发到
+`DEMO_HTTP_PORT`，建站期间的非演示实例不能出现在那个端口上：
+
+```bash
+docker compose down
+MOVIECLAW_DEMO_MODE=false DEMO_HTTP_PORT=3199 docker compose up -d movieclaw
+python3 provision.py --server http://127.0.0.1:3199 --media-root /media
+./reset.sh snapshot        # 以演示模式在 DEMO_HTTP_PORT 上重建容器并自检
+```
+
+**nginx 站点与证书**（acme.sh 走 webroot，与同机其他站点一致；没装过 acme.sh 先
+`curl https://get.acme.sh | sh -s email=你的邮箱`）：
+
+```bash
+source .env
+mkdir -p /var/www/acme /etc/nginx/ssl/$DEMO_DOMAIN
+# 先只放 80 的验证段（443 段要等证书签下来）
+sed -n '/^# 80 只用于/,/^}/p' nginx-site.conf.template | sed "s/__DOMAIN__/$DEMO_DOMAIN/g" \
+    > /etc/nginx/conf.d/movieclaw-demo.conf
+nginx -t && systemctl reload nginx
+~/.acme.sh/acme.sh --issue -d $DEMO_DOMAIN -w /var/www/acme --keylength ec-256 --server letsencrypt
+~/.acme.sh/acme.sh --install-cert -d $DEMO_DOMAIN --ecc \
+    --fullchain-file /etc/nginx/ssl/$DEMO_DOMAIN/fullchain.pem \
+    --key-file /etc/nginx/ssl/$DEMO_DOMAIN/key.pem \
+    --reloadcmd "nginx -t && systemctl reload nginx"
+# 证书到位后换成完整配置
+sed -e "s/__DOMAIN__/$DEMO_DOMAIN/g" -e "s/__PORT__/$DEMO_HTTP_PORT/g" nginx-site.conf.template \
+    > /etc/nginx/conf.d/movieclaw-demo.conf
+nginx -t && systemctl reload nginx
+```
+
+**域名经 Cloudflare 代理时：**
+
+- SSL/TLS 模式用 **Full (strict)**（源站是 Let's Encrypt 的正式证书）；Flexible 会让
+  Cloudflare 用 http 回源，被上面的 80 段跳回 https，死循环；
+- 首次签证书时 Cloudflare 的「Always Use HTTPS」要关着（Let's Encrypt 的 http 验证请求
+  会被它跳到 https，而源站这时还没有证书）；签下来之后可以打开，续期不受影响；
+- 模板只信 Cloudflare 回源网段带来的 `CF-Connecting-IP`，服务端才能按访客真实 IP
+  限频；Cloudflare 增减网段时（https://www.cloudflare.com/ips ）同步更新模板；
+- Cloudflare 免费套餐的条款不允许用它的 CDN 大量分发视频，演示站的播放流量走的正是
+  它。访问量上来之后，考虑把这个域名改成「仅 DNS」（证书照样有效）。
 
 ## 上线后的验收清单
 

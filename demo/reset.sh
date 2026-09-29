@@ -26,11 +26,21 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# 本脚本里所有 docker compose 调用都按演示模式创建容器（优先级高于 .env）
+# 读 .env 里的反代模式与端口（DEMO_PROXY、DEMO_HTTP_PORT），与 compose 用同一份配置
+if [[ -f .env ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+fi
+# 本脚本里所有 docker compose 调用都按演示模式创建容器（放在读 .env 之后，
+# .env 里哪怕写了 MOVIECLAW_DEMO_MODE=false 也会被这里盖掉）
 export MOVIECLAW_DEMO_MODE=true
+# caddy：本目录的 Caddy 负责 HTTPS；external：服务器上已有的 nginx 负责（不启动 Caddy）
+DEMO_PROXY="${DEMO_PROXY:-caddy}"
 
 SNAPSHOT="golden-data.tar.gz"
-BOOTSTRAP_URL="http://127.0.0.1:3000/api/v1/auth/bootstrap"
+BOOTSTRAP_URL="http://127.0.0.1:${DEMO_HTTP_PORT:-3000}/api/v1/auth/bootstrap"
 CHECK_TIMEOUT=180
 stamp() { date '+%F %T'; }
 
@@ -53,12 +63,14 @@ start_demo() {
         # 期望 data 里 initialized 为 true、demo 是对象；demo 为 null 说明没在演示模式
         if grep -Eq '"initialized"[[:space:]]*:[[:space:]]*true' <<<"$body" &&
             grep -Eq '"demo"[[:space:]]*:[[:space:]]*\{' <<<"$body"; then
-            docker compose up -d caddy
+            if [[ "$DEMO_PROXY" == "caddy" ]]; then
+                docker compose up -d caddy
+            fi
             return 0
         fi
         sleep 5
     done
-    docker compose stop movieclaw caddy || true
+    docker compose --profile caddy stop movieclaw caddy || true
     echo "$(stamp) 错误：movieclaw 启动 ${CHECK_TIMEOUT} 秒后仍未确认处于演示模式\
 （要求已完成初始化、且登录页接口带演示账号）。为防止非演示实例暴露在公网，\
 已停掉 movieclaw 与 Caddy。排查：docker compose logs --tail 100 movieclaw；\

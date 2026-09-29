@@ -5,7 +5,10 @@
 #   ./data             运行数据（建站后打成 golden-data.tar.gz，每天还原一次）
 #   ./media            demo/fetch_content.py 整理好的影片与图片（只读挂载）
 #   ./accounts.json    登录页公布的演示账号（与建站脚本用的是同一份）
-#   ./.env             DEMO_DOMAIN=演示站域名，MOVIECLAW_DEMO_IMAGE=镜像名
+#   ./.env             DEMO_DOMAIN=演示站域名，MOVIECLAW_DEMO_IMAGE=镜像名；可选：
+#                      DEMO_PROXY=external（服务器上已有 nginx 占着 80/443，不起 Caddy，
+#                      用 nginx-site.conf.template 反代）、DEMO_HTTP_PORT（本机端口，默认 3000）、
+#                      DEMO_MEM_LIMIT（内存上限，默认 3g）
 #
 # 建站时要临时关掉演示模式（只读守卫会拒绝建库、建成员），并且**必须先停掉 Caddy**：
 # 非演示模式的实例一旦经 Caddy 暴露在公网，任何人都能抢先注册超管。
@@ -24,8 +27,8 @@ services:
     init: true
     restart: unless-stopped
     ports:
-      # 只给本机：公网流量一律经 Caddy（HTTPS），建站脚本经这个口访问
-      - "127.0.0.1:3000:3000"
+      # 只给本机：公网流量一律经 Caddy 或宿主机 nginx（HTTPS），建站脚本经这个口访问
+      - "127.0.0.1:${DEMO_HTTP_PORT:-3000}:3000"
     volumes:
       - ./data:/app/data
       # 只读：即便哪条路漏了，也删不掉、改不了演示内容
@@ -48,8 +51,9 @@ services:
       - FORWARDED_ALLOW_IPS=127.0.0.1,172.31.250.0/24
       # TMDB Key 在构建镜像时已烧入；要换 Key 取消注释：
       # - TMDB_API_KEY=你的 key
-    # 小机器上给 Caddy 与系统留点余量（按 VPS 规格调整；4 GB 内存的机器用 3g）
-    mem_limit: 3g
+    # 小机器上给反代与系统留点余量（按 VPS 规格调整；4 GB 内存的独占机器用 3g，
+    # 与其他服务共用的机器在 .env 里调小）
+    mem_limit: ${DEMO_MEM_LIMIT:-3g}
     # 容器标准输出日志限量轮转：默认的 json-file 不限大小，时间一长能把磁盘写满
     logging:
       driver: json-file
@@ -58,6 +62,9 @@ services:
         max-file: "3"
 
   caddy:
+    # 服务器上已有 nginx 占着 80/443 时不用 Caddy（DEMO_PROXY=external）：
+    # 放进 profile，只有 reset.sh 在 Caddy 模式下才会点名启动它
+    profiles: ["caddy"]
     image: caddy:2
     container_name: movieclaw-demo-caddy
     restart: unless-stopped

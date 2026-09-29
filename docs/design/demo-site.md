@@ -114,6 +114,12 @@
 媒体目录只读挂载进容器，建库时关闭「往媒体目录写海报与 NFO」：守卫之外再加一道，
 即便哪条路漏了也改不了演示内容。
 
+HTTPS 入口两种形态：独占的服务器用本目录的 Caddy（自动申请证书）；已有 nginx 占着
+80/443 的服务器不起 Caddy（`DEMO_PROXY=external`），演示站作为 nginx 的一个站点接入
+（`demo/nginx-site.conf.template`，证书走 acme.sh）。后者建站时换一个 nginx 不转发的
+端口，保证非演示实例任何时候都不经 nginx 暴露；域名经 Cloudflare 代理时只信 Cloudflare
+回源网段带来的 `CF-Connecting-IP`，服务端才拿得到访客真实 IP。
+
 ## 6. 订阅与观看数据
 
 演示站没有真实的家庭在看片、追片，活动页、「我的订阅」「继续观看」「我的收藏」会全是

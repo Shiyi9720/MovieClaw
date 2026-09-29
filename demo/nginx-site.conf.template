@@ -1,0 +1,86 @@
+# =============================================================================
+# 演示站的宿主机 nginx 站点配置（DEMO_PROXY=external 时用，替代 Caddy）
+#
+# 适用：服务器上已有 nginx 占着 80/443、跑着别的站点，演示站只作为其中一个站点接入；
+# 域名经 Cloudflare 代理（SSL/TLS 模式 Full 或 Full (strict)）。
+#
+# 用法（在演示站目录执行，__DOMAIN__ / __PORT__ 换成 .env 里的 DEMO_DOMAIN / DEMO_HTTP_PORT）：
+#   sed -e "s/__DOMAIN__/demo.example.com/g" -e "s/__PORT__/3100/g" \
+#       nginx-site.conf.template > /etc/nginx/conf.d/movieclaw-demo.conf
+# 证书由 acme.sh 走 webroot 签发、自动续期（步骤见 README「已有 nginx 的服务器」）。
+# =============================================================================
+
+# 80 只用于 acme.sh 的 webroot 验证，其余跳转 HTTPS
+server {
+    server_name __DOMAIN__;
+    listen 80;
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme;
+    }
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    server_name __DOMAIN__;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+
+    ssl_certificate     /etc/nginx/ssl/__DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/nginx/ssl/__DOMAIN__/key.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # 访客真实 IP：只信 Cloudflare 回源地址带来的 CF-Connecting-IP（网段来自
+    # https://www.cloudflare.com/ips ，Cloudflare 增减网段时同步更新）。绕过 Cloudflare
+    # 直连源站的请求伪造这个头也没用——来源不在这些网段里，$remote_addr 就是它自己。
+    # 服务端按这个 IP 给登录限频（docs/design/demo-site.md §3）
+    set_real_ip_from 173.245.48.0/20;
+    set_real_ip_from 103.21.244.0/22;
+    set_real_ip_from 103.22.200.0/22;
+    set_real_ip_from 103.31.4.0/22;
+    set_real_ip_from 141.101.64.0/18;
+    set_real_ip_from 108.162.192.0/18;
+    set_real_ip_from 190.93.240.0/20;
+    set_real_ip_from 188.114.96.0/20;
+    set_real_ip_from 197.234.240.0/22;
+    set_real_ip_from 198.41.128.0/17;
+    set_real_ip_from 162.158.0.0/15;
+    set_real_ip_from 104.16.0.0/13;
+    set_real_ip_from 104.24.0.0/14;
+    set_real_ip_from 172.64.0.0/13;
+    set_real_ip_from 131.0.72.0/22;
+    set_real_ip_from 2400:cb00::/32;
+    set_real_ip_from 2606:4700::/32;
+    set_real_ip_from 2803:f800::/32;
+    set_real_ip_from 2405:b500::/32;
+    set_real_ip_from 2405:8100::/32;
+    set_real_ip_from 2a06:98c0::/29;
+    set_real_ip_from 2c0f:f248::/32;
+    real_ip_header CF-Connecting-IP;
+
+    # 请求体上限：演示站的上传都被只读守卫拒绝，剩下的登录、心跳、打点只有几 KB
+    client_max_body_size 2m;
+
+    location / {
+        proxy_pass http://127.0.0.1:__PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        # 覆盖而不是追加：只把上面认出的真实 IP 交给演示站，访客自带的 X-Forwarded-For 丢掉
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $host;
+        # 取流与 SSE 事件流（AI 助手逐字输出、任务进度）边收边转，不缓冲
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # 刻意不开访问日志：访客 IP 能不留就不留
+    access_log off;
+}
