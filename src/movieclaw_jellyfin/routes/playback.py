@@ -284,7 +284,7 @@ async def _load_policy_for(segment_container: str) -> PlaybackPolicy:
     if remote_worker_available("videotoolbox"):
         logger.warning(
             "在线的远程转码 Worker 版本过旧，传不回 Infuse 等播放器要的 TS 分片，本次按无硬件"
-            "处理。请把 Mac 上的 MovieClaw Transcoder 更新到与服务端相同的版本"
+            "处理。请把 Mac 上的 MovieClaw 转码器更新到与服务端相同的版本"
         )
     return replace(policy, hardware_available=False)
 
@@ -346,6 +346,10 @@ def _apply_transcode_negotiation(
       规则（adapt_to_downlink）算出并写进 URL——master 路由只按 URL 起会话。
     """
     if not negotiation.enable_transcoding:
+        return
+    if (f.container or "") == "iso":
+        # 光盘镜像服务端读不了盘内结构、ffmpeg 也打不开，转码无从谈起：只按原字节直连，
+        # 由 Infuse 这类自己认镜像的播放器放（disc-direct-play.md §2.2）
         return
     direct_ok = direct_play_allowed(f.bit_rate, negotiation)
     requested_index = negotiation.audio_stream_index
@@ -581,9 +585,10 @@ async def video_stream(
     media_type = container_mime_type(
         container or request.query_params.get("container") or f.container or path.suffix
     )
-    if f.is_disc():
+    if f.is_disc() and (f.container or "") != "iso":
         # 原盘（disc-playback.md §3.3）：单剪辑主片直接按 m2ts 供流；多剪辑
-        # 没有单文件，客户端应按 PlaybackInfo 给的 TranscodingUrl 走 HLS
+        # 没有单文件，客户端应按 PlaybackInfo 给的 TranscodingUrl 走 HLS。
+        # ISO 不进这个分支：原字节直推，盘内结构由播放器自己读（disc-direct-play.md）
         disc = disc_source_for_file(f)
         clip = disc.single_clip if disc is not None else None
         if clip is None:
@@ -1060,6 +1065,15 @@ async def _capped_transcode_spec(f: LibraryFile, params: TranscodeParams) -> _Se
             if not policy.software_transcode_enabled:
                 logger.warning(
                     "Jellyfin 转码请求被拒绝：硬件加速当前不可用且软件转码未开启：%s", f.file_path
+                )
+                raise not_found()
+            if decision.video.tone_map:
+                # 与网页端同一条底线：HDR 转码要显卡做色调映射，NAS 用 CPU 硬做是幻灯片。
+                # 决策时远程 Worker 算作硬件，执行时它却接不了（刚断开、版本过旧），
+                # 不能悄悄退到软转
+                logger.warning(
+                    "Jellyfin 转码请求被拒绝：这部片是 HDR，硬件转码当前不可执行，不退软件转码：%s",
+                    f.file_path,
                 )
                 raise not_found()
             decision = replace(

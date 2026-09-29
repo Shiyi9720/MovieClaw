@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -76,18 +77,29 @@ class DiscSource:
         """诊断/活动页用的片名：原盘目录名比 ``00001.m2ts`` 更能说明在播什么。"""
         return self.disc_dir.name
 
-    def concat_list(self) -> str:
+    def concat_list(
+        self,
+        *,
+        entry: Callable[[int, DiscClip], str] | None = None,
+        options: Sequence[tuple[str, str]] = (),
+    ) -> str:
         """ffmpeg concat demuxer 的清单文本（``-f concat -safe 0 -i 清单``）。
 
         每段写 ``inpoint``/``outpoint``（剪辑内的绝对 PTS，秒）与 ``duration``：
         concat demuxer 靠 ``duration`` 在不打开后续文件的前提下算出各段在拼接
         时间轴上的起点，``-ss`` 也据此直接定位到对应剪辑。单引号按 concat 的
         规则转义（``'`` → ``'\\''``）。
+
+        ``entry`` 把第 i 段换成别的读取地址（远程 Worker 经 HTTP 读 NAS，见
+        transcode_worker 路由），``options`` 给每段附加 ``option`` 指令（HTTP 断线
+        续读参数）。不传就是 NAS 本机读盘用的绝对路径清单。
         """
         lines = ["ffconcat version 1.0"]
-        for clip in self.clips:
-            escaped = str(clip.path).replace("'", "'\\''")
+        for index, clip in enumerate(self.clips):
+            target = entry(index, clip) if entry is not None else str(clip.path)
+            escaped = target.replace("'", "'\\''")
             lines.append(f"file '{escaped}'")
+            lines.extend(f"option {key} {value}" for key, value in options)
             lines.append(f"inpoint {clip.in_time / MPLS_CLOCK_HZ:.6f}")
             lines.append(f"outpoint {clip.out_time / MPLS_CLOCK_HZ:.6f}")
             lines.append(f"duration {clip.duration_s:.6f}")
@@ -165,10 +177,18 @@ def disc_source_for_file(file: LibraryFile, *, read_disc: bool = True) -> DiscSo
     record = file.disc_playlist
     if not disc_playlist_stale(record):
         assert isinstance(record, dict)
+        stream_dir = disc_dir / "BDMV" / "STREAM"
+        # 浏览场景不碰盘，按惯例的小写扩展名拼；播放场景按实际目录项解析——扩展名是
+        # .M2TS 的盘在区分大小写的 NAS 上按小写拼就是 404（disc-direct-play.md §0）
+        resolve = _stream_resolver(stream_dir) if read_disc else None
         clips = tuple(
             DiscClip(
                 clip_id=str(clip["id"]),
-                path=disc_dir / "BDMV" / "STREAM" / f"{clip['id']}.m2ts",
+                path=(
+                    resolve(str(clip["id"]))
+                    if resolve is not None
+                    else stream_dir / f"{clip['id']}.m2ts"
+                ),
                 in_time=int(clip["in"]),
                 out_time=int(clip["out"]),
             )
@@ -203,6 +223,19 @@ def disc_source_from_playlist(disc_dir: Path, playlist: MplsPlaylist) -> DiscSou
             for item in playlist.items
         ),
     )
+
+
+def _stream_resolver(stream_dir: Path) -> Callable[[str], Path]:
+    """剪辑 id → 实际文件路径的解析器：整个 STREAM 目录只列一次（多剪辑主片动辄几十段）。"""
+    try:
+        actual = {
+            entry.stem: entry
+            for entry in stream_dir.iterdir()
+            if entry.suffix.lower() == ".m2ts"
+        }
+    except OSError:
+        actual = {}
+    return lambda clip_id: actual.get(clip_id) or stream_dir / f"{clip_id}.m2ts"
 
 
 def _existing_stream(stream_dir: Path, clip_id: str) -> Path:

@@ -55,12 +55,15 @@ from movieclaw_api.services.playback.ffmpeg_args import (
     segment_type,
 )
 from movieclaw_api.services.playback.limits import auto_quota_bytes
+from movieclaw_api.services.playback.qoe import note_transcode_session
 from movieclaw_api.services.playback.remote_signing import issue_remote_grant
 from movieclaw_api.services.playback.remote_worker import (
     RemoteWorkerUnavailable,
+    WorkerConnection,
     effective_remote_transcode_config,
     get_remote_worker_registry,
 )
+from movieclaw_db.models.base import utcnow
 from movieclaw_events import new_ulid
 from movieclaw_playback import activity
 from movieclaw_playback.decide import PlaybackPlan, PlaybackTier
@@ -114,6 +117,11 @@ RESUME_FREE_BYTES = 2 * MIN_FREE_BYTES
 #: 客户端开始缺粮之前把料续上。远程 Worker 的恢复要一个 RTT，同样的数够用。
 LEAD_HIGH_S = 120.0
 LEAD_LOW_S = 60.0
+#: 给远程 Worker 推观众播放位置的间隔（只用于它的面板显示）。播放器的进度上报
+#: 本身约 10 秒一次，3 秒推一次、中间按实时外推，面板上的时间就是连续走的。
+PLAYBACK_REPORT_INTERVAL_S = 3.0
+#: 两次进度上报之间最多外推这么久：播放器不再上报（卡住、断网）时别让时间一直往前走。
+PLAYBACK_EXTRAPOLATE_MAX_S = 30.0
 #: 节流巡检间隔。领先量随转码头推进而涨，播放头不动时只有这个循环能发现
 #: 该暂停了；0.5 秒对应最多半秒的超出量，硬件档 10 倍速也就是 5 秒内容。
 THROTTLE_INTERVAL_S = 0.5
@@ -218,6 +226,10 @@ class TranscodeSession:
     #: VOD 模式（§12）：非 None 表示播放列表由服务端按关键帧表预生成，
     #: seek 由分片请求驱动（ensure_segment），ffmpeg 可在会话内多次重启。
     segment_plan: SegmentPlan | None = None
+    #: 开会话时客户端要的起播位置（毫秒，未对齐分片边界）。写进 VOD 列表的
+    #: ``EXT-X-START``，播放器第一个请求就取它所在的分片；``start_ms`` 会随
+    #: seek 重启改成新的边界，这个值开会话后不再变。
+    playlist_start_ms: int = 0
     #: 本轮 ffmpeg 的 -start_number：它正从这个分片号往后转
     head_segment: int = 0
     #: 跨轮次累计的已完成分片号。分片文件在会话目录里从不删除，重启只是换
@@ -247,6 +259,8 @@ class TranscodeSession:
     #: 远程 seek 重启的控制面切换窗口。此时旧 job 已取消、新 Worker 尚未写回，
     #: 分片等待不能把临时的 ``worker_id=None`` 当成 Worker 断线。
     remote_restarting: bool = False
+    #: 上次给 Worker 推播放位置的时间（monotonic），见 PLAYBACK_REPORT_INTERVAL_S
+    remote_playback_reported_at: float = 0.0
     remote_source_url: str = ""
     remote_artifact_base_url: str = ""
     remote_artifact_suffix: str = ""
@@ -313,6 +327,10 @@ class TranscodeSession:
     #: 起会话的浏览器设备标识（web-<成员>-<浏览器>），管理员「结束播放」按它
     #: 找到并停掉这台浏览器的全部会话。
     device_id: str = ""
+    #: App 的播放编号（docs/design/playback-qoe.md §2）：会话结束时把摘要交给这次播放的记录
+    attempt_id: str | None = None
+    #: 首个分片距会话创建的毫秒数（起播最后一公里），交给播放记录用
+    first_segment_ms: int | None = None
     #: 跨会话复用的台账（§B）：非 None 表示目录按指纹命名、结束时不删而是
     #: 落台账供下一次认领；None = 旧行为（目录按会话 id 命名，结束即删）。
     manifest: Manifest | None = None
@@ -621,6 +639,56 @@ class TranscodeSessionManager:
         """对全部会话跑一遍领先量节流。巡检循环与分片请求入口都会调它。"""
         for session in list(self._sessions.values()):
             await self._throttle_session(session)
+            await self._report_remote_playback(session)
+
+    def playback_snapshot(self, session: TranscodeSession) -> dict[str, int | bool]:
+        """观众看到哪儿、转码准备到哪儿、片子多长（毫秒，片内时间）。
+
+        - 观众位置取播放器自己的进度上报（活动页「正在播放」同一份数据），不用
+          「最近请求的分片」——那是播放器的下载位置，会比画面快几十秒；上报间隔
+          约 10 秒，没暂停时按实时外推（最多 PLAYBACK_EXTRAPOLATE_MAX_S）。
+        - 准备到哪儿、总长只有 VOD 会话（有预生成分片计划）才知道。
+        拿不到的字段就不给，Worker 按有什么显示什么。
+        """
+        snapshot: dict[str, int | bool] = {}
+        viewer = activity.current(session.device_id)
+        if viewer is not None and viewer.position_ms is not None:
+            position = viewer.position_ms
+            if not viewer.paused:
+                elapsed = (utcnow() - viewer.last_report_at).total_seconds()
+                position += int(min(max(0.0, elapsed), PLAYBACK_EXTRAPOLATE_MAX_S) * 1000)
+            snapshot["position_ms"] = position
+            snapshot["viewer_paused"] = viewer.paused
+        plan = session.segment_plan
+        if plan is not None:
+            snapshot["duration_ms"] = int(plan.duration_s * 1000)
+            produced = self._highest_produced(session)
+            if produced >= session.head_segment:
+                end = (
+                    plan.boundaries[produced + 1] if produced + 1 < plan.count else plan.duration_s
+                )
+                snapshot["prepared_ms"] = int(end * 1000)
+        if "position_ms" in snapshot and "duration_ms" in snapshot:
+            snapshot["position_ms"] = min(
+                int(snapshot["position_ms"]), int(snapshot["duration_ms"])
+            )
+        return snapshot
+
+    async def _report_remote_playback(self, session: TranscodeSession) -> None:
+        """每 3 秒把 :meth:`playback_snapshot` 推给远程 Worker（它的面板显示真实播放进度）。"""
+        if (
+            not session.remote
+            or not session.remote_job_id
+            or session.state not in ("spawning", "ready")
+        ):
+            return
+        now = time.monotonic()
+        if now - session.remote_playback_reported_at < PLAYBACK_REPORT_INTERVAL_S:
+            return
+        session.remote_playback_reported_at = now
+        snapshot = self.playback_snapshot(session)
+        if snapshot:
+            await get_remote_worker_registry().report_playback(session.remote_job_id, snapshot)
 
     async def _pause(self, session: TranscodeSession, reason: str) -> bool:
         """以某个原因挂起会话。已因别的原因挂起时只记原因，不重复发信号。"""
@@ -704,6 +772,7 @@ class TranscodeSessionManager:
         device_id: str = "",
         cache: bool = True,
         source_concat: str | None = None,
+        attempt_id: str | None = None,
     ) -> TranscodeSession:
         """起一个会话。playlist 出现即返回，不等全部分片转完。
 
@@ -729,7 +798,9 @@ class TranscodeSessionManager:
 
         session_id = new_ulid()
         head_segment = 0
+        playlist_start_ms = 0
         if segment_plan is not None:
+            playlist_start_ms = start_ms
             head_segment = segment_plan.segment_for(start_ms / 1000)
             # 起播点对齐到分片边界：VOD 列表的时间轴是文件绝对时间，客户端
             # 想到哪就 seek 到哪，服务端只按边界供片
@@ -739,6 +810,7 @@ class TranscodeSessionManager:
             file_id=plan.file_id,
             display_name=display_name,
             device_id=device_id,
+            attempt_id=attempt_id,
             member_id=member_id,
             tier=plan.tier,
             # 目录名默认就用会话 id：排查问题时看一眼盘上的目录就知道是哪个
@@ -747,6 +819,7 @@ class TranscodeSessionManager:
             start_ms=start_ms,
             plan=plan,
             segment_plan=segment_plan,
+            playlist_start_ms=playlist_start_ms,
             head_segment=head_segment,
             source_path=source_path,
             hw_backend=hw_backend,
@@ -869,6 +942,63 @@ class TranscodeSessionManager:
         manifest.last_used_at = time.time()
         manifest.save(session.directory)
 
+    async def _remote_command(
+        self,
+        session: TranscodeSession,
+        connection: WorkerConnection,
+        job_id: str,
+        *,
+        base_override: str,
+        start_number: int | None,
+    ) -> tuple[TranscodeCommand, str, str, str, str]:
+        """给接单的这台 Worker 拼一轮任务：源地址、产物回传地址、海报地址与 ffmpeg 命令。
+
+        首次下发与 seek 重启共用。地址都用**这台** Worker 连上来的地址拼（理由见
+        ``_spawn_remote``）。原盘的源是 ffconcat 清单：NAS 把主播放列表的各段剪辑
+        按 HTTP 地址列给它（transcode_worker 路由）；命令按这台 Worker 申报的视频
+        能力装——能硬解哪些编码、有没有 Metal 缩放与色调映射（WorkerVideoCaps）。
+        海报地址只给转码器面板的任务卡片显示用，和源地址同一个令牌：Worker 令牌
+        进不了业务接口，它只拿得到正在转的这一部片的海报。
+        返回（命令, 源地址, 产物根地址, 产物令牌后缀, 海报地址）。
+        """
+        base = (base_override or connection.observed_base_url).rstrip("/")
+        if not base:
+            raise SessionStartError(
+                "无法确定远程转码地址：Worker 连接未携带可用的 Host，"
+                "请在「应用 → 远程转码」填写专用地址"
+            )
+        source_token = await issue_remote_grant(
+            session_id=session.id, file_id=session.file_id, kind="source"
+        )
+        artifact_token = await issue_remote_grant(
+            session_id=session.id,
+            file_id=session.file_id,
+            kind="artifact",
+            attempt_id=job_id,
+        )
+        disc = session.concat_list is not None
+        endpoint = f"{base}/api/v1/transcode-worker/sessions/{session.id}"
+        source_url = (
+            f"{endpoint}/{'source.ffconcat' if disc else 'source'}"
+            f"?token={quote(source_token, safe='')}"
+        )
+        artifact_base = f"{endpoint}/artifacts"
+        token_suffix = f"?token={quote(artifact_token, safe='')}"
+        poster_url = f"{endpoint}/poster?token={quote(source_token, safe='')}"
+        command = build_hls_command(
+            session.plan,
+            source_path=source_url,
+            session_dir=session.directory,
+            start_ms=session.start_ms,
+            hw_backend=session.hw_backend,
+            start_number=start_number,
+            output_base_url=artifact_base,
+            output_url_suffix=token_suffix,
+            input_format="concat" if disc else None,
+            worker_caps=connection.capabilities.video_caps,
+        )
+        return command, source_url, artifact_base, token_suffix, poster_url
+
     async def _spawn_remote(
         self, session: TranscodeSession, base_url_override: str
     ) -> None:
@@ -891,6 +1021,7 @@ class TranscodeSessionManager:
                 backend=session.hw_backend or "videotoolbox",
                 segment_type=segment_type(session.plan),
                 attempt_id=job_id,
+                disc=session.concat_list is not None,
             )
         except RemoteWorkerUnavailable as exc:
             session.error = str(exc)
@@ -898,40 +1029,20 @@ class TranscodeSessionManager:
         # 占位之后到 start_job 之前的任何失败都必须归还槽位，否则这台 Worker
         # 的并发位会被一个从未下发的任务永久占住。
         try:
-            base = (base_url_override or connection.observed_base_url).rstrip("/")
-            if not base:
-                raise SessionStartError(
-                    "无法确定远程转码地址：Worker 连接未携带可用的 Host，"
-                    "请在「应用 → 远程转码」填写专用地址"
-                )
-            source_token = await issue_remote_grant(
-                session_id=session.id, file_id=session.file_id, kind="source"
-            )
-            artifact_token = await issue_remote_grant(
-                session_id=session.id,
-                file_id=session.file_id,
-                kind="artifact",
-                attempt_id=job_id,
-            )
-            token_suffix = f"?token={quote(artifact_token, safe='')}"
-            source_url = (
-                f"{base}/api/v1/transcode-worker/sessions/{session.id}/source"
-                f"?token={quote(source_token, safe='')}"
-            )
-            artifact_base = (
-                f"{base}/api/v1/transcode-worker/sessions/{session.id}/artifacts"
-            )
-            command = build_hls_command(
-                session.plan,
-                source_path=source_url,
-                session_dir=session.directory,
-                start_ms=session.start_ms,
-                hw_backend=session.hw_backend,
+            (
+                command,
+                source_url,
+                artifact_base,
+                token_suffix,
+                poster_url,
+            ) = await self._remote_command(
+                session,
+                connection,
+                job_id,
+                base_override=base_url_override,
                 start_number=(
                     session.head_segment if session.segment_plan is not None else None
                 ),
-                output_base_url=artifact_base,
-                output_url_suffix=token_suffix,
             )
         except BaseException:
             registry.release_job(job_id)
@@ -951,6 +1062,7 @@ class TranscodeSessionManager:
                     "ffmpeg_args": command.argv[1:],
                     # 只为 Worker 菜单栏显示用；旧版 Worker 忽略多余字段
                     "display_name": session.display_name,
+                    "poster_url": poster_url,
                 },
             )
             session.remote_worker_id = worker_id
@@ -1032,9 +1144,14 @@ class TranscodeSessionManager:
                 "转码缓存与数据库同在 data 目录，写满会导致整个应用不可用。"
                 "请清理磁盘后重试。"
             )
-        if quota_bytes is not None and self.usage_bytes() >= quota_bytes:
-            self.evict_cold(quota_bytes=quota_bytes)
-        if quota_bytes is not None and self.usage_bytes() >= quota_bytes:
+        if quota_bytes is None:
+            return
+        # 统计占用要把整个转码缓存 stat 一遍（NAS 上两千多个分片），开会话的必经路上只做一次，
+        # 真淘汰过才重算
+        usage = self.usage_bytes()
+        if usage >= quota_bytes and self.evict_cold(quota_bytes=quota_bytes):
+            usage = self.usage_bytes()
+        if usage >= quota_bytes:
             raise DiskQuotaError(
                 f"转码缓存已达配额上限（{quota_bytes / 1024**3:.1f} GB，"
                 "按磁盘剩余空间自动设定）。请稍候——正在播放的会话结束后会"
@@ -1267,14 +1384,17 @@ class TranscodeSessionManager:
                 session.served_segments += 1
             if result is not None and not session.first_segment_served:
                 session.first_segment_served = True
+                session.first_segment_ms = int((time.monotonic() - session.created_at) * 1000)
                 # 起播链路的最后一公里：「会话就绪」只等到 playlist，画面
                 # 能动还要等首个分片转出来。首帧慢但「会话就绪」各段都快时，
                 # 差值就在这里（ffmpeg 起转到首片落盘 + 客户端发现延迟）
                 logger.info(
-                    "首片供给：session=%s seg=%05d 距会话创建 %.1f 秒（本次请求等待 %d 毫秒）",
+                    "首片供给：session=%s seg=%05d 距会话创建 %.1f 秒"
+                    "（本次请求等待 %d 毫秒 attempt=%s）",
                     session.id, index,
                     time.monotonic() - session.created_at,
                     int((time.monotonic() - waited_from) * 1000),
+                    session.attempt_id or "-",
                 )
             return result
         finally:
@@ -1693,43 +1813,21 @@ class TranscodeSessionManager:
                     backend=session.hw_backend or "videotoolbox",
                     segment_type=segment_type(session.plan),
                     attempt_id=job_id,
+                    disc=session.concat_list is not None,
                 )
                 try:
-                    base = (
-                        effective_remote_transcode_config().base_url
-                        or connection.observed_base_url
-                    ).rstrip("/")
-                    if not base:
-                        raise SessionStartError(
-                            "无法确定远程转码地址：Worker 连接未携带可用的 Host，"
-                            "请在「应用 → 远程转码」填写专用地址"
-                        )
-                    source_token = await issue_remote_grant(
-                        session_id=session.id, file_id=session.file_id, kind="source"
-                    )
-                    artifact_token = await issue_remote_grant(
-                        session_id=session.id,
-                        file_id=session.file_id,
-                        kind="artifact",
-                        attempt_id=job_id,
-                    )
-                    source_url = (
-                        f"{base}/api/v1/transcode-worker/sessions/{session.id}/source"
-                        f"?token={quote(source_token, safe='')}"
-                    )
-                    artifact_base = (
-                        f"{base}/api/v1/transcode-worker/sessions/{session.id}/artifacts"
-                    )
-                    token_suffix = f"?token={quote(artifact_token, safe='')}"
-                    command = build_hls_command(
-                        session.plan,
-                        source_path=source_url,
-                        session_dir=session.directory,
-                        start_ms=session.start_ms,
-                        hw_backend=session.hw_backend,
+                    (
+                        command,
+                        source_url,
+                        artifact_base,
+                        token_suffix,
+                        poster_url,
+                    ) = await self._remote_command(
+                        session,
+                        connection,
+                        job_id,
+                        base_override=effective_remote_transcode_config().base_url,
                         start_number=index,
-                        output_base_url=artifact_base,
-                        output_url_suffix=token_suffix,
                     )
                 except BaseException:
                     # 占位到下发之间的任何失败都要归还槽位，否则这台 Worker 的
@@ -1748,6 +1846,7 @@ class TranscodeSessionManager:
                         "start_ms": session.start_ms,
                         "ffmpeg_args": command.argv[1:],
                         "display_name": session.display_name,
+                        "poster_url": poster_url,
                     },
                 )
                 session.remote_worker_id = worker_id
@@ -1908,7 +2007,7 @@ class TranscodeSessionManager:
         log = logger.warning if (error or session.segment_timeouts) else logger.info
         log(
             "转码会话结束：session=%s（%s）原因=%s · 档 %d %s · 持续 %.1f 分钟 · 供片 %d 段"
-            " · 重启 %d 次 · 等待超时 %d 次 · 最后请求第 %s 段%s",
+            " · 重启 %d 次 · 等待超时 %d 次 · 最后请求第 %s 段%s（attempt=%s）",
             session.id,
             session.display_name or "-",
             reason,
@@ -1920,6 +2019,24 @@ class TranscodeSessionManager:
             session.segment_timeouts,
             "-" if session.last_requested_segment is None else session.last_requested_segment,
             f" · 错误：{error[:500]}" if error else "",
+            session.attempt_id or "-",
+        )
+        # 播放体验打点（playback-qoe.md §5.3）：会话摘要交给这次播放，收尾时写进记录
+        note_transcode_session(
+            session.attempt_id,
+            {
+                "session_id": session.id,
+                "reason": reason,
+                "tier": int(session.tier),
+                "where": where,
+                "duration_s": round(time.monotonic() - session.created_at, 1),
+                "first_segment_ms": session.first_segment_ms,
+                "served_segments": session.served_segments,
+                "restarts": session.restart_generation,
+                "timeouts": session.segment_timeouts,
+                "last_segment_wait_ms": session.last_segment_wait_ms,
+                "error": error[:300] or None,
+            },
         )
 
     def touch_for_device(self, device_id: str) -> int:
@@ -2027,13 +2144,37 @@ class TranscodeSessionManager:
     # -- 观测 -------------------------------------------------------------
 
     def usage_bytes(self) -> int:
-        """当前转码缓存占盘。设置页展示用，也是配额判定的依据。"""
+        """当前转码缓存占盘。设置页展示用，也是配额判定的依据。
+
+        用 scandir 逐层走：目录项自带文件类型，每个文件只 stat 一次（rglob +
+        is_file + stat 要两次）。NAS 上两千多个缓存分片实测 50 毫秒 → 15 毫秒，
+        开会话的必经路上省下来的就是起播时间。
+        """
         if not self._root.exists():
             return 0
-        return sum(f.stat().st_size for f in self._root.rglob("*") if f.is_file())
+        return _tree_bytes(self._root)
 
     def active(self) -> list[TranscodeSession]:
         return list(self._sessions.values())
+
+
+def _tree_bytes(path: Path) -> int:
+    """目录树下所有普通文件的字节数之和（不跟随符号链接；读不到的目录项跳过）。"""
+    total = 0
+    try:
+        entries = os.scandir(path)
+    except OSError:
+        return 0
+    with entries:
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    total += _tree_bytes(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    return total
 
 
 _manager: TranscodeSessionManager | None = None

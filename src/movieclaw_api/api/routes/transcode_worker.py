@@ -11,16 +11,19 @@ import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote
 
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
 from fastapi import Path as PathParam
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect
 
+from movieclaw_api.api.client_address import client_address
 from movieclaw_api.api.deps import require_admin, resolve_worker_principal
+from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import (
     InsufficientStorageException,
     NotFoundException,
@@ -32,7 +35,19 @@ from movieclaw_api.schemas.transcode_worker import (
     RemoteTranscodeConfigPayload,
     RemoteTranscodeConfigView,
 )
+from movieclaw_api.services import login_devices, media_scrape
+from movieclaw_api.services.image_cache import get_image_cache
+from movieclaw_api.services.image_variants import (
+    ImageVariant,
+    get_image_variant_service,
+    source_version_of,
+)
 from movieclaw_api.services.playback import remote_config as remote_transcode_config
+from movieclaw_api.services.playback.disc_source import disc_source_for_file
+from movieclaw_api.services.playback.ffmpeg_args import (
+    REMOTE_IO_TIMEOUT_US,
+    REMOTE_RECONNECT_OPTIONS,
+)
 from movieclaw_api.services.playback.remote_signing import verify_remote_grant
 from movieclaw_api.services.playback.remote_worker import (
     REMOTE_WORKER_PROTOCOL_VERSION,
@@ -42,7 +57,8 @@ from movieclaw_api.services.playback.remote_worker import (
 )
 from movieclaw_api.services.playback.session import get_session_manager
 from movieclaw_db.engine import get_session
-from movieclaw_db.models import LibraryFile
+from movieclaw_db.models import LibraryFile, MediaItem
+from movieclaw_db.repositories.media_repo import MediaItemRepository
 from movieclaw_events import new_ulid
 from movieclaw_playback.streaming import (
     DisconnectAwareFileResponse,
@@ -77,6 +93,19 @@ def _warn_throttled(key: tuple[str, ...], message: str, *args: object) -> None:
 
 def _client_host(websocket: WebSocket) -> str:
     return websocket.client.host if websocket.client else "未知地址"
+
+
+async def _reject_before_hello(websocket: WebSocket, reason: str) -> None:
+    """握手阶段拒绝 Worker：先 accept 再用 1008 关闭，理由才送得到 Worker。
+
+    在 accept 之前 close，uvicorn 按 ASGI 规范只回一个空包体的 HTTP 403，关闭理由
+    整句丢掉——Worker 只能看到「There was a bad response from the server」，凭证
+    失效和开关没开分不出来，下面分开写的两个理由等于白写。Starlette 的 TestClient
+    不模拟这一点（照样抛带理由的 WebSocketDisconnect），测试里看不出差别。
+    先 accept 再关，理由随关闭帧送到 Worker，面板上照原文显示。
+    """
+    await websocket.accept()
+    await websocket.close(code=1008, reason=reason)
 
 
 def _artifact_write_failure(
@@ -224,20 +253,24 @@ async def transcode_worker_websocket(websocket: WebSocket) -> None:
     # 每条拒绝都在 NAS 留一行（同一来源同一原因限频）：拒绝理由只随关闭帧发给
     # Worker，用户说「Worker 连不上」时，NAS 日志此前一个字都没有。
     client = _client_host(websocket)
-    principal = await resolve_worker_principal(websocket.headers.get("authorization"))
+    principal = await resolve_worker_principal(
+        websocket.headers.get("authorization"),
+        ip=client_address(websocket) or None,  # type: ignore[arg-type]
+        user_agent=websocket.headers.get("user-agent"),
+    )
     if principal is None:
         reason = "凭证无效或已被吊销，请在网页「设置 → 设备」重新配对"
         _warn_throttled(
             ("ws-auth", client), "拒绝远程转码 Worker 连接（来自 %s）：%s", client, reason
         )
-        await websocket.close(code=1008, reason=reason)
+        await _reject_before_hello(websocket, reason)
         return
     if not remote_worker_enabled():
         reason = "服务端尚未启用远程转码，请在网页「应用 → 远程转码」打开开关并确认地址"
         _warn_throttled(
             ("ws-disabled", client), "拒绝远程转码 Worker 连接（来自 %s）：%s", client, reason
         )
-        await websocket.close(code=1008, reason=reason)
+        await _reject_before_hello(websocket, reason)
         return
 
     await websocket.accept()
@@ -271,7 +304,11 @@ async def transcode_worker_websocket(websocket: WebSocket) -> None:
             return
         try:
             connection = await registry.register(
-                websocket, hello, observed_base_url=_observed_base_url(websocket)
+                websocket,
+                hello,
+                observed_base_url=_observed_base_url(websocket),
+                # 注销这台转码器时据此当场断开连接（login_devices._after_revoke）
+                login_device_id=principal.device.id if principal.device is not None else None,
             )
         except ValueError as exc:
             _warn_throttled(
@@ -285,8 +322,15 @@ async def transcode_worker_websocket(websocket: WebSocket) -> None:
                 "protocol_version": REMOTE_WORKER_PROTOCOL_VERSION,
             }
         )
+        worker_ip = client_address(websocket) or None  # type: ignore[arg-type]
+        worker_ua = websocket.headers.get("user-agent")
         while True:
             message = await websocket.receive_json()
+            if connection.login_device_id is not None:
+                # 心跳也算活跃：否则「设置 → 设备」里的「最近活跃」停在握手那一刻
+                await login_devices.touch_id(
+                    connection.login_device_id, ip=worker_ip, user_agent=worker_ua
+                )
             if isinstance(message, dict):
                 artifact_failure = await registry.handle_message(connection, message)
                 if artifact_failure is not None:
@@ -331,6 +375,38 @@ async def transcode_worker_status() -> ApiResponse[dict]:
     )
 
 
+async def _remote_source_file(
+    session_id: str, token: str | None, session: AsyncSession
+) -> LibraryFile:
+    """三个取源接口共用的校验：令牌有效、会话是远程会话、令牌签给的就是这个文件。"""
+    grant = await _verify_grant(token, session_id=session_id, kind="source")
+    playback_session = get_session_manager().get(session_id)
+    if (
+        playback_session is None
+        or not playback_session.remote
+        or playback_session.file_id != grant.file_id
+    ):
+        raise NotFoundException("远程转码会话不存在")
+    file = await session.get(LibraryFile, grant.file_id)
+    if file is None or is_strm(file.file_path):
+        raise NotFoundException("远程转码源文件不存在")
+    return file
+
+
+def _missing_source(session_id: str, file: LibraryFile, path: Path) -> NotFoundException:
+    """源不在磁盘上：Worker 那边只会看到 ffmpeg 报 404、任务失败，真正的原因在
+    NAS 这一侧（文件被移走/删除，或媒体目录的挂载静默失效），必须在这里说出来。"""
+    _warn_throttled(
+        ("source-missing", str(file.id)),
+        "远程转码源文件不在磁盘上：session=%s file_id=%s path=%s"
+        "（文件已被移动或删除，或媒体目录挂载失效）",
+        session_id,
+        file.id,
+        path,
+    )
+    return NotFoundException("远程转码源文件已不在磁盘上")
+
+
 @router.get(
     "/sessions/{session_id}/source",
     summary="远程转码源文件",
@@ -343,34 +419,118 @@ async def transcode_source(
     session: AsyncSession = Depends(get_session),
 ):
     """给 Worker 提供支持 Range 的源文件读取；不允许读取 strm 占位文件。"""
-    grant = await _verify_grant(token, session_id=session_id, kind="source")
-    playback_session = get_session_manager().get(session_id)
-    if (
-        playback_session is None
-        or not playback_session.remote
-        or playback_session.file_id != grant.file_id
-    ):
-        raise NotFoundException("远程转码会话不存在")
-    file = await session.get(LibraryFile, grant.file_id)
-    if file is None or is_strm(file.file_path):
-        raise NotFoundException("远程转码源文件不存在")
+    file = await _remote_source_file(session_id, token, session)
+    if file.is_disc():
+        # 原盘是目录，没有单一源文件；新版 Worker 读 source.ffconcat，走不到这里
+        raise NotFoundException("原盘没有单一源文件，请改读 source.ffconcat 清单")
     path = Path(file.file_path)
     if not path.is_file():
-        # Worker 那边只会看到 ffmpeg 报 404、任务失败；真正的原因在 NAS 这一侧
-        # （文件被移走/删除，或媒体目录的挂载静默失效），必须在这里说出来
-        _warn_throttled(
-            ("source-missing", str(file.id)),
-            "远程转码源文件不在磁盘上：session=%s file_id=%s path=%s"
-            "（文件已被移动或删除，或媒体目录挂载失效）",
-            session_id,
-            file.id,
-            file.file_path,
-        )
-        raise NotFoundException("远程转码源文件已不在磁盘上")
+        raise _missing_source(session_id, file, path)
     return DisconnectAwareFileResponse(
         path,
         media_type=container_mime_type(file.container),
         headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/source.ffconcat",
+    summary="远程转码原盘清单",
+    operation_id="transcode.source.ffconcat",
+    openapi_extra={"x-cli-hidden": True},
+)
+async def transcode_disc_source(
+    session_id: Annotated[str, PathParam()],
+    token: Annotated[str | None, Query()] = None,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """原盘的 ffconcat 清单（docs/design/remote-transcode.md §5.2）。
+
+    和 NAS 本机读盘用的是同一份剪辑序列与 IN/OUT（``DiscSource.concat_list``），
+    只是每段换成本接口旁边的 ``clips/{i}`` 相对地址：ffmpeg 按清单自己的地址
+    解析，反向代理挂在子路径下也对得上；令牌沿用这一个（它签的是整个会话的源）。
+    每段逐个带上断线续读参数——命令行上的 ``-reconnect`` 只管清单这一个输入。
+    """
+    file = await _remote_source_file(session_id, token, session)
+    disc = disc_source_for_file(file) if file.is_disc() else None
+    if disc is None:
+        raise NotFoundException("这个远程转码会话的源不是可读的原盘")
+    token_query = quote(token or "", safe="")
+    body = disc.concat_list(
+        entry=lambda index, _clip: f"clips/{index}?token={token_query}",
+        options=(("rw_timeout", str(REMOTE_IO_TIMEOUT_US)), *REMOTE_RECONNECT_OPTIONS),
+    )
+    return Response(
+        content=body,
+        media_type="text/plain; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/clips/{index}",
+    summary="远程转码原盘剪辑",
+    operation_id="transcode.source.clip",
+    openapi_extra={"x-cli-hidden": True},
+)
+async def transcode_disc_clip(
+    session_id: Annotated[str, PathParam()],
+    index: Annotated[int, PathParam(ge=0)],
+    token: Annotated[str | None, Query()] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """原盘清单里第 ``index`` 段剪辑（m2ts）的 Range 读取。"""
+    file = await _remote_source_file(session_id, token, session)
+    disc = disc_source_for_file(file) if file.is_disc() else None
+    if disc is None or index >= len(disc.clips):
+        raise NotFoundException("原盘剪辑不存在")
+    path = disc.clips[index].path
+    if not path.is_file():
+        raise _missing_source(session_id, file, path)
+    return DisconnectAwareFileResponse(
+        path, media_type="video/MP2T", headers={"Cache-Control": "no-store"}
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/poster",
+    response_class=FileResponse,
+    summary="远程转码任务的海报",
+    operation_id="transcode.poster",
+    openapi_extra={"x-cli-hidden": True},
+)
+async def transcode_poster(
+    session_id: Annotated[str, PathParam()],
+    token: Annotated[str | None, Query()] = None,
+    session: AsyncSession = Depends(get_session),
+) -> FileResponse:
+    """转码器面板任务卡片上的海报（``poster-card`` 小尺寸 WebP）。
+
+    Worker 令牌进不了业务接口（图片资产要登录用户身份），这里用这次任务的取源
+    令牌鉴权：转码器只拿得到它正在转的那一部片的海报。取图规则与海报墙、分享页
+    同两层：本地刮削资产优先，没有再回落 TMDB 图床（经图片缓存代理）。剧集取的是
+    整部剧的海报。
+    """
+    file = await _remote_source_file(session_id, token, session)
+    item = await session.get(MediaItem, file.media_item_id) if file.media_item_id else None
+    if item is None or item.id is None:
+        raise NotFoundException("这个转码任务没有对应的条目")
+    meta = await MediaItemRepository(session).get_metadata(item.id)
+    poster_file = meta.poster_file if meta is not None else None
+    target = media_scrape.resolve_asset_path(poster_file) if poster_file else None
+    if target is not None and target.is_file():
+        source, key, version = target, f"asset:{poster_file}", source_version_of(target.stat())
+    elif item.poster_path:
+        url = f"{get_settings().tmdb_image_base_url.rstrip('/')}/w500{item.poster_path}"
+        cached = await get_image_cache().get_or_fetch(url)
+        source, key, version = cached.path, f"remote:{url}", cached.version
+    else:
+        raise NotFoundException("这部片还没有海报")
+    variant = await get_image_variant_service().get_or_create(
+        source, source_key=key, source_version=version, variant=ImageVariant.POSTER_CARD
+    )
+    return FileResponse(
+        variant.path, media_type=variant.content_type, headers={"Cache-Control": "no-store"}
     )
 
 

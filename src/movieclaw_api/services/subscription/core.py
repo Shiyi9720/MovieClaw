@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from statistics import median
 from types import EllipsisType
+from typing import Any
 
 from sqlalchemy import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -165,14 +166,17 @@ def _focus_day_rows(
 
 
 def _median_pipeline_minutes(
-    rows: list[WantedItem],
+    rows: list[Any],
     *,
     start_field: str,
     end_field: str,
     fallback: int,
     maximum: timedelta,
 ) -> int:
-    """从已完成工单取中位耗时；异常长链路不参与首页的日内时间估算。"""
+    """从已完成工单取中位耗时；异常长链路不参与首页的日内时间估算。
+
+    ``rows`` 是工单或只带时间戳列的查询行，按属性名取两端时间。
+    """
     durations: list[float] = []
     for row in rows:
         start = getattr(row, start_field)
@@ -1183,13 +1187,28 @@ class SubscriptionService:
         counts = await self._repo.count_wanted_by_status(
             [s.id for s in subscriptions if s.id is not None]
         )
+        # 条目一次批量取：逐条 session.get 是 N+1，几百部订阅就是几百次往返，
+        # 订阅页、今日入库等几个接口各跑一遍，冷启动并发时互相排队
+        item_ids = {sub.media_item_id for sub in subscriptions}
+        items = {
+            item.id: item
+            for item in (
+                await self._session.execute(
+                    select(MediaItem).where(MediaItem.id.in_(item_ids))  # type: ignore[union-attr]
+                )
+            ).scalars()
+        }
         rows: list[tuple[Subscription, MediaItem, dict[str, int]]] = []
         for sub in subscriptions:
-            item = await self._media_repo_get(sub.media_item_id)
+            item = items.get(sub.media_item_id)
+            if item is None:  # 外键保证下理论不可达，口径同 _media_repo_get
+                raise NotFoundException("订阅关联的媒体条目不存在")
             rows.append((sub, item, counts.get(sub.id or -1, {})))
         return rows
 
-    async def today_arrivals(self, *, member_id: int | None = None) -> list[TodayArrivalCandidate]:
+    async def today_arrivals(
+        self, *, member_id: int | None = None, whole_week: bool = False
+    ) -> list[TodayArrivalCandidate]:
         """聚合最近一次可能入库的可见内容，不查询外部下载器。
 
         资源预测只负责给出“何时可能出种”。首页把本订阅过往的
@@ -1203,6 +1222,11 @@ class SubscriptionService:
         分区切换就是按类型分的：混在一起收敛会让“电影今天在下载”顶掉“剧集三天后
         更新”，切到剧集分区就只剩一句并不成立的“接下来一周没有更新”。
 
+        ``whole_week=True`` 跳过焦点日收敛，整个窗口按日期排好原样返回——给
+        App 订阅首页的「日程」日期条用：那里本来就是一周的日历，用户点哪天看
+        哪天，不存在“流水账”问题。候选口径（哪些工单算、预计日怎么定）两种
+        模式完全一致。
+
         **电影只在管道内纳入**：电影没有播出日，未投递时给不出可信的预告时间，
         常年在找资源的电影会天天占据首页；已投递/已下载的电影则和剧集一样，
         “下载中 / 整理中”对用户完全成立。
@@ -1211,7 +1235,13 @@ class SubscriptionService:
         subscriptions = {
             sub.id: (sub, media) for sub, media, _counts in visible if sub.id is not None
         }
-        wanted_rows = await self._repo.list_wanted_many(list(subscriptions), in_scope_only=True)
+        # 候选只可能来自这三种状态；已入库工单是表里的大头，只为算链路中位耗时
+        # 单独取四列时间戳，不整行建 ORM 对象（整行读是这个接口最重的一步）
+        wanted_rows = await self._repo.list_wanted_many(
+            list(subscriptions),
+            in_scope_only=True,
+            statuses=(WantedStatus.WANTED, WantedStatus.GRABBED, WantedStatus.DOWNLOADED),
+        )
         next_probe_by_wanted = await next_forecast_probe_times_by_wanted(
             self._session,
             wanted_items=[row for row in wanted_rows if row.status == WantedStatus.WANTED],
@@ -1219,21 +1249,27 @@ class SubscriptionService:
         by_subscription: dict[int, list[WantedItem]] = {}
         for wanted in wanted_rows:
             by_subscription.setdefault(wanted.subscription_id, []).append(wanted)
+        timings_by_subscription: dict[int, list[Any]] = {}
+        for timing in await self._repo.imported_timings_many(list(by_subscription)):
+            timings_by_subscription.setdefault(timing.subscription_id, []).append(timing)
 
         today = publish_calendar_date(utcnow())
         horizon = today + timedelta(days=_UPCOMING_WINDOW_DAYS)
         candidates: list[TodayArrivalCandidate] = []
         for subscription_id, (subscription, media) in subscriptions.items():
-            rows = by_subscription.get(subscription_id, [])
+            rows = by_subscription.get(subscription_id)
+            if not rows:
+                continue
+            timings = timings_by_subscription.get(subscription_id, [])
             release_to_import = _median_pipeline_minutes(
-                rows,
+                timings,
                 start_field="grabbed_at",
                 end_field="imported_at",
                 fallback=_DEFAULT_RELEASE_TO_IMPORT_MINUTES,
                 maximum=timedelta(days=7),
             )
             download_to_import = _median_pipeline_minutes(
-                rows,
+                timings,
                 start_field="downloaded_at",
                 end_field="imported_at",
                 fallback=_DEFAULT_DOWNLOAD_TO_IMPORT_MINUTES,
@@ -1286,20 +1322,25 @@ class SubscriptionService:
         # 按媒体类型各算一次——首页的分区切换正是按类型分的，混在一起收敛会让
         # “电影今天在下载”顶掉“剧集三天后更新”，用户切到剧集分区就会看到一句
         # 并不成立的“接下来一周没有更新”。前端过滤完当前分区后再收敛到最近一天。
-        by_kind: dict[str, list[TodayArrivalCandidate]] = {}
-        for row in candidates:
-            by_kind.setdefault(row.media.kind, []).append(row)
-        candidates = [
-            row for rows_of_kind in by_kind.values() for row in _focus_day_rows(rows_of_kind, today)
-        ]
+        if not whole_week:
+            by_kind: dict[str, list[TodayArrivalCandidate]] = {}
+            for row in candidates:
+                by_kind.setdefault(row.media.kind, []).append(row)
+            candidates = [
+                row
+                for rows_of_kind in by_kind.values()
+                for row in _focus_day_rows(rows_of_kind, today)
+            ]
 
         status_order = {
             WantedStatus.DOWNLOADED: 0,
             WantedStatus.GRABBED: 1,
             WantedStatus.WANTED: 2,
         }
+        # 焦点日模式下同一批候选同一天，expected_day 这一键不改变原有顺序
         candidates.sort(
             key=lambda row: (
+                row.expected_day,
                 status_order.get(row.wanted.status, 9),
                 _forecast_predicted_at(row.wanted) or datetime.max,
                 row.media.title,
@@ -1521,7 +1562,7 @@ class SubscriptionService:
         """E 变化后在后台刷新该条目的资源发布时间预测，不挡在请求路径上。
 
         与 ``_kick_search`` 同一收口方式：预测是派生值，晚几秒无害；同步跑则要
-        把近 90 天的种子索引整个读出来解析匹配（见 release_forecast）。延迟导入
+        在请求里读种子索引并逐条细查（见 release_forecast）。延迟导入
         让测试能整体打桩。
         """
         from movieclaw_api.services.subscription.release_forecast import (
