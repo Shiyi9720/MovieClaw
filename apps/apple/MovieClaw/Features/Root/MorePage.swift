@@ -3,14 +3,15 @@ import SwiftUI
 /// 「我的」页：标签栏最右的头像页签（Web `/my` 与 components/more-page.tsx）。
 ///
 /// iOS 设置式分组列表（2026-09-29 按 iOS 设置 App 的惯例重排：分组不写标题，靠间距区分）：
-/// - 账户卡：头像 + 昵称 + 一行小字（和昵称不同时才带 `@用户名`、角色、登录了不止一台服务器时带服务器），
-///   点进「个人信息」，同 iOS 设置 App 顶部的账户卡；返回直接回到本页，不垫设置列表。
+/// - 账户卡：头像 + 昵称 + 身份小字（和昵称不同时才带 `@用户名`、角色）；登录了不止一台服务器时，服务器
+///   再单起一行更淡的小字（和身份挤一行信息太密，用户反馈）。点进「个人信息」，同 iOS 设置 App 顶部的账户卡；
+///   返回直接回到本页，不垫设置列表。
 ///   切换账号是高频操作，走底部头像页签的长按 / 双击（见 TabBarAccountGestures），不在这里占一行；
 ///   能看见的兜底入口「切换账号」与「退出登录」一起放在个人信息页最底部（iOS 账户详情页惯例）；
 /// - 提醒组（仅管理员、有事才出现，同 iOS 设置 App 账户卡下的「有可用更新」）：待处理（30 秒轮询）/
 ///   应用更新（文案「新版本 vX」或「新识别模型 X」）；
-/// - 服务器设置 / 关于 MovieClaw：「关于」按惯例该在最后，但管理员的末尾是按需续取的会话列表，放那里就滑不到了；
-/// - 最近会话（管理员）：首行「新会话」（顶栏的「+」已去掉，这里是发起新会话的入口），下面是 AI 会话，
+/// - 服务器设置。「关于 MovieClaw」不占这里的位置（低频，用户认为太重），放在服务器设置页最底部；
+/// - 最近会话（管理员）：首行「新会话」（加号，顶栏的「+」已去掉，这里是发起新会话的入口），下面是 AI 会话，
 ///   每页 20 条、滑到末尾自动加载下一页（用户决定不要「显示全部 / 收起」，与 Web 的差异）；
 ///   操作走 iOS 列表惯例：左滑出续接 / 重命名 / 删除三个图标按钮，长按出完整菜单（与会话页右上角同图标、同顺序）。
 ///
@@ -50,6 +51,12 @@ struct MorePage: View {
                                     .font(.subheadline)
                                     .foregroundStyle(Theme.textMuted)
                                     .lineLimit(1)
+                                if let host = serverLabel {
+                                    Text(host)
+                                        .font(.caption)
+                                        .foregroundStyle(Theme.textFaint)
+                                        .lineLimit(1)
+                                }
                             }
                             Spacer()
                             Image(systemName: "chevron.right")
@@ -104,20 +111,16 @@ struct MorePage: View {
                     Label("服务器设置", systemImage: "gearshape")
                 }
                 .accessibilityIdentifier("more-settings")
-                // 版本、开源许可与数据来源声明（上架必需，人人可见）
-                NavigationLink {
-                    AboutView()
-                } label: {
-                    Label("关于 MovieClaw", systemImage: "info.circle")
-                }
-                .accessibilityIdentifier("more-about")
             }
 
             if permissions.isAdmin {
                 Section("最近会话") {
                     MoreRouteRow(routes: [.newSession], tint: Theme.accentStrong) {
-                        Label("新会话", systemImage: "square.and.pencil").fontWeight(.medium)
+                        Label("新会话", systemImage: "plus").fontWeight(.medium)
                     }
+                    // 这一组只有首行带图标：分割线默认对齐到图标后的文字，比下面会话行的短一截、像没画全，
+                    // 对齐到行首与下面一致
+                    .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
                     .accessibilityIdentifier("more-new-session")
                     if sessions.isEmpty {
                         Text("还没有会话，点上方的「新会话」开始。")
@@ -147,16 +150,15 @@ struct MorePage: View {
         .agentComposerWarmup()
     }
 
-    /// 账户卡的小字：昵称和用户名不同时带上「@用户名」（相同就不重复）、角色，本机登录了不止一台服务器时
-    /// 再带上当前这台（免得分不清自己在哪台上）
+    /// 账户卡的身份小字：昵称和用户名不同时带上「@用户名」（相同就不重复），再带角色
     private func identityLine(_ session: API.SessionView) -> String {
-        var parts: [String] = []
-        if session.nickname != session.username { parts.append("@\(session.username)") }
-        parts.append(session.roleLabel)
-        if let server = model.server, model.savedServers.filter({ !$0.accounts.isEmpty }).count > 1 {
-            parts.append(server.hostLabel)
-        }
-        return parts.joined(separator: " · ")
+        session.nickname != session.username ? "@\(session.username) · \(session.roleLabel)" : session.roleLabel
+    }
+
+    /// 本机登录了不止一台服务器时标出当前是哪台（免得分不清自己在哪台上）；只有一台时不占地方
+    private var serverLabel: String? {
+        guard let server = model.server, model.savedServers.filter({ !$0.accounts.isEmpty }).count > 1 else { return nil }
+        return server.hostLabel
     }
 
     /// 会话行按 iOS 列表惯例处理操作（同邮件 / 信息）：行上不放「⋯」，左滑出三个纯图标按钮——
