@@ -9,9 +9,10 @@ import SwiftUI
 ///   能看见的兜底入口「切换账号」与「退出登录」一起放在个人信息页最底部（iOS 账户详情页惯例）；
 /// - 提醒组（仅管理员、有事才出现，同 iOS 设置 App 账户卡下的「有可用更新」）：待处理（30 秒轮询）/
 ///   应用更新（文案「新版本 vX」或「新识别模型 X」）；
-/// - 服务器设置，分组下方一行最淡的小字写当前服务器地址：它回答「这些设置改的是哪台」，也让人一眼看到
-///   App 连的是哪个地址（用户的主意）。长按可拷贝。「关于 MovieClaw」不占这里的位置（低频，用户认为太重），
-///   放在服务器设置页最底部；
+/// - 服务器设置：同一行右侧灰字写当前服务器地址（iOS「值样式」行，同设置 App 首页「无线局域网 …… 家里的WiFi」），
+///   回答「这些设置改的是哪台」，也让人一眼看到 App 连的是哪个地址。放在分组下方的说明文字（footer）试过：
+///   那是放解释句子的地方，单独一个地址悬在卡片外面没有一体感（用户反馈）。「关于 MovieClaw」不占这里的位置
+///   （低频，用户认为太重），放在服务器设置页最底部；
 /// - 最近会话（管理员）：首行「新会话」（加号，顶栏的「+」已去掉，这里是发起新会话的入口），下面是 AI 会话，
 ///   每页 20 条、滑到末尾自动加载下一页（用户决定不要「显示全部 / 收起」，与 Web 的差异）；
 ///   操作走 iOS 列表惯例：左滑出续接 / 重命名 / 删除三个图标按钮，长按出完整菜单（与会话页右上角同图标、同顺序）。
@@ -103,17 +104,20 @@ struct MorePage: View {
             Section {
                 // 这里改的都是服务器上的配置，与 App 本机偏好区分开；成员进去只看得到自己的设备
                 MoreRouteRow(routes: [.settings]) {
-                    Label("服务器设置", systemImage: "gearshape")
+                    HStack {
+                        Label("服务器设置", systemImage: "gearshape")
+                        Spacer(minLength: 12)
+                        if let server = model.server {
+                            // 太长时中间省略：开头认得出是哪台，结尾保住端口
+                            Text(server.hostLabel)
+                                .foregroundStyle(Theme.textMuted)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .accessibilityLabel("当前服务器 \(server.hostLabel)")
+                        }
+                    }
                 }
                 .accessibilityIdentifier("more-settings")
-            } footer: {
-                if let server = model.server {
-                    Text(server.hostLabel)
-                        .foregroundStyle(Theme.textFaint)
-                        .textSelection(.enabled)
-                        .accessibilityLabel("当前服务器 \(server.hostLabel)")
-                        .accessibilityIdentifier("more-server-address")
-                }
             }
 
             if permissions.isAdmin {
