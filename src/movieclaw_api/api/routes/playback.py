@@ -583,15 +583,12 @@ async def list_playback_history(
     )
     if demo_service.is_demo_mode():
         # 同活动页：演示站不原样展示访客自报的客户端名 / 设备名（演示数据除外）
-        device_ids = dict(
-            (
-                await session.execute(
-                    select(PlaybackLog.id, PlaybackLog.device_id).where(
-                        PlaybackLog.id.in_([e.id for e in history.entries])
-                    )
-                )
-            ).tuples()
+        rows = await session.execute(
+            select(PlaybackLog.id, PlaybackLog.device_id).where(
+                PlaybackLog.id.in_([e.id for e in history.entries])
+            )
         )
+        device_ids = {row_id: device_id for row_id, device_id in rows.all()}
         for entry in history.entries:
             entry.client, entry.device_name = demo_activity.display_client(
                 device_ids.get(entry.id, ""), entry.client, entry.device_name

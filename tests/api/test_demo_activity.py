@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest_asyncio
 from sqlalchemy import select
@@ -141,3 +141,41 @@ def test_live_sessions_rarely_all_idle(monkeypatch) -> None:
     counts = [len(demo_activity.live_sessions(epoch + minute * 60)) for minute in range(1440)]
     assert counts.count(0) / len(counts) < 0.12
     assert max(counts) >= 3, "路数要有起有落，高峰时能看到好几路"
+
+
+async def test_demo_history_shows_preset_names_and_hides_visitor_text(db, monkeypatch) -> None:
+    """演示模式下的「最近播放」：演示数据显示预设文案；访客的第三方播放器（包括
+    冒用演示设备标识的）自报的文字不原样出现。曾因把查询结果直接交给 dict() 而 500。"""
+    from movieclaw_api.api.routes.playback import list_playback_history
+    from movieclaw_api.services.auth import Principal
+    from movieclaw_api.settings.store import init_setting_store, reset_setting_store
+
+    await demo_activity.seed_demo_data(NOW)
+    async with get_database().session() as session:
+        seeded = (await session.execute(select(PlaybackLog).limit(1))).scalars().one()
+        fields = seeded.model_dump(exclude={"id", "device_id", "client", "device_name"})
+        started = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=5)
+        fields.update(started_at=started, ended_at=started + timedelta(minutes=1))
+        for device_id in ("demo-family-atv", "visitor-1"):
+            bad = {"client": "不当文字", "device_name": "不当文字"}
+            session.add(PlaybackLog(**fields, **bad, device_id=device_id))
+        await session.commit()
+
+    monkeypatch.setenv("MOVIECLAW_DEMO_MODE", "true")
+    get_settings.cache_clear()
+    init_setting_store(database=get_database())
+    async with get_database().session() as session:
+        resp = await list_playback_history(
+            limit=200,
+            before=None,
+            days=None,
+            member_id=None,
+            scope="all",
+            principal=Principal(kind="admin", name="admin"),
+            session=session,
+        )
+    reset_setting_store()
+    entries = resp.data.entries
+    assert entries
+    assert all("不当文字" not in (e.client, e.device_name) for e in entries)
+    assert {"Infuse", "第三方播放器"} <= {e.client for e in entries}
