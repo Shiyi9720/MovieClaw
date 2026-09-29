@@ -6,18 +6,19 @@ import UIKit
 ///
 /// 系统标签栏（iOS 26 液态玻璃的 `UITabBar`）没有给单个页签挂手势的接口，SwiftUI 的 `Tab` 也没有；
 /// 用户定过不自己绘制标签栏。这里从视图所在窗口找到标签栏，在**整条标签栏**上挂长按与双击两个识别器，
-/// 按手指落点命中的页签按钮判断是不是头像页签——页签按钮的读屏名就是 SwiftUI 给它设的
-/// `accessibilityLabel`（「我的」），只用公开属性，不碰私有视图。两个识别器都不吞触摸、与系统手势并存：
+/// 按手指落点在不在头像页签按钮里判断。头像页签按**位置**认：标签栏里并排着和页签数一样多的按钮
+/// （都是公开的 `UIControl`），最右边那个就是头像（头像页签永远在最右）。
+/// **不能按读屏名认**：没开读屏等辅助功能时系统不给页签按钮填读屏名、也不把它们当辅助元素——UI 测试
+/// 运行时辅助功能是开着的，模拟器上全都好使，真机上却一个都认不出（2026-09-29 真机反馈后查实）。
+/// 两个识别器都不吞触摸、与系统手势并存：
 /// - 单击照常切页签，在当前页签上再点照常回到顶层；
 /// - 按住时系统照常把选中光圈移到头像上并放大（按压反馈），0.45 秒后弹抽屉；松手后系统会顺带选中
 ///   「我的」页签，落在抽屉后面，不影响；
 /// - 按住再拖是系统的「滑过页签切换」：手指一动（超过 10pt）长按就不成立，两者互不干扰。
 ///
-/// 2026-09-29 在 iOS 26.5 模拟器上实测：长按命中「我的」；约 0.1 秒内点两下触发双击；间隔 1 秒点两下
+/// 2026-09-29 在 iOS 26.5 模拟器上实测：长按命中头像；约 0.1 秒内点两下触发双击；间隔 1 秒点两下
 /// 不触发（只算两次普通点选）；按住期间系统光圈与抽屉不打架。
 struct TabBarAccountGestures: UIViewRepresentable {
-    /// 头像页签的读屏名（MainTab.more.title）
-    let avatarLabel: String
     let onLongPress: () -> Void
     let onDoubleTap: () -> Void
     /// 头像页签按钮在窗口里的位置（首次提示气泡对准它）
@@ -42,8 +43,16 @@ struct TabBarAccountGestures: UIViewRepresentable {
         var parent: TabBarAccountGestures?
         private weak var tabBar: UITabBar?
 
-        func attach(from view: UIView) {
-            guard let root = view.window?.rootViewController, let bar = Self.findTabBar(from: root) else { return }
+        /// 冷启动时主界面可能比系统标签栏先上屏：找不到就隔 0.3 秒再找，最多找 10 次
+        func attach(from view: UIView, attempt: Int = 0) {
+            guard let root = view.window?.rootViewController, let bar = Self.findTabBar(from: root) else {
+                if attempt < 10 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self, weak view] in
+                        if let view { self?.attach(from: view, attempt: attempt + 1) }
+                    }
+                }
+                return
+            }
             if bar !== tabBar {
                 tabBar = bar
                 let longPress = UILongPressGestureRecognizer(target: self, action: #selector(longPressed(_:)))
@@ -73,28 +82,29 @@ struct TabBarAccountGestures: UIViewRepresentable {
             parent?.onDoubleTap()
         }
 
-        /// 手指落点命中的是不是头像页签：沿命中视图往上找，读屏名对得上即是
+        /// 手指落点在不在头像页签按钮里
         private func hitsAvatar(_ recognizer: UIGestureRecognizer) -> Bool {
-            guard let bar = tabBar, let label = parent?.avatarLabel else { return false }
-            var view = bar.hitTest(recognizer.location(in: bar), with: nil)
-            while let current = view, current !== bar {
-                if current.accessibilityLabel == label { return true }
-                view = current.superview
-            }
-            return false
+            guard let bar = tabBar, let avatar = avatarButton(in: bar) else { return false }
+            return avatar.bounds.contains(recognizer.location(in: avatar))
         }
 
-        /// 头像页签按钮：读屏名对得上的那个；读屏名还没设好时退到最右边的页签按钮（头像页签永远在最右）
+        /// 头像页签按钮：找到并排着和页签数一样多按钮（UIControl）的那一排，取最右边那个。
+        /// 标签栏收起时只剩一个选中页签的按钮，凑不齐一排，手势就不生效（轻点先把标签栏展开）
         private func avatarButton(in bar: UITabBar) -> UIView? {
-            var buttons: [UIView] = []
-            func collect(_ view: UIView) {
-                if view.isAccessibilityElement, !view.isHidden, view.bounds.width > 0 { buttons.append(view) }
-                view.subviews.forEach(collect)
+            let count = bar.items?.count ?? 0
+            guard count > 0 else { return nil }
+            var row: [UIControl]?
+            func find(_ view: UIView) {
+                guard row == nil else { return }
+                let controls = view.subviews.compactMap { $0 as? UIControl }.filter { !$0.isHidden && $0.bounds.width > 0 }
+                if controls.count == count {
+                    row = controls
+                    return
+                }
+                view.subviews.forEach(find)
             }
-            collect(bar)
-            let label = parent?.avatarLabel
-            return buttons.first { $0.accessibilityLabel == label }
-                ?? buttons.max { $0.convert($0.bounds, to: bar).maxX < $1.convert($1.bounds, to: bar).maxX }
+            find(bar)
+            return row?.max { $0.convert($0.bounds, to: bar).midX < $1.convert($1.bounds, to: bar).midX }
         }
 
         func gestureRecognizer(

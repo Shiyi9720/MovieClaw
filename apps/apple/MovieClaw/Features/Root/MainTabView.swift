@@ -90,7 +90,6 @@ struct MainTabView: View {
         .background { PageWarmup(tabs: warmupTabs) }
         // 头像页签：长按弹切换账号抽屉、双击切回上一个账号（仿 Instagram，见 TabBarAccountGestures）
         .background(TabBarAccountGestures(
-            avatarLabel: MainTab.more.title,
             onLongPress: openAccountSwitcher,
             onDoubleTap: { Task { await switchToPreviousAccount() } },
             onAvatarFrame: { avatarTabFrame = $0 }
