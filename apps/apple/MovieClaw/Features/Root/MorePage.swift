@@ -3,9 +3,10 @@ import SwiftUI
 /// 「我的」页：标签栏最右的头像页签（Web `/my` 与 components/more-page.tsx）。
 ///
 /// iOS 设置式分组列表（2026-09-29 按 iOS 设置 App 的惯例重排：分组不写标题，靠间距区分）：
-/// - 账户组：头像卡（头像 + 昵称 + `@用户名 · 角色`，点进「个人信息」，同 iOS 设置 App 顶部的账户卡；
-///   返回直接回到本页，不垫设置列表）+「切换账号」（可跨服务器，也在那里添加账号）。
-///   「退出登录」不在这里：危险操作按 iOS 惯例放在账户详情页（个人信息）最底部；
+/// - 账户卡：头像 + 昵称 + 一行小字（和昵称不同时才带 `@用户名`、角色、登录了不止一台服务器时带服务器），
+///   点进「个人信息」，同 iOS 设置 App 顶部的账户卡；返回直接回到本页，不垫设置列表。
+///   切换账号是高频操作，走底部头像页签的长按 / 双击（见 TabBarAccountGestures），不在这里占一行；
+///   能看见的兜底入口「切换账号」与「退出登录」一起放在个人信息页最底部（iOS 账户详情页惯例）；
 /// - 提醒组（仅管理员、有事才出现，同 iOS 设置 App 账户卡下的「有可用更新」）：待处理（30 秒轮询）/
 ///   应用更新（文案「新版本 vX」或「新识别模型 X」）；
 /// - 服务器设置 / 关于 MovieClaw：「关于」按惯例该在最后，但管理员的末尾是按需续取的会话列表，放那里就滑不到了；
@@ -43,15 +44,12 @@ struct MorePage: View {
                             AvatarBadge(session: session, size: 56)
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(session.nickname).font(.title3.weight(.semibold))
-                                Text("@\(session.username) · \(session.roleLabel)")
+                                // 一行小字，不带图标：列表会把行里的 Label 当成这一行的图标 + 正文来排，
+                                // 图标被撑到行首图标列、分割线也改对齐到它（2026-09-29 真机截图）
+                                Text(identityLine(session))
                                     .font(.subheadline)
                                     .foregroundStyle(Theme.textMuted)
-                                // 本机登录了不止一台服务器时标出当前是哪台，免得分不清自己在哪台上
-                                if let server = model.server, model.savedServers.filter({ !$0.accounts.isEmpty }).count > 1 {
-                                    Label(server.hostLabel, systemImage: "server.rack")
-                                        .font(.caption)
-                                        .foregroundStyle(Theme.textFaint)
-                                }
+                                    .lineLimit(1)
                             }
                             Spacer()
                             Image(systemName: "chevron.right")
@@ -63,12 +61,7 @@ struct MorePage: View {
                     }
                     .foregroundStyle(Theme.text)
                     .accessibilityIdentifier("more-profile-card")
-                    .accessibilityHint("查看和修改个人信息")
-                    Button {
-                        router.present(.accountSwitcher)
-                    } label: {
-                        Label("切换账号", systemImage: "person.2")
-                    }
+                    .accessibilityHint("查看和修改个人信息；长按底部头像可以切换账号")
                 }
             }
 
@@ -152,6 +145,18 @@ struct MorePage: View {
         .polling(every: 30, immediately: true) { await loadNotices() }
         // 最近会话的入口页：空闲时预热一次输入框，点进会话时首屏不再被它拖慢
         .agentComposerWarmup()
+    }
+
+    /// 账户卡的小字：昵称和用户名不同时带上「@用户名」（相同就不重复）、角色，本机登录了不止一台服务器时
+    /// 再带上当前这台（免得分不清自己在哪台上）
+    private func identityLine(_ session: API.SessionView) -> String {
+        var parts: [String] = []
+        if session.nickname != session.username { parts.append("@\(session.username)") }
+        parts.append(session.roleLabel)
+        if let server = model.server, model.savedServers.filter({ !$0.accounts.isEmpty }).count > 1 {
+            parts.append(server.hostLabel)
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// 会话行按 iOS 列表惯例处理操作（同邮件 / 信息）：行上不放「⋯」，左滑出三个纯图标按钮——
