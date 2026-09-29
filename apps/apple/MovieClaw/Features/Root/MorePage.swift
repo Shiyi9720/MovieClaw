@@ -3,14 +3,15 @@ import SwiftUI
 /// 「我的」页：标签栏最右的头像页签（Web `/my` 与 components/more-page.tsx）。
 ///
 /// iOS 设置式分组列表（2026-09-29 按 iOS 设置 App 的惯例重排：分组不写标题，靠间距区分）：
-/// - 账户卡：头像 + 昵称 + 身份小字（和昵称不同时才带 `@用户名`、角色）。不显示服务器：登录了多台服务器时
-///   在哪台只在切换抽屉（按服务器分组）与跨服务器的切换提示里出现（2026-09-29 用户决定）。点进「个人信息」，
-///   同 iOS 设置 App 顶部的账户卡；返回直接回到本页，不垫设置列表。
+/// - 账户卡：头像 + 昵称 + 身份小字（和昵称不同时才带 `@用户名`、角色）。不显示服务器（2026-09-29 用户决定）；
+///   点进「个人信息」，同 iOS 设置 App 顶部的账户卡；返回直接回到本页，不垫设置列表。
 ///   切换账号是高频操作，走底部头像页签的长按 / 双击（见 TabBarAccountGestures），不在这里占一行；
 ///   能看见的兜底入口「切换账号」与「退出登录」一起放在个人信息页最底部（iOS 账户详情页惯例）；
 /// - 提醒组（仅管理员、有事才出现，同 iOS 设置 App 账户卡下的「有可用更新」）：待处理（30 秒轮询）/
 ///   应用更新（文案「新版本 vX」或「新识别模型 X」）；
-/// - 服务器设置。「关于 MovieClaw」不占这里的位置（低频，用户认为太重），放在服务器设置页最底部；
+/// - 服务器设置，分组下方一行最淡的小字写当前服务器地址：它回答「这些设置改的是哪台」，也让人一眼看到
+///   App 连的是哪个地址（用户的主意）。长按可拷贝。「关于 MovieClaw」不占这里的位置（低频，用户认为太重），
+///   放在服务器设置页最底部；
 /// - 最近会话（管理员）：首行「新会话」（加号，顶栏的「+」已去掉，这里是发起新会话的入口），下面是 AI 会话，
 ///   每页 20 条、滑到末尾自动加载下一页（用户决定不要「显示全部 / 收起」，与 Web 的差异）；
 ///   操作走 iOS 列表惯例：左滑出续接 / 重命名 / 删除三个图标按钮，长按出完整菜单（与会话页右上角同图标、同顺序）。
@@ -105,6 +106,14 @@ struct MorePage: View {
                     Label("服务器设置", systemImage: "gearshape")
                 }
                 .accessibilityIdentifier("more-settings")
+            } footer: {
+                if let server = model.server {
+                    Text(server.hostLabel)
+                        .foregroundStyle(Theme.textFaint)
+                        .textSelection(.enabled)
+                        .accessibilityLabel("当前服务器 \(server.hostLabel)")
+                        .accessibilityIdentifier("more-server-address")
+                }
             }
 
             if permissions.isAdmin {
