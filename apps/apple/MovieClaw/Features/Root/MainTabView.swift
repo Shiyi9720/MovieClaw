@@ -170,6 +170,13 @@ struct MainTabView: View {
             }
             MainThreadProbe.run()  // -mcMainProbe YES：打开播放器后 3 秒内主线程的忙碌段
             router.open(webPath: path)
+            // -mcRouteThen <站内路径> -mcRouteThenDelay <秒>：先开 -mcRoute（比如首页），到点再开这个（比如播放页）——
+            // 量「在页面上停一会儿再点播放」这种真实动线（页面出现时的预连、空闲后的冷连接都在里面）
+            if let then = UserDefaults.standard.string(forKey: "mcRouteThen") {
+                try? await Task.sleep(for: .seconds(max(0.5, UserDefaults.standard.double(forKey: "mcRouteThenDelay"))))
+                MainThreadProbe.run()  // 同上，从打开播放页起量
+                router.open(webPath: then)
+            }
             // -mcRouteReopenAfter <秒>：到点关掉播放器、2 秒后原样再打开（验证退出再进同一部片的起播与流量）
             let reopenAfter = UserDefaults.standard.double(forKey: "mcRouteReopenAfter")
             if reopenAfter > 0 {

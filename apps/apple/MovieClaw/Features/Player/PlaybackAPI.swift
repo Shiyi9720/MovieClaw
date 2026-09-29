@@ -286,6 +286,10 @@ enum PlaybackPreconnect {
     private static var lastAt: ContinuousClock.Instant?
 
     static func warm(api: APIClient) {
+        #if DEBUG
+        // -mcNoPagePreconnect YES：页面出现时不预连（真机新旧对照用）
+        if UserDefaults.standard.bool(forKey: "mcNoPagePreconnect") { return }
+        #endif
         if let lastAt, ContinuousClock.now - lastAt < .seconds(20) { return }
         guard let health = api.server.resolve("/api/v1/health") else { return }
         lastAt = .now
