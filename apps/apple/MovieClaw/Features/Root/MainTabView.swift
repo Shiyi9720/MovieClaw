@@ -28,6 +28,8 @@ struct MainTabView: View {
     @State private var avatarIcon: UIImage?
     /// 正在背后预热的页签（见 PageWarmup）
     @State private var warmupTabs: [MainTab] = []
+    /// 播放器界面正在背后预热（见 PlayerWarmup）
+    @State private var warmupPlayer = false
     /// 主界面出现之后是否已经在前台过：冷启动用快照直接进主界面时，主界面比场景「变成前台」还早，
     /// 那一次激活不是「回到前台」，不补做身份校验与更新检查（冷启动那份由 AppModel.revalidate、角标轮询首轮做）
     @State private var wasActive = false
@@ -89,6 +91,7 @@ struct MainTabView: View {
         }
         .tabBarMinimizeBehavior(.onScrollDown)
         .background { PageWarmup(tabs: warmupTabs) }
+        .background { if warmupPlayer { PlayerWarmup() } }
         // 头像页签：长按弹切换账号抽屉、双击切回上一个账号（仿 Instagram，见 AccountGestureHub）
         .background(TabBarAccountGestures(onAvatarFrame: { if avatarTabFrame != $0 { avatarTabFrame = $0 } }))
         .onReceive(NotificationCenter.default.publisher(for: .avatarTabLongPressed)) { _ in openAccountSwitcher() }
@@ -152,6 +155,8 @@ struct MainTabView: View {
             }
         }
         .onChange(of: router.player?.id) { _, presented in
+            // 真的要弹播放器了：背后的预热马上拆掉，不和真正的播放器抢主线程
+            if warmupPlayer { warmupPlayer = false }
             // 提前起播了、播放器却没弹出来就被撤掉（视图从没出现过，不会走它的收尾）：这里关掉，免得会话与引擎空跑
             if let early = router.activePlayback, !early.viewAttached, early.request.id != presented {
                 early.close()
@@ -265,6 +270,19 @@ struct MainTabView: View {
                 try? await Task.sleep(for: .milliseconds(250))
                 warmupTabs = []
                 try? await Task.sleep(for: .milliseconds(400))
+            }
+            // 4. 播放器界面也在背后画一遍（见 PlayerWarmup）：第一次点播放时，这笔一次性的主线程开销不再挡在装载引擎前面
+            #if DEBUG
+            let skipPlayerWarmup = UserDefaults.standard.bool(forKey: "mcNoPlayerWarmup")  // 真机新旧对照用
+            #else
+            let skipPlayerWarmup = false
+            #endif
+            if !skipPlayerWarmup, !Task.isCancelled, router.player == nil {
+                PerfTrace.record("warmup.begin", ["page": "player"])
+                warmupPlayer = true
+                PerfTrace.afterCommit("warmup.rendered", ["page": "player"])
+                try? await Task.sleep(for: .milliseconds(250))
+                warmupPlayer = false
             }
             guard !Task.isCancelled else { return }
 
