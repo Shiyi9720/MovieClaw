@@ -2885,14 +2885,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                   offset < fileSize - Int64(Self.tailPrefetchBytes),
                   fileSize - offset <= Self.cuesPrefetchMaxBytes else { return nil }
             return (offset ..< fileSize, "Matroska 索引在 \(offset)（距文件尾 \(fileSize - offset) 字节，尾部预读够不着）")
-        case .secondarySeekHead(let offset):
-            // 开头的目录只指向文件尾附近的完整目录：Cues 在哪要读了那个目录才知道，多等一个来回不划算。
-            // 完整目录就在文件尾 1 MB 以内时，Cues、Tags 多半也在（语料里 Cues 离文件尾最远 93 万字节），直接先取
-            // 文件最后 1 MB（这段是盲取，比确知位置时取得少，慢速网络上少白下；取不全的照旧按需读）
+        case .secondarySeekHead:
+            // 开头的目录只指向文件尾附近的完整目录：Cues 在哪要读了那个目录才知道。试过盲取文件最后 1 MB，真机上这 1 MB
+            // 要 90～180 毫秒，索引预热反而等得更久（按需读只要约 37 毫秒），所以不取，照旧由解复用器按需读
             cuesLocateDone = true
-            let start = max(Int64(Self.headSpanMaxBytes), fileSize - Self.cuesPrefetchMaxBytes / 2)
-            guard offset >= start, offset < fileSize, start < fileSize - Int64(Self.tailPrefetchBytes) else { return nil }
-            return (start ..< fileSize, "Matroska 完整目录在文件尾附近（距文件尾 \(fileSize - offset) 字节），先取文件最后 \(fileSize - start) 字节")
+            return nil
         }
     }
 

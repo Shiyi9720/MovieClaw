@@ -20,7 +20,8 @@ enum MatroskaCuesLocator {
         /// Cues 元素在文件里的绝对偏移
         case found(Int64)
         /// 开头的 SeekHead 没登记 Cues，只指向另一个 SeekHead（在这个绝对偏移）：mkvmerge 预留的位置放不下完整目录时
-        /// 就这样写，完整目录连同 Cues、Tags 都在文件尾附近（语料《鹿鼎记2》：次级目录在文件最后 85 字节、Cues 离文件尾 17 万字节）
+        /// 就这样写，完整目录连同 Cues、Tags 都在文件尾附近（语料《鹿鼎记2》：次级目录在文件最后 85 字节、Cues 离文件尾 17 万字节）。
+        /// 读取器目前对这种布局不提前取（盲取文件尾 1 MB 实测得不偿失），留着结果供以后两步取（先读次级目录再取 Cues）
         case secondarySeekHead(Int64)
         /// 不是 Matroska，或 SeekHead 没登记 Cues、结构不认识：不用再找
         case absent
