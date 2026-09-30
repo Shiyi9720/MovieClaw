@@ -90,6 +90,24 @@ final class NativeEngine: NSObject, PlayerEngine {
 
     init(playsOriginalFile: Bool) throws {
         self.playsOriginalFile = playsOriginalFile
+        Self.prepareEngineEnvironment()
+        core = try AetherPlayback()
+        super.init()
+        Self.sweepStaleCachesOnce()
+        core.onPhase = { [weak self] phase in self?.handle(phase) }
+        core.onFailure = { [weak self] failure in self?.handle(failure) }
+        core.onTracksChanged = { [weak self] in self?.tracksChanged() }
+        core.onFirstFrame = { [weak self] in self?.firstFrameReady() }
+        core.onStartupStage = { [weak self] stage in self?.onEvent?(.startupStage(stage)) }
+        core.onSeekOutcome = { [weak self] outcome in self?.seekOutcome(outcome) }
+        core.onSoftwareFrameGeneration = { [weak self] in self?.softwareFrameGeneration() }
+    }
+
+    var view: UIView { core.view }
+
+    /// 建自研引擎前的全局准备：接管引擎日志、读开发期开关。刷片页（Features/Reels）自己管引擎实例，
+    /// 建之前也调它，与播放器页同一口径
+    static func prepareEngineEnvironment() {
         // 引擎日志一律进环形缓冲，播放失败时随播放记录上报（docs/design/playback-qoe.md §3.5）；
         // 开发期 -mcAetherLog YES 同时打到控制台（模拟器排查用）
         #if DEBUG
@@ -138,26 +156,14 @@ final class NativeEngine: NSObject, PlayerEngine {
         if UserDefaults.standard.bool(forKey: "mcEngineAudioSession") { hostManagesAudio = false }
         #endif
         AetherPlayback.hostManagesAudioSessionCategory = hostManagesAudio
-        core = try AetherPlayback()
-        super.init()
-        Self.sweepStaleCachesOnce()
-        core.onPhase = { [weak self] phase in self?.handle(phase) }
-        core.onFailure = { [weak self] failure in self?.handle(failure) }
-        core.onTracksChanged = { [weak self] in self?.tracksChanged() }
-        core.onFirstFrame = { [weak self] in self?.firstFrameReady() }
-        core.onStartupStage = { [weak self] stage in self?.onEvent?(.startupStage(stage)) }
-        core.onSeekOutcome = { [weak self] outcome in self?.seekOutcome(outcome) }
-        core.onSoftwareFrameGeneration = { [weak self] in self?.softwareFrameGeneration() }
     }
-
-    var view: UIView { core.view }
 
     /// 本次启动第一次建自研引擎时清一遍死会话的缓存（被杀掉的播放会话会在临时目录留下 GB 级分片，
     /// 真机一夜的测试攒到 15 GB、把手机写满）
     private static var sweptStaleCaches = false
     /// App 进后台时让片源字节缓存的记账立刻落盘（引擎补丁 P42）：下次启动续播认得这一场最后几秒下过的字节
     private static var backgroundObserver: NSObjectProtocol?
-    private static func sweepStaleCachesOnce() {
+    static func sweepStaleCachesOnce() {
         guard !sweptStaleCaches else { return }
         sweptStaleCaches = true
         DispatchQueue.global(qos: .utility).async { AetherPlayback.sweepStaleCaches() }
