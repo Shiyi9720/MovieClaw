@@ -1814,6 +1814,13 @@ final class HLSLocalServer: @unchecked Sendable {
         } else {
             // EXT-X-PLAYLIST-TYPE:VOD lets AVPlayer prune fetched segments past the buffer-behind window; without it RSS grows linearly with segment count for the whole playback.
             lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+            // [MovieClaw P59] 媒体播放列表里也声明「每段独立」。只写在主播放列表里时 AVPlayer 不认：跳转后它先要目标前 5 段
+            // 自己找关键帧（模拟器实测：目标在第 58 段，先来要第 53 段），生产者只好从那里重启，把目标前 15～23 秒的内容整段
+            // 下完才到落点，慢线路上这就是几十秒。点播分片都在关键帧处切（`vodCutter` 只在关键帧开新段，#92），声明属实，
+            // 与主播放列表那一行是同一个事实
+            if AetherEngine.declaresIndependentMediaSegments {
+                lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
+            }
         }
         // Absolute custom-scheme URIs route sub-resources through AVAssetResourceLoader; relative URIs go through CFNetwork (aetherctl workflow).
         let initURI: (Int) -> String

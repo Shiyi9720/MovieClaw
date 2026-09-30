@@ -1032,6 +1032,8 @@ extension AetherEngine {
     /// [MovieClaw P57] 边产出边送时分片内片段的长度（秒）。Mac 实测 6 Mbit/s 下 4K 长 GOP 片：1 秒时从头播 3.1 秒开播，
     /// 0.5 秒时 1.8 秒；每个片段多一个几百字节的 moof 头，可以忽略
     nonisolated(unsafe) public static var progressiveFragmentSeconds: Double = 0.5
+    /// [MovieClaw P59] 点播媒体播放列表也声明 EXT-X-INDEPENDENT-SEGMENTS（默认开；关掉即只有主播放列表声明，对照用）
+    nonisolated(unsafe) public static var declaresIndependentMediaSegments = true
 }
 
 /// 取到的分片：要么已经写完（完整字节），要么正在写（边写边读）
