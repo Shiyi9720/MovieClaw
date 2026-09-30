@@ -54,6 +54,8 @@ final class ReelsStore {
     @ObservationIgnored private var nextOffset = 0
     @ObservationIgnored private var prefetchTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var standbyTask: Task<Void, Never>?
+    /// 从全屏观看回来时，这一条从哪里接着放（条目 id、秒）；下一次为它现建引擎时用掉
+    @ObservationIgnored private var resumeAt: (itemID: String, seconds: Double)?
     @ObservationIgnored private var pendingEvents: [API.ReelEventIn] = []
     @ObservationIgnored private var shownAt: ContinuousClock.Instant?
     /// 当前这条已经「接着看 / 看正片」转去播放器页了
@@ -137,7 +139,9 @@ final class ReelsStore {
             do {
                 let player = try ReelPlayer(item: item)
                 adopt(player, item: item, index: index)
-                player.start(server: api.server)
+                let from = resumeAt?.itemID == id ? resumeAt?.seconds : nil
+                resumeAt = nil
+                player.start(server: api.server, from: from)
             } catch {
                 playerState = .failed("播放器创建失败")
                 record(item, kind: "fail", detail: ["reason": .string("engine_init")])
@@ -188,6 +192,21 @@ final class ReelsStore {
                            fileId: item.segment.fileId)
     }
 
+    /// 「全屏观看」：这一段交给播放器页的片段模式放（`PlaybackClip`：手势、控制、换音轨字幕与正片一致，
+    /// 时间轴只算这一段、放到终点停下、不写观看记录），从当前位置接着放
+    func fullscreenRequest() -> PlayRequest? {
+        guard let player else { return nil }
+        let item = player.item
+        let position = player.position
+        record(item, kind: "fullscreen", positionMs: Int(position * 1000), watchedMs: watchedMs(player))
+        // 不是滑走：挂起时不记「离开」
+        handedOff = true
+        return PlayRequest(mediaItemId: item.title.mediaItemId, season: item.title.episode?.season,
+                           episode: item.title.episode?.episode, startSeconds: position,
+                           fileId: item.segment.fileId,
+                           clip: PlaybackClip(startMs: item.segment.startMs, endMs: item.segment.endMs))
+    }
+
     /// 「看正片」：按正常播放的规则起播（续播点或片头、默认版本）
     func openRequest(for item: API.ReelItemView) -> PlayRequest {
         record(item, kind: "open", watchedMs: player.map { watchedMs($0) })
@@ -205,9 +224,15 @@ final class ReelsStore {
         Task { await flush() }
     }
 
-    /// 回到页面：当前这条从片段起点重新起播
-    func resume() {
+    /// 回到页面：当前这条重新起播。从全屏观看回来（`returning` 是片段播放器关掉时停的位置）且还在这一段里，
+    /// 就从那里接着放；否则从片段起点放
+    func resume(returning: ClipReturn? = nil) {
         guard player == nil else { return }
+        if let returning, let id = currentID, let item = items.first(where: { $0.id == id }),
+           item.segment.fileId == returning.fileId,
+           returning.positionMs >= item.segment.startMs, returning.positionMs < item.segment.endMs - 1000 {
+            resumeAt = (id, Double(returning.positionMs) / 1000)
+        }
         settle()
     }
 

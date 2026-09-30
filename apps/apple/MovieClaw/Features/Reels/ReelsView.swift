@@ -8,16 +8,17 @@ import SwiftUI
 ///   再点一次「媒体库」页签回到媒体库首页；左上是标题「片段」，右上一个玻璃胶囊「全部 ⌄」，
 ///   点开选「全部」或某个类型；这一页锁竖屏，转手机不会把信息流转横；
 /// - 纯黑底，影片居中成一条 16:9 的横带；没出第一帧前先显示封面（服务端抓的就是起点那一帧）；
-///   横带下方一个描边小胶囊「全屏观看」（TikTok 横屏视频的做法），点了横过来全屏看这一段，
-///   用的是同一个播放器，不打断、不重新加载，退出回到竖屏接着刷（ReelFullscreenView）；
+///   点页面任意空白处暂停 / 继续（同抖音），暂停时横带正中出播放标记，放到片段终点停下、再点重播；
+/// - 横带下方一个描边小胶囊「全屏观看」（TikTok 横屏视频的做法）：这一段交给正片播放器的片段模式
+///   横屏放（`PlaybackClip`）——手势、控制条、换音轨字幕与正片完全一样，时间轴只算这一段；
+///   退出全屏回到这里，从刚才看到的地方接着放；
 /// - 右下角一列**无底色**的白色图标按钮（不用毛玻璃，和画面融在一起，带投影保证亮画面上也看得清）：
 ///   收藏、播放、已看、分享；
 /// - 左下角四行，层级从强到弱：导演（剧集是主创，对应 TikTok / Instagram 的作者行，点了进人物页）、
 ///   片名（剧集后面跟季集）、年份 · 评分 · 类型、一行简介（剧集前面是集名，放不下就「展开」）；
-/// - 最底下一条细进度线（这一段的进度），右边是「在整部片里放到哪 / 整部片多长」。
+/// - 最底下一条细进度线，右边是「这一段放到哪 / 这一段多长」——与全屏一致，都按片段算，不按整部片。
 ///
-/// 播放按钮：点一下从当前位置转到播放器页（同一个文件，刷片下过的字节直接复用），长按可选「从头看」。
-/// 点画面暂停 / 继续，放到片段终点停下、再点重播。
+/// 播放按钮：点一下从当前位置转到播放器页正常放整部（同一个文件，刷片下过的字节直接复用），长按可选「从头看」。
 struct ReelsView: View {
     @Environment(\.api) private var api
     @Environment(\.permissions) private var permissions
@@ -26,11 +27,9 @@ struct ReelsView: View {
     @State private var store: ReelsStore?
     @State private var visible = false
     @State private var sharing: API.ReelItemView?
-    /// 全屏（横屏）观看当前这一条
-    @State private var fullscreen = false
-    /// 最近一次竖屏时的整页尺寸。全屏看、横着进播放器页时整页会转横，翻页区要是跟着按横屏重排，
+    /// 最近一次竖屏时的整页尺寸。进播放器页（全屏观看、播放）时整页会跟着转横，翻页区要是按横屏重排，
     /// 转回竖屏后滚动位置对不上原来那一条（模拟器实测从第二条跳到了第三条）。所以每页始终按竖屏尺寸排：
-    /// 横屏期间翻页区被全屏层或播放器页整个盖住，看不出差别
+    /// 横屏期间翻页区被播放器页整个盖住，看不出差别
     @State private var portraitPage: PageGeometry?
 
     var body: some View {
@@ -53,26 +52,6 @@ struct ReelsView: View {
             }
         }
         .background(Color.black.ignoresSafeArea())
-        .overlay {
-            if fullscreen, let store {
-                ZStack {
-                    // 点「看全片」时刷片的引擎先收掉、播放器页随后才盖上来：这期间垫黑，不露出底下横着的信息流
-                    Color.black.ignoresSafeArea()
-                    if let player = store.player {
-                        ReelFullscreenView(
-                            store: store, player: player,
-                            onExit: { setFullscreen(false) },
-                            onPlayFull: {
-                                // 横着看的直接横着进播放器页：方向锁不动，不先转回竖屏再转过去；
-                                // 全屏状态留到播放器页盖上之后再收（onDisappear）
-                                play(from: store, restart: false, item: player.item, landscape: true)
-                            }
-                        )
-                    }
-                }
-                .transition(.opacity)
-            }
-        }
         // 标题不用系统的大标题：系统大标题跟着滚动视图走，一滑到下一条就缩成正中的小字。
         // 这里放在左上角的工具栏位、去掉玻璃底，字号与媒体库首页的标题一致，滑动时不变
         .navigationTitle("")
@@ -90,9 +69,6 @@ struct ReelsView: View {
             .sharedBackgroundVisibility(.hidden)
             ToolbarItem(placement: .topBarTrailing) { genreMenu }
         }
-        .toolbarVisibility(fullscreen ? .hidden : .automatic, for: .navigationBar, .tabBar)
-        .statusBarHidden(fullscreen)
-        .persistentSystemOverlays(fullscreen ? .hidden : .automatic)
         .preferredColorScheme(.dark)
         .task {
             if store == nil { store = ReelsStore(api: api, metered: NetworkCost.shared.isMetered) }
@@ -106,24 +82,26 @@ struct ReelsView: View {
             try? audio.setActive(true)
             // 信息流锁竖屏：转手机不该把整页转横（横着看走「全屏观看」）
             PlayerOrientation.request(landscape: false)
-            store?.resume()
+            // 从全屏观看回来：接着刚才看到的地方放
+            let returned = router.clipReturn
+            router.clipReturn = nil
+            store?.resume(returning: returned)
         }
         .onDisappear {
             visible = false
-            if fullscreen { setFullscreen(false, rotate: false) }
             // 被播放器页盖住时方向归播放器页管（它关掉时会解锁）；真正离开这一页才解开竖屏锁
             if router.player == nil { PlayerOrientation.release() }
             store?.suspend()
             UIApplication.shared.isIdleTimerDisabled = false
         }
-        // 播放器页是根部的全屏弹层：盖上来时收掉刷片的引擎，收起后当前这条重新起播
+        // 播放器页是根部的全屏弹层：盖上来时收掉刷片的引擎，收起后当前这条接着放（onAppear）
         .onChange(of: router.player == nil) { _, closed in
             if closed {
-                // 从全屏「看全片」过去、盖上时没收到 onDisappear 的，回来前把全屏收掉
-                if fullscreen { setFullscreen(false, rotate: false) }
                 if visible {
                     PlayerOrientation.request(landscape: false)
-                    store?.resume()
+                    let returned = router.clipReturn
+                    router.clipReturn = nil
+                    store?.resume(returning: returned)
                 }
             } else {
                 store?.suspend()
@@ -142,16 +120,6 @@ struct ReelsView: View {
                 .sheetFeedback()
             }
         }
-    }
-
-    // MARK: - 全屏
-
-    /// 进出全屏：播放器不换，只把画面挪到全屏层、转横 / 转回竖屏，字幕换成对应字号
-    private func setFullscreen(_ on: Bool, rotate: Bool = true) {
-        guard fullscreen != on else { return }
-        store?.player?.setFullscreen(on)
-        if rotate { PlayerOrientation.request(landscape: on) }
-        withAnimation(.easeInOut(duration: 0.2)) { fullscreen = on }
     }
 
     // MARK: - 顶部类型选择
@@ -187,7 +155,6 @@ struct ReelsView: View {
                 ForEach(store.items, id: \.id) { item in
                     ReelPage(
                         item: item, store: store, isCurrent: item.id == store.currentID, insets: insets,
-                        showsVideo: !fullscreen,
                         canCreateShareLink: permissions.isAdmin,
                         onPlay: { play(from: store, restart: false, item: item) },
                         onPlayFromStart: { play(from: store, restart: true, item: item) },
@@ -196,7 +163,7 @@ struct ReelsView: View {
                             sharing = item
                         },
                         onOpenPerson: { router.push(.person(tmdbId: $0)) },
-                        onFullscreen: { setFullscreen(true) }
+                        onFullscreen: { openFullscreen(store) }
                     )
                     .frame(width: size.width + insets.leading + insets.trailing,
                            height: size.height + insets.top + insets.bottom)
@@ -205,24 +172,30 @@ struct ReelsView: View {
             .scrollTargetLayout()
         }
         .scrollTargetBehavior(.paging)
-        // 全屏时整页转横、翻页区跟着重新排版，滚动位置会被动地变：这期间不认，免得把正在放的那条换掉
-        .scrollPosition(id: Binding(get: { store.currentID }, set: { if !fullscreen { store.currentID = $0 } }))
+        .scrollPosition(id: Binding(get: { store.currentID }, set: { store.currentID = $0 }))
         .scrollIndicators(.hidden)
-        .scrollDisabled(fullscreen)
         .onScrollPhaseChange { _, phase in
             // 滑动停稳才换播放器：拖动途中 currentID 会跟着变，不能每变一次就起一个引擎
-            if phase == .idle, !fullscreen { store.settle() }
+            if phase == .idle { store.settle() }
         }
     }
 
-    /// - Parameter landscape: 从全屏过来的，保持横屏锁（与播放器页自己的横屏键同一种锁，
-    ///   播放器页里「退出横屏」、关掉播放器都照常）
-    private func play(from store: ReelsStore, restart: Bool, item: API.ReelItemView, landscape: Bool = false) {
+    private func play(from store: ReelsStore, restart: Bool, item: API.ReelItemView) {
         let request = restart ? store.openRequest(for: item) : (store.continueRequest() ?? store.openRequest(for: item))
         store.suspend()
         // 播放器页跟随手机方向：先解开刷片的竖屏锁
-        if !landscape { PlayerOrientation.release() }
+        PlayerOrientation.release()
         router.play(request)
+    }
+
+    /// 「全屏观看」：这一段交给播放器页的片段模式，从当前位置接着放，播放器页自己转横。
+    /// 不做上滑转场：直接盖上黑底的播放器页再转横，不然转场途中会露出横着排的信息流
+    private func openFullscreen(_ store: ReelsStore) {
+        guard let request = store.fullscreenRequest() else { return }
+        store.suspend()
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { router.play(request) }
     }
 
     // MARK: - 空态
@@ -264,8 +237,6 @@ private struct ReelPage: View {
     let store: ReelsStore
     let isCurrent: Bool
     let insets: EdgeInsets
-    /// 全屏时画面挪到全屏层，这里只留封面
-    let showsVideo: Bool
     let canCreateShareLink: Bool
     let onPlay: () -> Void
     let onPlayFromStart: () -> Void
@@ -301,6 +272,10 @@ private struct ReelPage: View {
                 .padding(.horizontal, Theme.pagePadding)
                 .padding(.bottom, insets.bottom + 10)
             }
+            // 点页面任意空白处暂停 / 继续（同抖音）：不只横带，横带上下的黑底、进度线也算；
+            // 按钮、导演、简介自己响应点击，不会被这里抢走
+            .contentShape(Rectangle())
+            .onTapGesture { if isCurrent { store.togglePause() } }
         }
         .onChange(of: isCurrent) { _, current in
             if !current { expanded = false }
@@ -316,17 +291,20 @@ private struct ReelPage: View {
         ZStack {
             Color.black
             RemoteImage(url: api.image(item.coverUrl, .landscapeCard), contentMode: .fit)
-            if showsVideo, let player {
-                ReelVideoSurface(engineView: player.core.view)
+            if let player {
+                EngineSurface(engineView: player.core.view)
                     .id(ObjectIdentifier(player))
                     .opacity(store.frameReady(for: item) ? 1 : 0)
             }
-            if showsVideo { overlay }
+            overlay
         }
         .frame(width: width, height: height)
         .clipped()
-        .contentShape(Rectangle())
-        .onTapGesture { if isCurrent { store.togglePause() } }
+        // 读屏：横带就是暂停 / 继续键（明眼用户点页面任意处，见 body）
+        .accessibilityElement()
+        .accessibilityAddTraits(.isButton)
+        .accessibilityLabel(isCurrent && store.playerState == .playing ? "暂停" : "播放")
+        .accessibilityAction { if isCurrent { store.togglePause() } }
         .accessibilityIdentifier("reels-video")
     }
 
@@ -539,8 +517,8 @@ private struct ReelPage: View {
     }
 }
 
-/// 细线是这一段的进度；右边的时间是「在整部片里放到哪 / 整部片多长」（剧集是这一集），
-/// 让人知道这一段出自片子的什么位置。竖屏页与全屏共用
+/// 细线与时间都按**这一段**算：「这一段放到哪 / 这一段多长」（0:12 / 0:45），与全屏播放器的片段模式一致——
+/// 显示整部片的片长会让人以为在看整部（2026-09-30 用户要求）
 struct ReelProgressRow: View {
     let item: API.ReelItemView
     let player: ReelPlayer?
@@ -569,45 +547,10 @@ struct ReelProgressRow: View {
     }
 
     private var timeText: String {
-        let position = player?.position ?? Double(item.segment.startMs) / 1000
-        let total = item.segment.durationMs.map { Double($0) / 1000 } ?? player?.core.duration
-        guard let total, total > 0 else { return Self.clock(position, long: position >= 3600) }
-        let long = total >= 3600
-        return "\(Self.clock(position, long: long)) / \(Self.clock(total, long: long))"
-    }
-
-    /// 1:36:17 / 45:08：一小时以上的片子两边都带小时位，对齐不跳
-    private static func clock(_ seconds: Double, long: Bool) -> String {
-        let total = max(0, Int(seconds.rounded(.down)))
-        let h = total / 3600, m = total % 3600 / 60, s = total % 60
-        return long ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
-    }
-}
-
-/// 刷片的画面容器：同一个引擎画面要在竖屏页的横带与全屏层之间来回挪。
-///
-/// 不能直接用播放器页的 `EngineSurface`：它每次更新都会把画面「抢」回自己的容器。进出全屏有一段
-/// 过渡动画，新旧两个容器同时在——退出时全屏层在淡出途中又把画面抢回去，淡出结束画面跟着它一起被
-/// 移走，横带就成了黑的（模拟器实测）。这里只在新建时接管画面；之后画面已经在别的容器里就不动它，
-/// 只有画面无处可挂（没有父视图）时才接回来。
-struct ReelVideoSurface: UIViewRepresentable {
-    let engineView: UIView
-
-    func makeUIView(context: Context) -> UIView {
-        let container = UIView()
-        container.backgroundColor = .black
-        attach(to: container)
-        return container
-    }
-
-    func updateUIView(_ container: UIView, context: Context) {
-        if engineView.superview == nil { attach(to: container) }
-    }
-
-    private func attach(to container: UIView) {
-        engineView.frame = container.bounds
-        engineView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        container.addSubview(engineView)
+        let start = Double(item.segment.startMs) / 1000
+        let total = Double(item.segment.endMs - item.segment.startMs) / 1000
+        let elapsed = min(max(0, (player?.position ?? start) - start), total)
+        return "\(Formatters.clock(elapsed)) / \(Formatters.clock(total))"
     }
 }
 

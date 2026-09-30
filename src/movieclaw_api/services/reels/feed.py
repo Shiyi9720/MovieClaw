@@ -538,7 +538,7 @@ async def _episode_facts(
 # --- 事件 ------------------------------------------------------------------------
 
 EVENT_KINDS = frozenset(
-    {"impression", "first_frame", "leave", "complete", "continue", "open", "fail"}
+    {"impression", "first_frame", "leave", "complete", "continue", "open", "fullscreen", "fail"}
 )
 
 
