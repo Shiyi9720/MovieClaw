@@ -13,12 +13,13 @@ import SwiftUI
 ///   横屏放（`PlaybackClip`）——手势、控制条、换音轨字幕与正片完全一样，时间轴只算这一段；
 ///   退出全屏回到这里，从刚才看到的地方接着放；
 /// - 右下角一列**无底色**的白色图标按钮（不用毛玻璃，和画面融在一起，带投影保证亮画面上也看得清）：
-///   收藏、播放、已看、分享；
+///   收藏、详情、已看、分享；
 /// - 左下角只放导演与简介（片名、年份挪到了左上角）：导演（剧集是主创，对应 TikTok / Instagram 的作者行，
 ///   点了进人物页）、两行简介（剧集前面是「第 N 季第 N 集「集名」」，放不下就「展开」）；
 /// - 最底下一条细进度线，右边是「这一段放到哪 / 这一段多长」——与全屏一致，都按片段算，不按整部片。
 ///
-/// 播放按钮：点一下从当前位置转到播放器页正常放整部（同一个文件，刷片下过的字节直接复用），长按可选「从头看」。
+/// 「详情」：去媒体库条目页看这部片的详细信息（剧集定位到这一集），返回后这一条接着放。
+/// 想看整部：全屏里点「看全片」，或在详情页里播放。
 struct ReelsView: View {
     @Environment(\.api) private var api
     @Environment(\.permissions) private var permissions
@@ -157,8 +158,11 @@ struct ReelsView: View {
                     ReelPage(
                         item: item, store: store, isCurrent: item.id == store.currentID, insets: insets,
                         canCreateShareLink: permissions.isAdmin,
-                        onPlay: { play(from: store, restart: false, item: item) },
-                        onPlayFromStart: { play(from: store, restart: true, item: item) },
+                        onOpenDetail: {
+                            store.openDetail(item)
+                            router.push(.libraryItem(libraryId: item.title.libraryId, itemId: item.title.mediaItemId,
+                                                     season: item.title.episode?.season, episode: item.title.episode?.episode))
+                        },
                         onShare: {
                             store.pause()
                             sharing = item
@@ -179,14 +183,6 @@ struct ReelsView: View {
             // 滑动停稳才换播放器：拖动途中 currentID 会跟着变，不能每变一次就起一个引擎
             if phase == .idle { store.settle() }
         }
-    }
-
-    private func play(from store: ReelsStore, restart: Bool, item: API.ReelItemView) {
-        let request = restart ? store.openRequest(for: item) : (store.continueRequest() ?? store.openRequest(for: item))
-        store.suspend()
-        // 播放器页跟随手机方向：先解开刷片的竖屏锁
-        PlayerOrientation.release()
-        router.play(request)
     }
 
     /// 「全屏观看」：这一段交给播放器页的片段模式，从当前位置接着放，播放器页自己转横。
@@ -239,8 +235,7 @@ private struct ReelPage: View {
     let isCurrent: Bool
     let insets: EdgeInsets
     let canCreateShareLink: Bool
-    let onPlay: () -> Void
-    let onPlayFromStart: () -> Void
+    let onOpenDetail: () -> Void
     let onShare: () -> Void
     let onOpenPerson: (Int) -> Void
     let onFullscreen: () -> Void
@@ -369,12 +364,9 @@ private struct ReelPage: View {
             }
             .accessibilityValue(favorite ? "已收藏" : "未收藏")
             .accessibilityIdentifier("reels-favorite")
-            ReelActionButton(symbol: "play.fill", title: "播放", action: onPlay)
-                .contextMenu {
-                    Button("从这里接着看", systemImage: "play.fill", action: onPlay)
-                    Button("从头看", systemImage: "backward.end.fill", action: onPlayFromStart)
-                }
-                .accessibilityIdentifier("reels-play")
+            // 详情：刷到感兴趣的片，最常做的是去条目页看看详细信息（2026-09-30 用户要求，替换原来的「播放」）
+            ReelActionButton(symbol: "info.circle", title: "详情", action: onOpenDetail)
+                .accessibilityIdentifier("reels-detail")
             ReelActionButton(symbol: played ? "checkmark.circle.fill" : "checkmark.circle", title: "已看",
                              tint: played ? Theme.success : .white) {
                 Task { await store.togglePlayed(item) }
