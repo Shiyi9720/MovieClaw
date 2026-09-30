@@ -494,11 +494,27 @@ final class PlaybackController {
         #endif
         if preconnect, let health = scope.streamURL("/api/v1/health") {
             // 取流地址要等会话回来才有，但源站就是这台服务器：先让引擎的取源连接把 TCP / TLS 握手做掉（引擎补丁 P43）。
-            // 建请求在主线程上也要几毫秒（第一次还要建会话），放后台
-            Task.detached(priority: .userInitiated) { NativeEngine.preconnect(url: health) }
+            // 建请求在主线程上也要几毫秒（第一次还要建会话），放后台。
+            // 错开一点再发：和开会话同时建三条连接时，开会话要晚约 15 毫秒回来（真机对照 132 → 147）；
+            // 会话往返要一百多毫秒，晚发几十毫秒的预连照样赶在装载引擎之前连好
+            let delay = Self.preconnectDelayMs
+            Task.detached(priority: .userInitiated) {
+                if delay > 0 { try? await Task.sleep(for: .milliseconds(delay)) }
+                NativeEngine.preconnect(url: health)
+            }
         }
         // 会话回来后定落盘计划要用可用空间，这个查询在主线程上约 17 毫秒：趁等响应在后台先查好
         NativeStoragePlan.refreshFreeBytesInBackground()
+    }
+
+    /// 点播放后隔多久再发引擎预连（毫秒），让开会话先建好自己的连接。开发期 -mcPreconnectDelayMs 可改（真机对照用）
+    private static var preconnectDelayMs: Int {
+        #if DEBUG
+        if UserDefaults.standard.object(forKey: "mcPreconnectDelayMs") != nil {
+            return UserDefaults.standard.integer(forKey: "mcPreconnectDelayMs")
+        }
+        #endif
+        return 50
     }
 
     /// 进入播放器时的单元（`request.fileId` 只属于它）
