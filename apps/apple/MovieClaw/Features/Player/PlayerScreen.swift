@@ -1,4 +1,3 @@
-import Combine
 import SwiftUI
 
 /// 全屏播放器（对应 Web `/play/{mediaItemId}/{sXXeYY}?t=`），由根视图 fullScreenCover 呈现。
@@ -260,40 +259,10 @@ struct PlayerScreen: View {
 }
 
 /// 播放器画面与控制层
-/// 播放器界面空闲预热（由 `MainTabView` 的空闲预热在页签预热之后调）：用一个不起播的控制器把播放器内容视图
-/// 在背后不可见地画一遍再拆掉。
-///
-/// 为什么：第一次弹出播放器，主线程要花几十毫秒（真机约 70、调试包模拟器约 200）第一次实例化播放器界面的一长串视图类型，
-/// Time Profiler 里约四成采样是 Swift 运行时的协议一致性查找（查过一次就缓存，第二次弹出只要约 20 毫秒）。
-/// 从首页、详情页点播放时连接是预连过的，会话几十毫秒就回来，却要等这段主线程忙完才轮到装载引擎。
-/// 空闲时先画一遍，这笔一次性开销就不落在起播路上（同页面预热 `PageWarmup`）。
-/// 控制器不调 `start()`、不发任何请求；预热模式不挂音量键接管、不订阅系统音量
-struct PlayerWarmup: View {
-    @Environment(\.api) private var api
-    @State private var controller: PlaybackController?
-
-    var body: some View {
-        ZStack {
-            Color.black
-            if let controller {
-                PlayerContent(controller: controller, exit: {}, openRemoteSettings: {}, warmup: true)
-            }
-        }
-        .opacity(0)
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-        .onAppear {
-            if controller == nil { controller = PlaybackController(request: PlayRequest(mediaItemId: 0), api: api) }
-        }
-    }
-}
-
 private struct PlayerContent: View {
     let controller: PlaybackController
     let exit: () -> Void
     let openRemoteSettings: () -> Void
-    /// 空闲预热（见 `PlayerWarmup`）：只为把界面画一遍，不挂音量键接管、不订阅系统音量
-    var warmup = false
 
     @State private var chromeVisible = true
     @State private var chromeActivity = 0
@@ -410,18 +379,16 @@ private struct PlayerContent: View {
                     PlayerInfoErrorView(message: infoError, exit: exit)
                 }
                 // 放到屏幕左上角：ZStack 默认居中，不指定的话它正好压在画面正中
-                if !warmup {
-                    SystemVolumeHost().frame(width: 1, height: 1)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                        .ignoresSafeArea()
-                        .allowsHitTesting(false)
-                }
+                SystemVolumeHost().frame(width: 1, height: 1)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
             }
             .animation(.easeInOut(duration: 0.25), value: chromeVisible)
             .animation(.easeInOut(duration: 0.2), value: controller.notice)
             .animation(.easeInOut(duration: 0.25), value: controller.qualityOffer)
         }
-        .onReceive(warmup ? Combine.Empty<Float, Never>().eraseToAnyPublisher() : SystemVolume.shared.changes) { volume in
+        .onReceive(SystemVolume.shared.changes) { volume in
             showVolumeFromKeys(Double(volume))
         }
         .task(id: autoHideKey) {
