@@ -167,6 +167,21 @@ def test_matroska_cues_missing_from_seekhead_is_unsupported(tmp_path):
     assert ci.read_container_index(path) is None
 
 
+def test_matroska_content_with_mp4_suffix_sniffed_by_magic(tmp_path):
+    """后缀是 .mp4 但内容是 Matroska（NAS 上真实出现过）：按魔数走 Matroska 解析。"""
+    path = tmp_path / "disguised.mp4"
+    _build_mkv(
+        path,
+        duration_ms=600_000,
+        clusters=[(0, 1000), (2000, 3000)],
+        subtitle_ms=[],
+        chapters=[],
+    )
+    index = ci.read_container_index(path)
+    assert index is not None
+    assert index.container == "matroska"
+
+
 def test_garbage_with_mkv_suffix_returns_none(tmp_path):
     path = tmp_path / "fake.mkv"
     path.write_bytes(b"\x00" * 4096)
