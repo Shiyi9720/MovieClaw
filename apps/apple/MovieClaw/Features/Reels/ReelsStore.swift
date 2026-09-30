@@ -162,6 +162,12 @@ final class ReelsStore {
         playerState = .loading
     }
 
+    /// 左上角标题跟的那一条：在播的这一条（滑过去、换了播放器才换）；还没有播放器时（刚进来、挂起中）按滚动位置
+    var titleItem: API.ReelItemView? {
+        if let player { return player.item }
+        return items.first { $0.id == currentID }
+    }
+
     /// 某一条现在由哪个播放器出画：当前这条，或预起好的下一条
     func player(for item: API.ReelItemView) -> ReelPlayer? {
         if let player, player.item.id == item.id { return player }
