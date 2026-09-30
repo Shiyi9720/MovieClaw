@@ -116,11 +116,12 @@ def run_one(batch, name, extra=(), tag=None, seconds=66, close_at=56, at="keep",
             time.sleep(
                 seconds + max(0.0, ROUTE_DELAY - 2) + (ROUTE_THEN_DELAY if ROUTE_FIRST else 0)
             )
-            # 先 SIGINT 让 devicectl 正常断开控制台连接，2 秒没退再强杀：直接 SIGKILL 会在设备上留下没断开的控制台，
-            # 接下来带 --console 的启动一阵子都报 CoreDeviceError 10002「Invalid argument」（日志为空）
+            # 先 SIGINT 让 devicectl 正常断开控制台连接，6 秒没退再强杀：直接 SIGKILL 会在设备上留下没断开的控制台，
+            # 接下来带 --console 的启动一阵子都报 CoreDeviceError 10002「Invalid argument」（日志为空）。等它完全退出，
+            # 免得它转发给 App 的中断信号晚到、落在下一次启动的实例上（出现过一次「App terminated due to signal 2」）
             p.send_signal(signal.SIGINT)
             try:
-                p.wait(timeout=2)
+                p.wait(timeout=6)
             except subprocess.TimeoutExpired:
                 p.kill()
                 p.wait()
