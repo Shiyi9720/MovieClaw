@@ -146,6 +146,8 @@ final class NativeEngine: NSObject, PlayerEngine {
         AetherPlayback.setSkipsDetourOnSlowLink(!UserDefaults.standard.bool(forKey: "mcNoDetourSkip"))
         // -mcNoIndexPriority YES：冷打开时文件头照旧一开始就要 32 MB、与索引提前取并行（引擎补丁 P56 之前的行为，对照用）
         AetherPlayback.setPrioritizesIndexPrefetch(!UserDefaults.standard.bool(forKey: "mcNoIndexPriority"))
+        // -mcNoProgressiveSegments YES：分片照旧整段写完再交付给 AVPlayer（引擎补丁 P57 之前的行为，对照用）
+        AetherPlayback.setServesSegmentsProgressively(!UserDefaults.standard.bool(forKey: "mcNoProgressiveSegments"))
         // -mcWitnessInterval <秒>：起播 / 跳转后看缓冲过没过开播线的间隔（引擎补丁 P28，默认 0.025，原来 0.1；真机对照用）
         let witness = UserDefaults.standard.double(forKey: "mcWitnessInterval")
         if witness > 0 { AetherPlayback.vodStartWitnessIntervalSeconds = witness }

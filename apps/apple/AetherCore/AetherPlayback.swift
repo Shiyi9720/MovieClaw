@@ -230,6 +230,11 @@ public final class AetherPlayback {
         AetherEngine.skipsDetourOnSlowLink = on
     }
 
+    /// 点播分片边产出边送、分片内每 0.5 秒一个片段（引擎补丁 P57，默认开；对照时关掉）
+    public static func setServesSegmentsProgressively(_ on: Bool) {
+        AetherEngine.servesSegmentsProgressively = on
+    }
+
     /// 冷打开时文件头先只要 512 KB，索引提前取在途时文件头不超前预读（引擎补丁 P56，默认开；对照时关掉）
     public static func setPrioritizesIndexPrefetch(_ on: Bool) {
         AetherEngine.prioritizesIndexPrefetch = on
