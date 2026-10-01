@@ -689,6 +689,8 @@ async def _append_progressive_part(
         partial.next_part += 1
         if partial.next_part == 1:
             playback_session.mark("frag", name=name, kb=written // 1024)
+            # 第一个片段到了：在等这一片的请求现在就能开始流式下发
+            playback_session.notify_changed()
         if final:
             os.replace(partial.path, playback_session.directory / name)
             partial.done = True

@@ -2217,3 +2217,23 @@ async def test_progressive_segment_is_handed_out_once_its_first_fragment_lands(m
     # 上一轮写的半截不给（seek 重启后它会被新一轮重写）
     session.partials[5].job = "job-old"
     assert manager._streamable_partial(session, 5) is None
+
+
+@pytest.mark.asyncio
+async def test_remote_segment_wait_wakes_up_when_the_artifact_lands(manager, tmp_path, monkeypatch):
+    """远程产物一落盘就叫醒在等的请求，不再干等轮询的下一拍（轮询间隔这里拉长到 5 秒）。"""
+    monkeypatch.setattr(TranscodeSessionManager, "_SEGMENT_POLL_S", 5.0)
+    session = _vod_session(tmp_path, head=5, completed=set())
+    session.remote = True
+    session.remote_job_id = "job-a"
+    session.remote_restarting = True  # 不去查 Worker 在不在线（这里没有注册表）
+    manager._sessions[session.id] = session
+    waiter = asyncio.ensure_future(manager.ensure_segment(session, 5))
+    await asyncio.sleep(0.05)
+    (tmp_path / "seg00005.m4s").write_bytes(b"x" * 64)
+    landed = time.monotonic()
+    session.record_remote_upload(
+        "seg00005.m4s", status=201, received_bytes=64, content_length=64, transfer_encoding=None
+    )
+    assert await asyncio.wait_for(waiter, 2) == tmp_path / "seg00005.m4s"
+    assert time.monotonic() - landed < 1.0

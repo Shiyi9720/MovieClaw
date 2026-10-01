@@ -447,8 +447,15 @@ class TranscodeSession:
     progressive: bool = False
     #: 边产出边送时正在写的分片（分片号 → 状态），见 ``PartialSegment``
     partials: dict[int, PartialSegment] = field(default_factory=dict)
+    #: 远程产物落盘、边产出边送的片段到了就换一个新事件并置位，叫醒在等分片的请求
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
     _stderr_task: asyncio.Task | None = None
     _restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def notify_changed(self) -> None:
+        """有新产物了：叫醒所有在等分片的请求（每次换一个新事件，等待方不会错过）。"""
+        event, self.changed = self.changed, asyncio.Event()
+        event.set()
 
     def mark(self, event: str, **fields: Any) -> None:
         """记一条时间线事件。只改内存，近零开销；字段要短（诊断接口整份返回）。"""
@@ -528,6 +535,7 @@ class TranscodeSession:
         )
         if 200 <= status < 300:
             self.mark("landed", name=name, kb=received_bytes // 1024)
+            self.notify_changed()
             segment = _segment_index_from_name(name)
             superseded = self.partials.pop(segment, None) if segment is not None else None
             if superseded is not None and not superseded.done:
@@ -1460,6 +1468,8 @@ class TranscodeSessionManager:
     #: 请求相差这么多分片时，较远且较新的请求视为用户跳转，不能被列表头
     #: 的旧探测请求拖到 30 秒超时。普通播放器的并行预取通常只有 1~3 片。
     _LARGE_SEEK_GAP_SEGMENTS = 4
+    #: 等分片时的轮询间隔（本机 ffmpeg 写盘没有信号；远程产物落盘会立刻叫醒，不等这一拍）
+    _SEGMENT_POLL_S = 0.05
     #: 单个分片的等待上限。局域网起播 + burst 下正常几百毫秒就好；超时说明
     #: ffmpeg 卡死或存储极慢，让客户端拿 404 重试比挂着请求强
     _SEGMENT_WAIT_S = 30.0
@@ -1574,6 +1584,8 @@ class TranscodeSessionManager:
         allow_partial: bool = False,
     ) -> Path | PartialSegment | None:
         while time.monotonic() < deadline:
+            # 先拿住这一拍的变化信号再做检查：检查之后、等待之前落盘的产物也能叫醒这次等待
+            changed = session.changed
             # 会话可能在等待期间被显式结束（用户退出的 DELETE 会删目录）。
             # 不查这条就会对着已删除的目录重启 ffmpeg，No such file or
             # directory 一路冒成 500。
@@ -1642,10 +1654,12 @@ class TranscodeSessionManager:
                 return None
             if session.state == "failed":
                 return None
-            # 50ms 轮询：这决定「分片写完 → 客户端拿到」的发现延迟，seek 的
-            # 尾巴上省的就是这几十毫秒。解析已被 _sync_completed 的签名门控
-            # 挡住，轮询本身只剩 stat 调用，再快也没有收益。
-            await asyncio.sleep(0.05)
+            # 远程产物落盘、边产出边送的片段到了会立刻叫醒（``notify_changed``），省掉轮询
+            # 平均 25 毫秒的发现延迟（时间线里「落盘 → 交付」原来常有 30～45 毫秒）；本机
+            # ffmpeg 写盘没有信号，仍按 50ms 轮询。解析已被 _sync_completed 的签名门控挡住，
+            # 轮询本身只剩 stat 调用。
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(changed.wait(), timeout=self._SEGMENT_POLL_S)
         session.segment_timeouts += 1
         if session.remote:
             # 远程分片靠 Worker 回传。issue #444 里旧版 Worker 在本机悄悄拒收了全部
