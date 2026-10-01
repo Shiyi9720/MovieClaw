@@ -132,7 +132,13 @@ async function runScenario(name, scenario) {
       try {
         body = JSON.parse(req.postData() ?? "null");
       } catch {}
-      const item = { t: now(), failed_tiers: body?.failed_tiers ?? [], max_height: body?.max_height ?? null, start_ms: body?.start_ms ?? null };
+      const item = {
+        t: now(),
+        failed_tiers: body?.failed_tiers ?? [],
+        max_height: body?.max_height ?? null,
+        downlink_bps: body?.downlink_bps ?? null,
+        start_ms: body?.start_ms ?? null,
+      };
       result.sessionRequests.push(item);
       emit({ kind: "session-req", ...item });
     });

@@ -4,6 +4,7 @@
 //   WEB_FAULTLAB_HLS        视频直通的服务端流（档 1 / 2，换封装或只转音轨），码率越高越好，例如 /play/123?t=600
 //   WEB_FAULTLAB_DIRECT     档 0 直出的 MP4（H.264 + AAC），例如 /play/456?t=600
 //   WEB_FAULTLAB_DECODE     （可选）会撞上硬解错误的位置，例如 /play/123?t=634
+//   WEB_FAULTLAB_TRANSCODE  （可选）网页要整片转码的片子（4K HDR、HEVC 等），例如 /play/789?t=600
 //   WEB_FAULTLAB_MP4_REMUX  （可选）音轨浏览器不支持、要换封装的 MP4，量首播
 //   WEB_FAULTLAB_TS         （可选）要换封装的 TS，量首播
 //   WEB_FAULTLAB_AUDIO      （可选）多音轨条目：<条目 id>:<非默认音轨引用>:<播放页地址>，例如 123:embedded:7:/play/123?t=600
@@ -84,6 +85,22 @@ export const scenarios = {
     link: { mbps: 7, rttMs: 40 },
     durationS: 90,
     expect: all(noStepDown, (r) => uiShows(r, /网速跟不上当前画质/)),
+  },
+
+  // 已经在转码、线路装不下：不弹卡，按实测带宽同档重开一次压码率（每集一次）；压过之后线路够用，
+  // 不该再弹卡（量到分片码率之前按服务端的转码目标码率比，不拿片源码率）
+  "slow-transcode": {
+    route: env("TRANSCODE"),
+    link: { mbps: 3, rttMs: 60 },
+    durationS: 90,
+    expect: all(
+      noStepDown,
+      (r) => (r.sessionRequests.some((q) => q.downlink_bps) ? null : "没有按实测带宽重开转码会话"),
+      (r) => {
+        const at = firstUiAt(r, /网速跟不上当前画质/);
+        return at === null ? null : `压过码率后仍弹换画质卡（第 ${at} 秒）`;
+      },
+    ),
   },
 
   // —— 断线：同档原地恢复，不降档 ——
