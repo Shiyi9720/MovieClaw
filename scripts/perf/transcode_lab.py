@@ -237,6 +237,40 @@ def purge_cache(file_ids: list[int]) -> int:
     return int(nas_python(_PURGE_CACHE, ",".join(map(str, file_ids))).strip() or 0)
 
 
+_EVICT_SOURCE = r"""
+import os, sqlite3, sys
+ids = [int(x) for x in sys.argv[1].split(",") if x]
+db = sqlite3.connect("file:/app/data/movieclaw.db?mode=ro", uri=True)
+marks = ",".join("?" * len(ids))
+files = 0
+for (path,) in db.execute(f"select file_path from library_file where id in ({marks})", ids):
+    if os.path.isfile(path):
+        targets = [path]
+    else:
+        targets = [os.path.join(d, f) for d, _, names in os.walk(path) for f in names]
+    for target in targets:
+        try:
+            fd = os.open(target, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            files += 1
+        finally:
+            os.close(fd)
+print(files)
+"""
+
+
+def evict_source(file_ids: list[int]) -> int:
+    """把片源赶出 NAS 的页缓存（原盘整棵目录），每次都从冷的起转。
+
+    不赶的话同一部片两组对照里先跑的那组读冷盘、后跑的读页缓存（实测文件尾的小读
+    首字节 20～30 ms 对 2 ms），配对差里混进了先后顺序。片源若在 NFS 上，赶的是 NAS
+    这一层 NFS 客户端的缓存，存储端自己的缓存管不到——对两组一样。"""
+    return int(nas_python(_EVICT_SOURCE, ",".join(map(str, file_ids))).strip() or 0)
+
+
 # ---------------------------------------------------------------------------
 # 语料
 # ---------------------------------------------------------------------------
@@ -645,6 +679,24 @@ def wait_idle(api: Api, expect: str, limit: float = 1800) -> float:
         time.sleep(2)
 
 
+def wait_quiet(max_load: float, limit: float = 1800) -> float:
+    """等本机安静下来。返回等了多少秒。
+
+    探针（AVPlayer）总在本机跑，本机当 Worker 时 ffmpeg 也在本机：别的会话这时候编译或打包
+    （实测 5 分钟负载 14）会让 Worker 起 ffmpeg、ffmpeg 发第一个请求、播放器要分片全都慢
+    几百毫秒，两组对照里撞上的那一组就成了噪声。1 分钟负载有一分钟左右的滞后，宁可多等。"""
+    started = time.monotonic()
+    announced = False
+    while os.getloadavg()[0] > max_load:
+        if not announced:
+            log(f"  本机负载 {os.getloadavg()[0]:.1f}（上限 {max_load}），等别的任务跑完")
+            announced = True
+        if time.monotonic() - started > limit:
+            raise TimeoutError(f"本机负载 {limit:.0f} 秒内一直高于 {max_load}")
+        time.sleep(5)
+    return time.monotonic() - started
+
+
 def scenario_plan(entry: dict, scenario: str) -> tuple[int, list[dict]]:
     """场景 → (起播毫秒, 跳转脚本)。位置取整秒，同一部片每轮相同，便于配对。"""
     duration = int(entry["duration"])
@@ -672,7 +724,12 @@ def run_one(
     round_index: int,
 ) -> dict:
     waited = wait_idle(api, args.expect_worker)
+    if args.max_load > 0:
+        waited += wait_quiet(args.max_load)
+    load_before = round(os.getloadavg()[0], 2)
     purged = purge_cache([entry["file_id"]]) if not args.keep_cache else 0
+    if args.cold:
+        evict_source([entry["file_id"]])
     start_ms, seeks = scenario_plan(entry, scenario)
     body: dict[str, Any] = {
         "file_id": entry["file_id"],
@@ -738,6 +795,8 @@ def run_one(
         "name": entry["name"],
         "start_ms": start_ms,
         "waited_idle_s": round(waited, 1),
+        # 本机 1 分钟负载（起播前、收尾后）：事后挑出被别的任务干扰的那几次
+        "load": [load_before, round(os.getloadavg()[0], 2)],
         "purged_dirs": purged,
         "valid": valid,
         "session": session,
@@ -1261,6 +1320,15 @@ def main() -> None:
     run.add_argument("--link", choices=sorted(LINKS), default="lan")
     run.add_argument("--timeout", type=float, default=30, help="等首帧 / 单次跳转出画的上限（秒）")
     run.add_argument("--gap", type=float, default=1.5, help="两次播放之间歇几秒")
+    run.add_argument(
+        "--max-load", type=float, default=6.0, help="本机 1 分钟负载高于此值时先等（0 = 不等）"
+    )
+    run.add_argument(
+        "--cold",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="每次起播前把片源赶出 NAS 页缓存（默认开；--no-cold 量热缓存）",
+    )
     run.add_argument(
         "--keep-cache", action="store_true", help="不清 NAS 上的转码缓存（量缓存命中）"
     )
