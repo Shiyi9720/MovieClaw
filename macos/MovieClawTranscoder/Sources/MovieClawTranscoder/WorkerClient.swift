@@ -329,8 +329,7 @@ actor WorkerClient {
                 // MP4，这边切段、每 0.5 秒一块回传。旧版服务端忽略这个字段，照旧派整段落盘的任务
                 "progressive_segments": !configuration.labFlags.contains("no-progressive"),
                 // ffmpeg 认得的取源选项：NAS 按它给取源加「不倒着读估时长、探测阶段按块要」
-                "read_options": configuration.labFlags.contains("no-read-options")
-                    ? [] : capabilities.readOptions,
+                "read_options": declaredReadOptions,
             ],
         ]
         do {
@@ -603,6 +602,22 @@ actor WorkerClient {
             // 兼容旧服务端或非 HLS 任务；当前远程播放任务应始终命中代理。
             AppLogger.shared.warning("远程任务未找到产物地址，将由 ffmpeg 直接处理：job=\(jobID)")
         }
+        // 取源走本机代理（docs/design/transcode-latency.md §6）：连接复用、按块取、块缓存。
+        // 起不来不影响转码，ffmpeg 照旧直连 NAS。代理随这一轮 ffmpeg 退出而停。
+        var sourceProxy: SourceReadProxy?
+        if !configuration.labFlags.contains("no-source-proxy"),
+           let sourceURL = SourceReadProxy.remoteSourceURL(from: ffmpegArguments),
+           let origin = SourceReadProxy.origin(of: sourceURL)
+        {
+            do {
+                let proxy = try SourceReadProxy(jobID: jobID, origin: origin)
+                let localBaseURL = try await proxy.start()
+                ffmpegArguments = proxy.rewrite(arguments: ffmpegArguments, localBaseURL: localBaseURL)
+                sourceProxy = proxy
+            } catch {
+                AppLogger.shared.warning("取源代理起不来，改为直连 NAS：job=\(jobID) 原因=\(error)")
+            }
+        }
         jobs[jobID] = execution
         jobAttempts[jobID] = attemptID
         timelines[jobID] = timeline
@@ -617,6 +632,7 @@ actor WorkerClient {
         } catch {
             execution.stop()
             uploadProxies.removeValue(forKey: jobID)?.stop()
+            sourceProxy?.stop()
             jobs.removeValue(forKey: jobID)
             jobAttempts.removeValue(forKey: jobID)
             timelines.removeValue(forKey: jobID)
@@ -631,7 +647,8 @@ actor WorkerClient {
 
         let activeFFmpegArguments = ffmpegArguments
         let activeUploadProxy = uploadProxy
-        Task { [weak self, execution, activeFFmpegArguments, activeUploadProxy, timeline] in
+        let activeSourceProxy = sourceProxy
+        Task { [weak self, execution, activeFFmpegArguments, activeUploadProxy, activeSourceProxy, timeline] in
             let result = await execution.run(
                 arguments: activeFFmpegArguments,
                 onProgress: { [weak self] progress in
@@ -651,6 +668,7 @@ actor WorkerClient {
                     }
                 }
             )
+            activeSourceProxy?.stop()
             if let activeUploadProxy {
                 await activeUploadProxy.drainPendingUploads()
             }
@@ -664,6 +682,14 @@ actor WorkerClient {
                 arguments: activeFFmpegArguments
             )
         }
+    }
+
+    /// 申报给 NAS 的取源选项。走取源代理时只要「不倒着读估时长」：「探测阶段按块要」那一对
+    /// 由代理按块向 NAS 取代替了，再让 ffmpeg 按块向回环口要只是多几次本机请求。
+    private var declaredReadOptions: [String] {
+        if configuration.labFlags.contains("no-read-options") { return [] }
+        if configuration.labFlags.contains("no-source-proxy") { return capabilities.readOptions }
+        return capabilities.readOptions.filter { $0 == "skip_estimate_duration_from_pts" }
     }
 
     /// 把这一轮还没发出去的分段计时发给 NAS（见 ``JobTimeline``）。没有新内容就不发。
