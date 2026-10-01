@@ -46,14 +46,12 @@ enum CapabilityProbe {
         )
     }
 
-    /// NAS 取源时可能加的输入选项（docs/design/transcode-latency.md §6）：MPEG-TS 打开时不倒着读文件尾
-    /// 估时长、探测阶段按块要并复用连接。`multiple_requests` / `initial_request_size` 是较新的
-    /// ffmpeg 才有的 HTTP 选项（jellyfin-ffmpeg 8.1 有），所以要先问 ffmpeg 自己。
-    static let readOptions: [String] = [
-        "skip_estimate_duration_from_pts", "multiple_requests", "initial_request_size",
-    ]
+    /// NAS 取源时可能加的输入选项（docs/design/transcode-latency.md §6.2）：MPEG-TS（原盘、广电录像）
+    /// 打开时不倒着读文件尾估时长。未知选项会让 ffmpeg 直接退出，所以要先问 ffmpeg 自己。
+    /// （按块要、连接复用由取源代理做，见 ``SourceReadProxy``。）
+    static let readOptions: [String] = ["skip_estimate_duration_from_pts"]
 
-    /// 从 `ffmpeg -h full` 的输出里挑出认得的取源选项。选项行形如 `  -multiple_requests <boolean> …`。
+    /// 从 `ffmpeg -h full` 的输出里挑出认得的取源选项。选项行形如 `  -skip_estimate_duration_from_pts <boolean> …`。
     static func parseReadOptions(_ output: String) -> [String] {
         let declared = Set(
             output.split(separator: "\n").compactMap { line -> String? in

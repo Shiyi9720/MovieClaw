@@ -783,7 +783,7 @@ def test_registry_reads_progressive_capability():
 
 
 def test_remote_read_options_only_go_to_workers_that_know_them():
-    """取源选项（docs/design/transcode-latency.md §6）只加 Worker 的 ffmpeg 认得的：
+    """取源选项（docs/design/transcode-latency.md §6.2）只加 Worker 的 ffmpeg 认得的：
     未知选项会让 ffmpeg 直接退出。"""
     from movieclaw_api.services.playback.ffmpeg_args import WorkerVideoCaps
 
@@ -799,22 +799,16 @@ def test_remote_read_options_only_go_to_workers_that_know_them():
             worker_caps=WorkerVideoCaps(read_options=read_options),
         ).argv
 
-    legacy = command(frozenset())
-    assert "-skip_estimate_duration_from_pts" not in legacy
-    assert "-initial_request_size" not in legacy
+    assert "-skip_estimate_duration_from_pts" not in command(frozenset())
 
+    # 初版 Worker 还申报过 HTTP 的两项：不再加（按块要由 Worker 的取源代理做）
     argv = command(
         frozenset({"skip_estimate_duration_from_pts", "multiple_requests", "initial_request_size"})
     )
     source = argv.index("-i")
-    for flag in ("-skip_estimate_duration_from_pts", "-multiple_requests", "-initial_request_size"):
-        assert flag in argv[:source], f"{flag} 必须是输入选项"
-    assert argv[argv.index("-initial_request_size") + 1] == str(1024 * 1024)
-
-    # 只认一半：按块要的两项必须成对，缺一项就都不加
-    partial = command(frozenset({"skip_estimate_duration_from_pts", "multiple_requests"}))
-    assert "-skip_estimate_duration_from_pts" in partial
-    assert "-multiple_requests" not in partial
+    assert "-skip_estimate_duration_from_pts" in argv[:source], "必须是输入选项"
+    assert "-multiple_requests" not in argv
+    assert "-initial_request_size" not in argv
 
 
 def test_registry_reads_read_options_capability():

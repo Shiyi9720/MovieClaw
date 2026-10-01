@@ -53,15 +53,8 @@ final class ReadOptionsProbeTests: XCTestCase {
           -multiple_requests <boolean>    ED......... use persistent connections (default false)
           -initial_request_size <int64>      .D......... size (in bytes) of initial requests
         """
-        XCTAssertEqual(
-            CapabilityProbe.parseReadOptions(help),
-            ["skip_estimate_duration_from_pts", "multiple_requests", "initial_request_size"]
-        )
-        // 旧版 ffmpeg 没有 HTTP 的两项：只申报认得的那一项
-        XCTAssertEqual(
-            CapabilityProbe.parseReadOptions("  -skip_estimate_duration_from_pts <boolean> x"),
-            ["skip_estimate_duration_from_pts"]
-        )
+        // HTTP 的两项不申报（取源代理代替了它们）
+        XCTAssertEqual(CapabilityProbe.parseReadOptions(help), ["skip_estimate_duration_from_pts"])
         XCTAssertEqual(CapabilityProbe.parseReadOptions(""), [])
     }
 }

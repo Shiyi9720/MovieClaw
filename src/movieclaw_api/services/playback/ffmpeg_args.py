@@ -261,32 +261,20 @@ class WorkerVideoCaps:
     read_options: frozenset[str] = frozenset()
 
 
-#: 远程取源时探测阶段每个请求要多少字节（ffmpeg http 的 ``initial_request_size``）。
-#: 开放式 Range（bytes=X-）下 ffmpeg 读完文件头就掐断连接，NAS 却已经推出去十几 MB——
-#: 一次起转要来回读三遍文件头、两遍文件尾，白读约 40 MB（网络挂载的媒体盘尤其贵）。
-#: 按 1 MB 一块要，读多少给多少；探测完之后的顺序读照旧开放式（每块都要一次往返，
-#: 高码率片顺序读时按块要会拖慢吞吐）。
-REMOTE_PROBE_REQUEST_BYTES = 1024 * 1024
-
-
 def remote_read_options(caps: WorkerVideoCaps | None) -> tuple[tuple[str, str], ...]:
-    """远程取源时额外加的输入选项（docs/design/transcode-latency.md §6），只加 Worker 申报认得的。
+    """远程取源时额外加的输入选项（docs/design/transcode-latency.md §6.2），只加 Worker 申报认得的。
 
-    - ``skip_estimate_duration_from_pts``：MPEG-TS（原盘 m2ts、广电录像）打开时 ffmpeg 会从文件尾
-      倒着读、越读越多地找每条流的最后一个时间戳来估时长——原盘实测十七个请求、六百多毫秒，可时长
-      NAS 早就知道（原盘清单里每段都写了 duration）。对 MKV / MP4 不起作用，无害；
-    - ``multiple_requests`` + ``initial_request_size``：探测阶段按块要、复用同一条连接
-      （见上面常量）。
+    ``skip_estimate_duration_from_pts``：MPEG-TS（原盘 m2ts、广电录像）打开时 ffmpeg 会从文件尾
+    倒着读、越读越多地找每条流的最后一个时间戳来估时长——原盘实测两到十几个请求，可时长 NAS
+    早就知道（原盘清单里每段都写了 duration）。对 MKV / MP4 不起作用，无害。
+
+    ffmpeg HTTP 的 ``initial_request_size`` / ``multiple_requests`` 不加：只管到第一次顺序读越界
+    为止，原盘、TS 的二分查找照样不封口、照样新开连接（读 8.1 的 http.c 确认）；按块要、连接复用
+    由 Worker 的取源代理来做（§6.3）。
     """
-    if caps is None:
+    if caps is None or "skip_estimate_duration_from_pts" not in caps.read_options:
         return ()
-    options: list[tuple[str, str]] = []
-    if "skip_estimate_duration_from_pts" in caps.read_options:
-        options.append(("skip_estimate_duration_from_pts", "1"))
-    if {"multiple_requests", "initial_request_size"} <= caps.read_options:
-        options.append(("multiple_requests", "1"))
-        options.append(("initial_request_size", str(REMOTE_PROBE_REQUEST_BYTES)))
-    return tuple(options)
+    return (("skip_estimate_duration_from_pts", "1"),)
 
 
 #: VideoToolbox 命令的三种形态（见 ``_videotoolbox_mode``）。

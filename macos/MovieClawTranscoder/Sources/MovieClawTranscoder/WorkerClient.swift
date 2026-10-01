@@ -328,8 +328,9 @@ actor WorkerClient {
                 // 能边产出边送分片（docs/design/transcode-latency.md §5）：NAS 让 ffmpeg 输出分片化
                 // MP4，这边切段、每 0.5 秒一块回传。旧版服务端忽略这个字段，照旧派整段落盘的任务
                 "progressive_segments": !configuration.labFlags.contains("no-progressive"),
-                // ffmpeg 认得的取源选项：NAS 按它给取源加「不倒着读估时长、探测阶段按块要」
-                "read_options": declaredReadOptions,
+                // ffmpeg 认得的取源选项：NAS 按它给取源加「不倒着读估时长」
+                "read_options": configuration.labFlags.contains("no-read-options")
+                    ? [] : capabilities.readOptions,
             ],
         ]
         do {
@@ -610,7 +611,14 @@ actor WorkerClient {
            let origin = SourceReadProxy.origin(of: sourceURL)
         {
             do {
-                let proxy = try SourceReadProxy(jobID: jobID, origin: origin)
+                let proxy = try SourceReadProxy(
+                    jobID: jobID,
+                    origin: origin,
+                    // 实验开关 eager-prefetch：送出第二块就预取（初版行为，对照用）
+                    prefetchAfterBlocks: configuration.labFlags.contains("eager-prefetch")
+                        ? 1 : SourceReadProxy.defaultPrefetchAfterBlocks,
+                    logRequests: configuration.labFlags.contains("source-log")
+                )
                 let localBaseURL = try await proxy.start()
                 ffmpegArguments = proxy.rewrite(arguments: ffmpegArguments, localBaseURL: localBaseURL)
                 sourceProxy = proxy
@@ -682,14 +690,6 @@ actor WorkerClient {
                 arguments: activeFFmpegArguments
             )
         }
-    }
-
-    /// 申报给 NAS 的取源选项。走取源代理时只要「不倒着读估时长」：「探测阶段按块要」那一对
-    /// 由代理按块向 NAS 取代替了，再让 ffmpeg 按块向回环口要只是多几次本机请求。
-    private var declaredReadOptions: [String] {
-        if configuration.labFlags.contains("no-read-options") { return [] }
-        if configuration.labFlags.contains("no-source-proxy") { return capabilities.readOptions }
-        return capabilities.readOptions.filter { $0 == "skip_estimate_duration_from_pts" }
     }
 
     /// 把这一轮还没发出去的分段计时发给 NAS（见 ``JobTimeline``）。没有新内容就不发。
