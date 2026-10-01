@@ -32,6 +32,29 @@ export const FREEZE_FRAME_MAX_WIDTH = 960;
  * 抓不到帧的正常情况：还没出过画（readyState < HAVE_CURRENT_DATA）、
  * 上一次换流已经把流摘掉了、浏览器不给 2d 上下文。都不是错误，静默返回。
  */
+/**
+ * 冻结帧画布的平均亮度（0～255），缩到 16×8 再算，几十微秒。读不出像素（跨源污染等）为 null。
+ *
+ * 用来认出「抓到的是一张黑图」：iPhone Safari 的原生 HLS（HDR）上 drawImage 可能画出全黑，
+ * 盖上去用户看到的就是黑屏（2026-10-02 真机排查，见 video-player 的 freeze-trace 日志）。
+ */
+export function meanBrightness(canvas: HTMLCanvasElement): number | null {
+  try {
+    const scratch = document.createElement("canvas");
+    scratch.width = 16;
+    scratch.height = 8;
+    const ctx = scratch.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(canvas, 0, 0, 16, 8);
+    const px = ctx.getImageData(0, 0, 16, 8).data;
+    let sum = 0;
+    for (let i = 0; i < px.length; i += 4) sum += px[i] + px[i + 1] + px[i + 2];
+    return Math.round(sum / (px.length / 4) / 3);
+  } catch {
+    return null;
+  }
+}
+
 export function captureFrame(video: HTMLVideoElement, canvas: HTMLCanvasElement): boolean {
   const width = video.videoWidth;
   const height = video.videoHeight;

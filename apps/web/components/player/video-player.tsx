@@ -60,6 +60,7 @@ import {
   canReleaseFreeze,
   captureFrame,
   drawTile,
+  meanBrightness,
 } from "@/lib/player/freeze-frame";
 import {
   planSystemTrackModes,
@@ -559,6 +560,17 @@ export function VideoPlayer(props: VideoPlayerProps) {
    */
   const freezeHoldRef = useRef<number | null>(null);
   /**
+   * 原生 HLS 跳转时冻结帧的现场（真机黑屏排查，2026-10-02）：抓到的帧亮度、缩略图多久盖上、
+   * 多久撤掉。撤的时候作为 freeze-trace 客户端日志报上去；其它引擎不记。
+   */
+  const freezeTraceRef = useRef<{
+    startedAt: number;
+    captured: boolean;
+    captureMean: number | null;
+    hasTile: boolean;
+    tileMs: number | null;
+  } | null>(null);
+  /**
    * 松手提交时元素还在为跟随的 seek 忙着、落点又不是同一个：提交的落点
    * （会话秒数）先记在这儿，等元素落地再发。**同一时刻元素上最多只有一次
    * seek 在途**是 §19.5 的规矩——两次叠在一起，浏览器会把上一次正在取的索引
@@ -603,11 +615,22 @@ export function VideoPlayer(props: VideoPlayerProps) {
       const token = freezeTokenRef.current + 1;
       freezeTokenRef.current = token;
       freezeHoldRef.current = null;
-      if (captureFrame(video, canvas)) setFrozen(true);
+      const captured = captureFrame(video, canvas);
+      if (captured) setFrozen(true);
 
       // 走 ref 读 trickplay：把它写进依赖会让 freezeFrame 在索引加载完成时
       // 换掉身份，而挂引擎那个 effect 依赖它——那就是一次无谓的销毁重挂流。
       const tile = targetFileMs === undefined ? null : tileAt(trickplayRef.current, targetFileMs);
+      freezeTraceRef.current =
+        engineLabelRef.current === "native-hls"
+          ? {
+              startedAt: performance.now(),
+              captured,
+              captureMean: captured ? meanBrightness(canvas) : null,
+              hasTile: tile !== null,
+              tileMs: null,
+            }
+          : null;
       if (!tile) return;
       const cache = sheetCacheRef.current;
       let image = cache.get(tile.url);
@@ -627,7 +650,11 @@ export function VideoPlayer(props: VideoPlayerProps) {
       const paint = () => {
         // 过期的那张不能画：这几十毫秒里可能已经撤了冻结、或者又跳了一次
         if (freezeTokenRef.current !== token) return;
-        if (drawTile(canvas, image, tile)) setFrozen(true);
+        if (drawTile(canvas, image, tile)) {
+          setFrozen(true);
+          const trace = freezeTraceRef.current;
+          if (trace && trace.tileMs === null) trace.tileMs = Math.round(performance.now() - trace.startedAt);
+        }
       };
       if (image.complete) paint();
       else image.addEventListener("load", paint, { once: true });
@@ -647,6 +674,23 @@ export function VideoPlayer(props: VideoPlayerProps) {
    */
   useEffect(() => {
     if (!frozen || !video) return;
+    const reportTrace = (timedOut: boolean) => {
+      const trace = freezeTraceRef.current;
+      freezeTraceRef.current = null;
+      if (!trace) return;
+      reportPlaybackClientLog(
+        "freeze-trace",
+        {
+          ...trace,
+          startedAt: undefined,
+          releaseMs: Math.round(performance.now() - trace.startedAt),
+          timedOut,
+          readyState: video.readyState,
+          paused: video.paused,
+        },
+        apiRef.current,
+      );
+    };
     const release = () => {
       // 松手提交还排在在途 seek 后面：这一刻落地的是**跟随**的位置，盖着的是
       // 落点的缩略图，撤了就先露一帧别处的画面、再黑一下才到落点。等提交发出去
@@ -661,6 +705,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
         })
       ) {
         freezeHoldRef.current = null;
+        reportTrace(false);
         // 递增 token 让在途的缩略图作废：晚到的那张不能把已经出画的画面
         // 重新盖回去（远跳时雪碧图与首帧常常是前后脚到）
         freezeTokenRef.current += 1;
@@ -669,7 +714,10 @@ export function VideoPlayer(props: VideoPlayerProps) {
     };
     const events = ["seeked", "playing", "canplay", "timeupdate"] as const;
     for (const event of events) video.addEventListener(event, release);
-    const timer = window.setTimeout(() => setFrozen(false), FREEZE_FRAME_MAX_MS);
+    const timer = window.setTimeout(() => {
+      reportTrace(true);
+      setFrozen(false);
+    }, FREEZE_FRAME_MAX_MS);
     return () => {
       for (const event of events) video.removeEventListener(event, release);
       window.clearTimeout(timer);
