@@ -865,6 +865,19 @@ export function VideoPlayer(props: VideoPlayerProps) {
       }, 180);
     }, 2600);
   }, []);
+  /**
+   * 落到错误页 / 同意弹窗就立即收起提示：「连接中断，正在重连…」这类过程提示若等计时器自己
+   * 收，会和「服务器上找不到这个文件」同屏打架两三秒（NAS 实测 direct-404）。
+   */
+  useEffect(() => {
+    if (!awaitsUserDecision(state.phase)) return;
+    const timers = noticeTimersRef.current;
+    if (timers.hide !== null) window.clearTimeout(timers.hide);
+    if (timers.gone !== null) window.clearTimeout(timers.gone);
+    timers.hide = null;
+    timers.gone = null;
+    setNotice(null);
+  }, [state.phase]);
 
   /** 卸载时清掉各组反馈计时器，别让它们对着已卸载的组件 setState。 */
   useEffect(
