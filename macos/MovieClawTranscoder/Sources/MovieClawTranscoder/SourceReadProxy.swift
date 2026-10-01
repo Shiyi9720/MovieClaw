@@ -249,6 +249,10 @@ final class SourceReadProxy: @unchecked Sendable {
     static let firstRunBlocks = 1
     static let runGrowth = 4
     static let maxRunBlocks = 32
+    /// 送出这么多块之后才开始预取。回环口两头的缓冲能吞下约两块（实测 512 KiB），「送出」不等于
+    /// ffmpeg 读了；二分查找每一步要读 0.5～1 MB（凑够一帧视频），读完就跳走，过早预取的
+    /// 4 + 8 MB 全白取，还跟下一步抢带宽。送出 6 块时 ffmpeg 至少读走了 1 MB，是真在顺序读。
+    static let defaultPrefetchAfterBlocks = 6
     /// 一个请求顺序读过这么多之后取的块算「过路」（转码主读），记进过路块的份额
     static let defaultTransientAfterBytes: Int64 = 16 * 1024 * 1024
 
@@ -288,6 +292,9 @@ final class SourceReadProxy: @unchecked Sendable {
     let origin: URL
     let cache: SourceBlockCache
     let transientAfterBytes: Int64
+    /// 逐请求记日志（实验开关 source-log）：起点、交给 ffmpeg 多少、等了网络多久
+    let logRequests: Bool
+    let prefetchAfterBlocks: Int
     private let queue: DispatchQueue
     private let listener: NWListener
     private let lock = NSLock()
@@ -301,12 +308,16 @@ final class SourceReadProxy: @unchecked Sendable {
         jobID: String,
         origin: URL,
         cache: SourceBlockCache = .shared,
-        transientAfterBytes: Int64 = SourceReadProxy.defaultTransientAfterBytes
+        transientAfterBytes: Int64 = SourceReadProxy.defaultTransientAfterBytes,
+        prefetchAfterBlocks: Int = SourceReadProxy.defaultPrefetchAfterBlocks,
+        logRequests: Bool = false
     ) throws {
+        self.prefetchAfterBlocks = prefetchAfterBlocks
         self.jobID = jobID
         self.origin = origin
         self.cache = cache
         self.transientAfterBytes = transientAfterBytes
+        self.logRequests = logRequests
         queue = DispatchQueue(label: "com.movieclaw.transcoder.source.\(jobID)")
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: 0)!)
@@ -629,6 +640,18 @@ private final class SourceConnection: @unchecked Sendable {
             return
         }
         proxy.record { $0.requests += 1 }
+        let began = Date()
+        var outcome = "完成"
+        defer {
+            if proxy.logRequests {
+                let offset = request.rangeStart.map { String(format: "%.1f MB", Double($0) / 1_048_576) } ?? "整个"
+                AppLogger.shared.info(
+                    "取源请求：job=\(proxy.jobID) 起点=\(offset) 送出=\(trace.sentBytes / 1024) KB " +
+                        "用时=\(Int(Date().timeIntervalSince(began) * 1000)) ms 等网络=\(trace.waitedMS) ms（\(trace.waits) 次）" +
+                        " 命中=\(trace.hits) 块 预取=\(trace.prefetches) 次 结束=\(outcome)"
+                )
+            }
+        }
         do {
             if let start = request.rangeStart {
                 try await serveRange(proxy: proxy, url: url, start: start, end: request.rangeEnd)
@@ -650,8 +673,11 @@ private final class SourceConnection: @unchecked Sendable {
             )
         } catch is ClientGone {
             // ffmpeg 跳读走了（关了连接），正常情况
+            outcome = "对方断开"
         } catch is CancellationError {
+            outcome = "对方断开"
         } catch {
+            outcome = "出错"
             // 响应头还没发就回 502；已经在送了就直接断开，ffmpeg 按断线续读从断点重新要
             AppLogger.shared.warning("取源代理向 NAS 取数失败：\(error.localizedDescription)")
             try? await respond(status: 502, reason: "Bad Gateway")
@@ -660,6 +686,17 @@ private final class SourceConnection: @unchecked Sendable {
 
     /// 回写 ffmpeg 失败：它已经关了这条连接。
     private struct ClientGone: Error {}
+
+    /// 一个请求的经过（实验开关 source-log 时写日志）
+    private struct Trace {
+        var sentBytes: Int64 = 0
+        var waits = 0
+        var waitedMS = 0
+        var hits = 0
+        var prefetches = 0
+    }
+
+    private var trace = Trace()
 
     private var headerSent = false
 
@@ -686,15 +723,24 @@ private final class SourceConnection: @unchecked Sendable {
         func load(_ index: Int) async throws -> Data {
             held.removeAll { $0.first + $0.count <= index }
             for run in held where run.covers(index) {
-                if let data = await run.block(index) { return data }
+                if let data = await run.block(index) {
+                    trace.hits += 1
+                    return data
+                }
             }
-            if let data = await cache.cached(resource, index) { return data }
+            if let data = await cache.cached(resource, index) {
+                trace.hits += 1
+                return data
+            }
             guard let run = await cache.run(resource, index: index, count: run, transient: isTransient(index), fetch: fetch) else {
                 return try await load(index)
             }
             held.append(run)
             grow()
+            let waitStarted = Date()
             _ = try await run.task.value
+            trace.waits += 1
+            trace.waitedMS += Int(Date().timeIntervalSince(waitStarted) * 1000)
             guard let data = await run.block(index) else { throw URLError(.badServerResponse) }
             return data
         }
@@ -739,12 +785,13 @@ private final class SourceConnection: @unchecked Sendable {
         var index = firstIndex
         while true {
             try Task.checkCancellation()
-            // 预取：ffmpeg 已经读到第二块往后（顺序读），下一个缺的块在这一段之内就提前去取
-            if index > firstIndex,
+            // 预取：ffmpeg 确实在顺序往下读（见 defaultPrefetchAfterBlocks），下一个缺的块在这一段之内就提前去取
+            if index >= firstIndex + proxy.prefetchAfterBlocks,
                let next = await nextMissing(from: index + 1, limit: min(lastBlock + 1, index + 1 + run))
             {
                 if let ahead = await cache.run(resource, index: next, count: run, transient: isTransient(next), fetch: fetch) {
                     held.append(ahead)
+                    trace.prefetches += 1
                 }
                 grow()
             }
@@ -753,6 +800,7 @@ private final class SourceConnection: @unchecked Sendable {
             let to = min(data.endIndex, data.startIndex + Int(last - blockStart) + 1)
             guard from < to else { throw URLError(.badServerResponse) }
             try await send(Data(data[from..<to]))
+            trace.sentBytes += Int64(to - from)
             proxy.record { $0.blocksServed += 1 }
             position += Int64(to - from)
             guard position <= last else { return }
