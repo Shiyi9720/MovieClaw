@@ -614,6 +614,11 @@ async def _rescan_later(library_id: int, delay: float) -> None:
     # 这一轮只为接住刚写完的新文件；历史规格补探必须由用户主动扫描触发，
     # 否则下载期间一次短暂的 mtime 波动也会重新扫到整库未补探的旧文件。
     await scan_library(library_id, backfill_existing_specs=False)
+    # 暂缓的新文件这轮终于入账了：同样要识别片头片尾（docs/design/skip-intro.md），
+    # 这条路径不经过扫描作业，扫描作业收尾的那个挂钩够不着
+    from movieclaw_api.services.library.skip_segments import enqueue_after_library_change
+
+    await enqueue_after_library_change(library_id)
 
 
 def last_scan(library_id: int) -> tuple | None:

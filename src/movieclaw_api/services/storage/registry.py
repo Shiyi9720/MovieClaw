@@ -103,8 +103,10 @@ async def _existing_ids(model_name: str) -> set[int]:
 
     model = getattr(models, model_name)
     async with get_database().session() as session:
-        rows = await session.exec(select(model.id))
-        return {int(i) for i in rows.all() if i is not None}
+        # get_database().session() 给的是 SQLAlchemy 的 AsyncSession，没有 SQLModel 才有的 .exec；
+        # 以前这里写 .exec，「清理孤儿」在真数据库上一律 500（测试把本函数整个替身了，没测到）
+        rows = await session.execute(select(model.id))
+        return {int(i) for i in rows.scalars().all() if i is not None}
 
 
 def _orphans_by_id(model_name: str) -> EntryProbe:

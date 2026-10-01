@@ -34,6 +34,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,8 +74,15 @@ _DETECT_BASE_TIMEOUT_S = 120.0
 _DETECT_TIMEOUT_PER_EPISODE_S = 6.0
 #: 开播后等多久再排作业：让开起播的关键窗口
 _BUMP_DELAY_S = 20.0
-#: 整库回填遇到有人在看片时，每隔多久再看一眼人走了没有
-_QUIET_POLL_S = 10.0
+#: 整库回填遇到有人在看片时，每隔多久再看一眼人走了没有（也是取消请求的响应间隔）
+_QUIET_POLL_S = 3.0
+#: 播放会话 / 转码会话多久没有动静就不再算「有人在看」：播放器每 10 秒左右上报一次进度或心跳，
+#: 45 秒 = 连丢三个周期。浏览器被直接杀掉、App 崩了不会发「停止」，不设这个窗口会让回填白等好几分钟
+_FRESH_S = 45.0
+#: 开播提队 / 入库触发的条目作业一次最多读几个文件（其余留给整库回填，它会为在看的人让路）。
+#: 这类作业本身不让路——入库读的是刚下载好的本地文件、开播提队本来就是因为有人开播——
+#: 但整季可能有一大堆没算的旧集，不设上限就会为一集新片把整个积压从 NAS 上读一遍
+PRIORITY_BATCH = 6
 
 # ---------------------------------------------------------------------------
 # 能力探测与并发槽
@@ -141,18 +149,19 @@ def _niced(args: list[str]) -> list[str]:
 
 
 def playback_active() -> bool:
-    """现在有没有人在看片：有未暂停的播放会话、有仍在服务的取流、或有转码会话在跑。
+    """现在有没有人在看片：有未暂停且近期有动静的播放会话、有仍在服务的取流、或有近期有心跳的转码会话。
 
     数据来自进程内的播放活动注册表（播放器进度上报 + 取流字节计量，Web / iOS / Jellyfin
     客户端都汇到这里）。整库回填据此让路——它连续几个小时顺序读片库所在的磁盘 / 网络，
     和正在播的片子抢的是同一份 IO，而「播放不被打扰」比「识别早一小时完成」重要得多。
     """
+    now = time.monotonic()
     sessions, meters = activity.snapshot()
     if any(m.kind == activity.STREAM_KIND_PLAY for m in meters):
+        return True  # 正在往外发字节，一定在看
+    if any(not s.paused and now - s.last_activity_mono <= _FRESH_S for s in sessions):
         return True
-    if any(not session.paused for session in sessions):
-        return True
-    return bool(get_session_manager().active())
+    return any(now - t.last_ping <= _FRESH_S for t in get_session_manager().active())
 
 
 async def _wait_until_quiet(context: jobs.JobContext) -> None:
@@ -441,20 +450,30 @@ async def analyze_season(
     *,
     context: jobs.JobContext | None = None,
     polite: bool = False,
+    max_new: int | None = None,
+    prefer_episode: int | None = None,
 ) -> SeasonOutcome:
     """把一季做完：补齐缺的指纹，再整季识别一遍（有新指纹或结果过期时）。
 
     每个文件的指纹单独提交——作业中途被取消、服务重启，已经算好的不会白算。
     ``polite``：每个文件开读前，有人在看片就先等（整库回填用，见 ``_wait_until_quiet``）。
+    ``max_new``：这次最多新算几个指纹（``PRIORITY_BATCH``），多出来的留给整库回填；挑哪几个：
+    给了 ``prefer_episode`` 就先挑离它最近的集（开播提队：在看第 N 集，先把 N 附近的算出来），
+    否则先挑最新入库的（入库触发）。识别照样用已有的全部指纹做，只是积压的旧集要等回填。
     """
     db = get_database()
     outcome = SeasonOutcome()
     async with db.session() as session:
         rows = await _season_files(session, media_item_id, season_number)
     outcome.files = len(rows)
-    for file, state in rows:
-        if not _fingerprint_due(file, state):
-            continue
+    due = [(file, state) for file, state in rows if _fingerprint_due(file, state)]
+    if max_new is not None and len(due) > max_new:
+        if prefer_episode is not None:
+            due.sort(key=lambda fs: abs(int(fs[0].episode_number or 0) - prefer_episode))
+        else:
+            due.sort(key=lambda fs: fs[0].created_at, reverse=True)
+        due = due[: max(max_new, 0)]
+    for file, _ in due:
         if context is not None:
             await context.raise_if_cancelled()
             if polite:
@@ -578,12 +597,12 @@ def schedule_playback_bump(file: LibraryFile) -> None:
     except RuntimeError:
         return
     _bump_pending.add(key)
-    task = loop.create_task(_bump(*key))
+    task = loop.create_task(_bump(*key, int(file.episode_number)))
     _bump_tasks.add(task)
     task.add_done_callback(_bump_tasks.discard)
 
 
-async def _bump(media_item_id: int, season_number: int) -> None:
+async def _bump(media_item_id: int, season_number: int, episode_number: int) -> None:
     try:
         await asyncio.sleep(_BUMP_DELAY_S)
         if not await fingerprint_supported():
@@ -599,7 +618,12 @@ async def _bump(media_item_id: int, season_number: int) -> None:
             item = await session.get(MediaItem, media_item_id)
             title = item.title if item is not None else f"条目 #{media_item_id}"
             await enqueue_item_job(
-                session, media_item_id, title, season_number=season_number, priority=0
+                session,
+                media_item_id,
+                title,
+                season_number=season_number,
+                episode_number=episode_number,
+                priority=0,
             )
     except Exception:  # noqa: BLE001 —— 锦上添花，绝不影响播放
         logger.warning("开播时排片头片尾识别失败（条目 #%s）", media_item_id, exc_info=True)
@@ -646,6 +670,7 @@ async def enqueue_item_job(
     title: str,
     *,
     season_number: int | None = None,
+    episode_number: int | None = None,
     priority: int = -5,
     origin: str = "system",
 ) -> jobs.CreateJobResult:
@@ -657,7 +682,11 @@ async def enqueue_item_job(
         session,
         job_type=ITEM_JOB_TYPE,
         subject=title,
-        input_data={"media_item_id": media_item_id, "season_number": season_number},
+        input_data={
+            "media_item_id": media_item_id,
+            "season_number": season_number,
+            "episode_number": episode_number,
+        },
         resources=[jobs.ResourceRef("media_item", media_item_id)],
         dedupe_key=f"{ITEM_JOB_TYPE}:{media_item_id}",
         conflict_policy="return_existing",
@@ -669,12 +698,13 @@ async def enqueue_item_job(
     )
 
 
-async def enqueue_after_library_change(library_id: int) -> bool:
-    """库里有新文件落账之后排一份整库补缺，返回是否入队。
+async def enqueue_after_library_change(library_id: int, *, origin: str = "system") -> bool:
+    """库里的文件有变动之后，有活才排一份整库补缺，返回是否入队。
 
-    两个入口共用：扫描作业收尾（含定期对账），以及**监听触发的增量扫描**——后者直接
-    调 ``scan_library`` 不经过扫描作业，手工把文件拷进库目录的用户不该等到下一轮对账
-    才有片头。库没开开关 / 不是剧集库 / ffmpeg 不支持时什么都不做。
+    三个扫描入口共用：扫描作业收尾（含定期对账）、监听触发的增量扫描、暂缓文件的补扫——
+    后两者直接调 ``scan_library`` 不经过扫描作业，手工把文件拷进库目录的用户不该等到下一轮
+    对账才有片头。库没开开关 / 不是剧集库 / ffmpeg 不支持 / 没有待办的季时什么都不做：
+    没活就不排，免得任务中心每次扫描后多一条「处理 0 季」的空记录。
     """
     async with get_database().session() as session:
         library = await session.get(Library, library_id)
@@ -682,7 +712,9 @@ async def enqueue_after_library_change(library_id: int) -> bool:
             return False
         if not await fingerprint_supported():
             return False
-        await enqueue_library_job(session, library_id, library.name)
+        if not await seasons_needing_work(session, library_id=library_id):
+            return False
+        await enqueue_library_job(session, library_id, library.name, origin=origin)
     return True
 
 
@@ -729,9 +761,10 @@ async def apply_library_switch(
                 reason=f"「{library.name}」已关闭「识别片头片尾」，未完成的识别随之取消",
             )
         return
-    if rescan_queued or not await fingerprint_supported():
+    if rescan_queued:
         return
-    await enqueue_library_job(session, library.id, library.name, origin=origin)
+    # 有待办的季才排（打开开关后库里没有要补的就不留一条空记录）
+    await enqueue_after_library_change(library.id, origin=origin)
 
 
 #: 一个作业最多连查几轮「还有没有新活」：防止某个季反复出新活时作业永远收不了尾
@@ -744,8 +777,12 @@ async def _run_seasons(
     *,
     subject: str,
     polite: bool = False,
+    budget: int | None = None,
+    prefer_episode: int | None = None,
 ) -> dict[str, Any]:
     """逐季处理的公共循环（整库与条目作业共用）。断点天然：做完的季不再是「有活要干」。
+
+    ``budget``：整个作业最多新算几个指纹（条目作业传 ``PRIORITY_BATCH``，整库回填不限）。
 
     做完一轮后**再查一次**还有没有活：同库 / 同条目已有作业在跑时，后来的排队请求会被
     ``return_existing`` 并进这一个作业——如果它只按开跑时那一刻的清单做，作业运行期间
@@ -754,11 +791,21 @@ async def _run_seasons(
     stats = {"seasons": 0, "fingerprinted": 0, "failed": 0, "errors": 0}
     errored: set[tuple[int, int]] = set()
     for _ in range(_MAX_ROUNDS):
+        if budget is not None and stats["fingerprinted"] + stats["failed"] >= budget:
+            break
         async with get_database().session() as session:
             seasons = [key for key in await find(session) if key not in errored]
         if not seasons:
             break
-        await _run_round(context, seasons, stats, errored, polite=polite)
+        await _run_round(
+            context,
+            seasons,
+            stats,
+            errored,
+            polite=polite,
+            budget=budget,
+            prefer_episode=prefer_episode,
+        )
     logger.info("%s的片头片尾识别完成：%s", subject, stats)
     return stats
 
@@ -770,12 +817,24 @@ async def _run_round(
     errored: set[tuple[int, int]],
     *,
     polite: bool,
+    budget: int | None,
+    prefer_episode: int | None,
 ) -> None:
     total = len(seasons)
     for index, (item_id, season) in enumerate(seasons, start=1):
         await context.raise_if_cancelled()
+        left = None if budget is None else budget - stats["fingerprinted"] - stats["failed"]
+        if left is not None and left <= 0:
+            break
         try:
-            outcome = await analyze_season(item_id, season, context=context, polite=polite)
+            outcome = await analyze_season(
+                item_id,
+                season,
+                context=context,
+                polite=polite,
+                max_new=left,
+                prefer_episode=prefer_episode,
+            )
         except (jobs.JobCancelled, asyncio.CancelledError):
             raise
         except Exception:  # noqa: BLE001 —— 一季出错不打断整批
@@ -842,6 +901,7 @@ async def _run_library_job(context: jobs.JobContext, input_data: dict[str, Any])
 async def _run_item_job(context: jobs.JobContext, input_data: dict[str, Any]) -> dict[str, Any]:
     media_item_id = int(input_data["media_item_id"])
     season = input_data.get("season_number")
+    episode = input_data.get("episode_number")
     if not await fingerprint_supported():
         return {"message": _UNSUPPORTED}
 
@@ -852,5 +912,34 @@ async def _run_item_job(context: jobs.JobContext, input_data: dict[str, Any]) ->
             season_number=int(season) if season is not None else None,
         )
 
-    stats = await _run_seasons(context, find, subject=f"条目 #{media_item_id}")
+    stats = await _run_seasons(
+        context,
+        find,
+        subject=f"条目 #{media_item_id}",
+        budget=PRIORITY_BATCH,
+        prefer_episode=int(episode) if episode is not None else None,
+    )
+    # 积压没做完的交给整库回填（它会为在看片的人让路）：按条目所在的库各排一份
+    async with get_database().session() as session:
+        left = await seasons_needing_work(session, media_item_id=media_item_id)
+        library_ids = (
+            sorted(
+                {
+                    int(i)
+                    for i in (
+                        await session.execute(
+                            select(LibraryFile.library_id).where(
+                                LibraryFile.media_item_id == media_item_id
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                }
+            )
+            if left
+            else []
+        )
+    for library_id in library_ids:
+        await enqueue_after_library_change(library_id)
     return {"message": _summary(stats), **stats}

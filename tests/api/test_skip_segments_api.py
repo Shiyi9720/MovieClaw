@@ -491,3 +491,141 @@ def test_enqueue_after_library_change_respects_switch_and_kind(
     # 同库重复触发并进同一个作业，不排第二份
     assert call(client, skip_segments.enqueue_after_library_change, ids["tv"]) is True
     assert len(call(client, _active_jobs)) <= 1
+
+
+def test_cache_panel_cleans_orphan_fingerprints_against_real_database(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """缓存管理面板的「清理孤儿」在真数据库上走通：只删没有对应文件的指纹，正常的原样保留。
+
+    这条路径以前在真数据库上一律 500（孤儿判定查主键时用了 AsyncSession 没有的 .exec），
+    单测又把判定整个替身了，所以一直没人发现。
+    """
+    ids = call(client, _seed, tmp_path)
+    call(client, skip_segments.analyze_season, ids["show"], 1)
+    fp_dir = tmp_path / "fp"
+    (fp_dir / "99999.fp").write_bytes(b"orphan")
+    before = sorted(p.name for p in fp_dir.glob("*.fp"))
+    assert "99999.fp" in before and len(before) == 6
+    resp = client.post(
+        "/api/v1/app/storage/cache.audio_fingerprints/clean", json={"mode": "orphans"}
+    )
+    assert resp.status_code == 200, resp.text
+    after = sorted(p.name for p in fp_dir.glob("*.fp"))
+    assert after == [n for n in before if n != "99999.fp"]
+    # 用量快照是后台统计的：先触发一次，再轮询到统计结果出来
+    client.get("/api/v1/app/storage?refresh=1")
+    usage = None
+    for _ in range(50):
+        usage = client.get("/api/v1/app/storage").json()["data"]["usage"]
+        if usage is not None:
+            break
+        time.sleep(0.2)
+    assert usage is not None, "用量统计一直没出结果"
+    mine = next(d for d in usage["dirs"] if d["key"] == "cache.audio_fingerprints")
+    assert mine["clearable"] is True and mine["rebuild_cost"] == "expensive"
+    assert mine["orphan_aware"] is True and mine["entries"] == 5
+    unregistered = [u["path"] for u in usage["unregistered"]]
+    assert not any("audio-fingerprints" in path for path in unregistered), unregistered
+    # 全部清空：识别结果仍在（会话照常下发），只是缓存没了
+    resp = client.post("/api/v1/app/storage/cache.audio_fingerprints/clean", json={"mode": "all"})
+    assert resp.status_code == 200, resp.text
+    assert list(fp_dir.glob("*.fp")) == []
+    assert len(start_session(client, ids["files"][0])["segments"]) == 2
+
+
+def test_priority_job_is_bounded_and_hands_backlog_to_polite_backfill(
+    client: TestClient, tmp_path: Path, monkeypatch
+) -> None:
+    """入库 / 开播提队的条目作业不让路，所以一次最多读 PRIORITY_BATCH 个文件，先读离在看那一集近的；
+    整季积压的旧集留给整库回填（它会为在看片的人让路），而不是为一集新片把整个积压读一遍。"""
+    ids = call(client, _seed, tmp_path, 8)
+    monkeypatch.setattr(skip_segments, "PRIORITY_BATCH", 4)
+    ctx = _Ctx()
+    # 在看第 8 集：先算离它最近的 4 集（5、6、7、8）
+    result = call(
+        client,
+        skip_segments._run_item_job,
+        ctx,
+        {"media_item_id": ids["show"], "season_number": 1, "episode_number": 8},
+    )
+    assert result["fingerprinted"] == 4
+    states = call(client, _states)
+    done = sorted(n for n, file_id in enumerate(ids["files"], start=1) if file_id in states)
+    assert done == [5, 6, 7, 8], done
+    # 有了 4 集的指纹就能识别：最近的这几集已经带上片段，积压的旧集还没有
+    assert {s["type"] for s in states[ids["files"][7]].segments} == {"intro", "outro"}
+    assert ids["files"][0] not in states
+
+    async def _library_jobs() -> list[str]:
+        async with get_database().session() as session:
+            rows = await jobs.list_jobs(
+                session, active_only=True, job_type=skip_segments.LIBRARY_JOB_TYPE
+            )
+            return [str(r.status) for r in rows]
+
+    assert call(client, _library_jobs), "积压要交给整库回填（排出一份会让路的整库作业）"
+    # 整库回填把剩下的补完
+    call(client, skip_segments._run_library_job, ctx, {"library_id": ids["tv"]})
+    states = call(client, _states)
+    assert len(states) == 8 and all(s.analyzed_at is not None for s in states.values())
+
+
+def test_ingest_style_priority_job_takes_newest_first(
+    client: TestClient, tmp_path: Path, monkeypatch
+) -> None:
+    ids = call(client, _seed, tmp_path, 6)
+    monkeypatch.setattr(skip_segments, "PRIORITY_BATCH", 3)
+
+    # 没有「在看哪一集」时先读最新入库的（入库触发）：给第 2、4、6 集一个更新的入库时间
+    async def _touch_created() -> None:
+        from datetime import timedelta
+
+        async with get_database().session() as session:
+            for rank, n in enumerate((2, 4, 6), start=1):
+                row = await session.get(LibraryFile, ids["files"][n - 1])
+                row.created_at = row.created_at + timedelta(hours=rank)
+                session.add(row)
+            await session.commit()
+
+    call(client, _touch_created)
+    call(
+        client,
+        skip_segments._run_item_job,
+        _Ctx(),
+        {"media_item_id": ids["show"], "season_number": None, "episode_number": None},
+    )
+    done = sorted(n for n, fid in enumerate(ids["files"], start=1) if fid in call(client, _states))
+    assert done == [2, 4, 6], done
+
+
+def test_stale_clients_do_not_count_as_watching(client: TestClient, tmp_path: Path) -> None:
+    """浏览器被直接杀掉 / App 崩了不会发「停止」：会话超过新鲜窗口没有动静就不再算在看，
+    回填不用白等好几分钟。暂停中的、从没动静的都不算。"""
+    ids = call(client, _seed, tmp_path)
+    device = ClientInfo(name="测试播放器", device_id="dev-fresh")
+    unit = (ids["show"], 1, 1)
+
+    async def scenario():
+        import time as _time
+
+        activity.reset()
+        assert not skip_segments.playback_active()
+        activity.report_progress(
+            "dev-fresh", member_id=0, client=device, unit=unit, position_ms=1000, paused=False
+        )
+        assert skip_segments.playback_active(), "刚上报过进度的未暂停会话算在看"
+        activity.report_progress(
+            "dev-fresh", member_id=0, client=device, unit=unit, position_ms=1000, paused=True
+        )
+        assert not skip_segments.playback_active(), "暂停了不算"
+        activity.report_progress(
+            "dev-fresh", member_id=0, client=device, unit=unit, position_ms=2000, paused=False
+        )
+        assert skip_segments.playback_active()
+        # 上报停了 60 秒：浏览器没了
+        activity.current("dev-fresh").last_activity_mono = _time.monotonic() - 60
+        assert not skip_segments.playback_active(), "超过新鲜窗口没动静就不算在看"
+        activity.reset()
+
+    call(client, scenario)
