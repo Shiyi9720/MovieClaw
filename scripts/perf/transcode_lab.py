@@ -120,7 +120,9 @@ class Api:
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
 
     def login(self, user: str, password: str) -> None:
-        self.call("POST", "/api/v1/auth/login", {"username": user, "password": password, "remember": True})
+        self.call(
+            "POST", "/api/v1/auth/login", {"username": user, "password": password, "remember": True}
+        )
 
     def call(self, method: str, path: str, body: dict | None = None, timeout: float = 30) -> dict:
         data = json.dumps(body).encode() if body is not None else None
@@ -138,7 +140,11 @@ class Api:
             try:
                 return json.loads(payload)
             except ValueError:
-                return {"success": False, "status": error.code, "message": payload[:200].decode(errors="replace")}
+                return {
+                    "success": False,
+                    "status": error.code,
+                    "message": payload[:200].decode(errors="replace"),
+                }
 
     def cookie_header(self) -> str:
         return "; ".join(f"{c.name}={c.value}" for c in self.jar)
@@ -162,8 +168,15 @@ def login_from_env() -> Api:
 
 def nas_python(code: str, *args: str, timeout: float = 60) -> str:
     """在 NAS 的应用容器里跑一段 Python（经 stdin 传入，免去层层转义）。"""
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST,
-               f"{DOCKER} exec -i {CONTAINER} python3 - " + " ".join(args)]
+    command = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        SSH_HOST,
+        f"{DOCKER} exec -i {CONTAINER} python3 - " + " ".join(args),
+    ]
     result = subprocess.run(command, input=code, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(f"NAS 脚本失败：{result.stderr.strip()[-400:]}")
@@ -172,8 +185,15 @@ def nas_python(code: str, *args: str, timeout: float = 60) -> str:
 
 def nas_logs(since_epoch: float) -> str:
     since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(since_epoch)) + "Z"
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST,
-               f"{DOCKER} logs --since {since} {CONTAINER} 2>&1"]
+    command = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        SSH_HOST,
+        f"{DOCKER} logs --since {since} {CONTAINER} 2>&1",
+    ]
     result = subprocess.run(command, capture_output=True, text=True, timeout=120)
     return result.stdout
 
@@ -182,8 +202,9 @@ _CORPUS_QUERY = r"""
 import json, sqlite3
 c = sqlite3.connect("file:/app/data/movieclaw.db?mode=ro", uri=True)
 rows = c.execute('''
-  select f.id, f.media_item_id, f.season_number, f.episode_number, f.container, f.resolution, f.video_codec,
-         coalesce(f.hdr, ''), f.bit_depth, f.bit_rate, f.duration_seconds, f.frame_rate, f.file_path,
+  select f.id, f.media_item_id, f.season_number, f.episode_number, f.container,
+         f.resolution, f.video_codec, coalesce(f.hdr, ''), f.bit_depth, f.bit_rate,
+         f.duration_seconds, f.frame_rate, f.file_path,
          f.size_bytes, length(coalesce(f.subtitle_streams, ''))
   from library_file f join library l on l.id = f.library_id
   -- 只取电影 / 剧集库：实验会在活动页、播放记录里留下片名
@@ -223,14 +244,57 @@ def purge_cache(file_ids: list[int]) -> int:
 #: (类别, 判据, 每类取几部)。按片库里实际多的格式排，覆盖转码链路的几条分支：
 #: GPU 全链路（缩放 + 色调映射）、长 GOP 高码率、尾部 moov 的 MP4、字幕轨多的 MKV、原盘
 CATEGORIES: list[tuple[str, Any]] = [
-    ("4k-hdr10-mkv", lambda r: r["container"] == "mkv" and r["resolution"] == "2160p" and r["codec"] == "hevc" and r["hdr"] == "HDR10"),
-    ("4k-dv-mkv", lambda r: r["container"] == "mkv" and r["resolution"] == "2160p" and r["hdr"] == "Dolby Vision"),
-    ("4k-dv-mp4", lambda r: r["container"] == "mp4" and r["resolution"] == "2160p" and r["hdr"] == "Dolby Vision"),
-    ("4k-sdr-mp4", lambda r: r["container"] == "mp4" and r["resolution"] == "2160p" and r["codec"] == "hevc" and not r["hdr"]),
-    ("4k-h264-mkv", lambda r: r["container"] == "mkv" and r["resolution"] == "2160p" and r["codec"] == "h264"),
-    ("1080-h264-mkv", lambda r: r["container"] == "mkv" and r["resolution"] == "1080p" and r["codec"] == "h264"),
-    ("1080-h264-mp4", lambda r: r["container"] == "mp4" and r["resolution"] == "1080p" and r["codec"] == "h264"),
-    ("1080-hevc10-mkv", lambda r: r["container"] == "mkv" and r["resolution"] == "1080p" and r["codec"] == "hevc" and r["bit_depth"] == 10),
+    (
+        "4k-hdr10-mkv",
+        lambda r: (
+            r["container"] == "mkv"
+            and r["resolution"] == "2160p"
+            and r["codec"] == "hevc"
+            and r["hdr"] == "HDR10"
+        ),
+    ),
+    (
+        "4k-dv-mkv",
+        lambda r: (
+            r["container"] == "mkv" and r["resolution"] == "2160p" and r["hdr"] == "Dolby Vision"
+        ),
+    ),
+    (
+        "4k-dv-mp4",
+        lambda r: (
+            r["container"] == "mp4" and r["resolution"] == "2160p" and r["hdr"] == "Dolby Vision"
+        ),
+    ),
+    (
+        "4k-sdr-mp4",
+        lambda r: (
+            r["container"] == "mp4"
+            and r["resolution"] == "2160p"
+            and r["codec"] == "hevc"
+            and not r["hdr"]
+        ),
+    ),
+    (
+        "4k-h264-mkv",
+        lambda r: r["container"] == "mkv" and r["resolution"] == "2160p" and r["codec"] == "h264",
+    ),
+    (
+        "1080-h264-mkv",
+        lambda r: r["container"] == "mkv" and r["resolution"] == "1080p" and r["codec"] == "h264",
+    ),
+    (
+        "1080-h264-mp4",
+        lambda r: r["container"] == "mp4" and r["resolution"] == "1080p" and r["codec"] == "h264",
+    ),
+    (
+        "1080-hevc10-mkv",
+        lambda r: (
+            r["container"] == "mkv"
+            and r["resolution"] == "1080p"
+            and r["codec"] == "hevc"
+            and r["bit_depth"] == 10
+        ),
+    ),
     ("uhd-bluray", lambda r: r["container"] == "bluray" and r["resolution"] == "2160p"),
     ("hlg-ts", lambda r: r["container"] == "ts" and r["hdr"] == "HLG"),
 ]
@@ -238,9 +302,24 @@ CATEGORIES: list[tuple[str, Any]] = [
 
 def build_corpus(args: argparse.Namespace) -> None:
     raw = json.loads(nas_python(_CORPUS_QUERY))
-    keys = ["file_id", "media_item_id", "season", "episode", "container", "resolution", "codec", "hdr",
-            "bit_depth", "bit_rate", "duration", "fps", "path", "size", "subtitle_json_len"]
-    rows = [dict(zip(keys, row)) for row in raw]
+    keys = [
+        "file_id",
+        "media_item_id",
+        "season",
+        "episode",
+        "container",
+        "resolution",
+        "codec",
+        "hdr",
+        "bit_depth",
+        "bit_rate",
+        "duration",
+        "fps",
+        "path",
+        "size",
+        "subtitle_json_len",
+    ]
+    rows = [dict(zip(keys, row, strict=True)) for row in raw]
     rng = random.Random(args.seed)
     picked: list[dict] = []
     for category, match, *_ in CATEGORIES:
@@ -257,13 +336,15 @@ def build_corpus(args: argparse.Namespace) -> None:
                 break
         for index, row in enumerate(chosen):
             height = 1080 if row["resolution"] == "2160p" else 720
-            picked.append({
-                **{k: row[k] for k in keys if k != "path"},
-                "name": Path(row["path"]).name,
-                "category": category,
-                "max_height": height,
-                "quick": index == 0,
-            })
+            picked.append(
+                {
+                    **{k: row[k] for k in keys if k != "path"},
+                    "name": Path(row["path"]).name,
+                    "category": category,
+                    "max_height": height,
+                    "quick": index == 0,
+                }
+            )
         log(f"{category}: 候选 {len(candidates)} 部，取 {len(chosen)} 部")
     CORPUS_PATH.parent.mkdir(parents=True, exist_ok=True)
     CORPUS_PATH.write_text(json.dumps(picked, ensure_ascii=False, indent=1))
@@ -322,21 +403,34 @@ class LabProxy:
 
         self.loop.run_until_complete(main())
 
-    def _record(self, method: str, target: str, status: int, size: int, t_req: int, t_first: int,
-                t_done: int, aborted: bool = False) -> None:
+    def _record(
+        self,
+        method: str,
+        target: str,
+        status: int,
+        size: int,
+        t_req: int,
+        t_first: int,
+        t_done: int,
+        aborted: bool = False,
+    ) -> None:
         with self.lock:
-            self.records.append({
-                "method": method,
-                "path": target.split("?", 1)[0],
-                "status": status,
-                "bytes": size,
-                "t_req": t_req,
-                "t_first": t_first,
-                "t_done": t_done,
-                "aborted": aborted,
-            })
+            self.records.append(
+                {
+                    "method": method,
+                    "path": target.split("?", 1)[0],
+                    "status": status,
+                    "bytes": size,
+                    "t_req": t_req,
+                    "t_first": t_first,
+                    "t_done": t_done,
+                    "aborted": aborted,
+                }
+            )
 
-    async def _handle(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter) -> None:
+    async def _handle(
+        self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
+    ) -> None:
         upstream_reader = upstream_writer = None
         prefix = b""
 
@@ -421,7 +515,16 @@ class LabProxy:
                     close_after = True
                 if gone(eof_task):
                     # 收到一半客户端走了：记成中途放弃
-                    self._record(method, target, status, size, t_req, t_first, time.monotonic_ns(), aborted=True)
+                    self._record(
+                        method,
+                        target,
+                        status,
+                        size,
+                        t_req,
+                        t_first,
+                        time.monotonic_ns(),
+                        aborted=True,
+                    )
                     return
                 if eof_task.done() and not eof_task.cancelled():
                     prefix = eof_task.result()  # 下一个请求的头一个字节已经被读走了
@@ -505,8 +608,12 @@ def build_probe() -> Path:
     if not binary.exists() or binary.stat().st_mtime < PROBE_SRC.stat().st_mtime:
         binary.parent.mkdir(parents=True, exist_ok=True)
         log("编译探针 …")
-        subprocess.run(["swiftc", "-O", str(PROBE_SRC), "-o", str(binary)], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["swiftc", "-O", str(PROBE_SRC), "-o", str(binary)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     return binary
 
 
@@ -554,8 +661,16 @@ def scenario_plan(entry: dict, scenario: str) -> tuple[int, list[dict]]:
     ]
 
 
-def run_one(api: Api, probe: Probe, proxy: LabProxy, entry: dict, scenario: str, args: argparse.Namespace,
-            base: str, round_index: int) -> dict:
+def run_one(
+    api: Api,
+    probe: Probe,
+    proxy: LabProxy,
+    entry: dict,
+    scenario: str,
+    args: argparse.Namespace,
+    base: str,
+    round_index: int,
+) -> dict:
     waited = wait_idle(api, args.expect_worker)
     purged = purge_cache([entry["file_id"]]) if not args.keep_cache else 0
     start_ms, seeks = scenario_plan(entry, scenario)
@@ -577,10 +692,19 @@ def run_one(api: Api, probe: Probe, proxy: LabProxy, entry: dict, scenario: str,
     probe.send({"cmd": "warm", "base": base})
     probe.expect("warm", 30)
     proxy.drain()
-    probe.send({
-        "cmd": "run", "id": run_id, "base": base, "cookie": api.cookie_header(), "body": body,
-        "mode": args.mode, "seeks": seeks, "tail": 4, "timeout": args.timeout,
-    })
+    probe.send(
+        {
+            "cmd": "run",
+            "id": run_id,
+            "base": base,
+            "cookie": api.cookie_header(),
+            "body": body,
+            "mode": args.mode,
+            "seeks": seeks,
+            "tail": 4,
+            "timeout": args.timeout,
+        }
+    )
     session = probe.expect("session", 60)
     session_id = session.get("session_id")
     tier, backend = session.get("tier"), session.get("hw_backend")
@@ -592,9 +716,12 @@ def run_one(api: Api, probe: Probe, proxy: LabProxy, entry: dict, scenario: str,
     done = probe.expect("done", args.timeout * 4 + 120)
     if session_id and valid:
         token = (session.get("master_url") or "").partition("token=")[2]
-        diagnostics = api.call(
-            "GET", f"/api/v1/playback/sessions/{session_id}/diagnostics?token={token}"
-        ).get("data") or {}
+        diagnostics = (
+            api.call(
+                "GET", f"/api/v1/playback/sessions/{session_id}/diagnostics?token={token}"
+            ).get("data")
+            or {}
+        )
         api.call("DELETE", f"/api/v1/playback/sessions/{session_id}")
         if diagnostics.get("worker_id") != args.expect_worker:
             valid = False
@@ -615,11 +742,23 @@ def run_one(api: Api, probe: Probe, proxy: LabProxy, entry: dict, scenario: str,
         "valid": valid,
         "session": session,
         "result": done.get("result", {}),
-        "diagnostics": {k: diagnostics.get(k) for k in (
-            "worker_id", "worker_version", "ffmpeg_version", "encoder", "cache_hit", "cached_segments",
-            "job_speed", "job_state", "highest_produced_segment", "recent_uploads", "processing_mode",
-            "timeline",
-        )},
+        "diagnostics": {
+            k: diagnostics.get(k)
+            for k in (
+                "worker_id",
+                "worker_version",
+                "ffmpeg_version",
+                "encoder",
+                "cache_hit",
+                "cached_segments",
+                "job_speed",
+                "job_state",
+                "highest_produced_segment",
+                "recent_uploads",
+                "processing_mode",
+                "timeline",
+            )
+        },
         "requests": requests,
     }
     record["metrics"] = compute_metrics(record)
@@ -677,13 +816,23 @@ def server_breakdown(timeline: list[dict]) -> dict[str, Any]:
     first: dict[str, int] = {}
     for entry in sorted(timeline, key=lambda e: e["t"]):
         name = entry["ev"]
-        if name in ("landed", "put", "w_recv", "w_up", "w_seg_open") and entry.get("name", "").startswith("seg"):
+        if name in ("landed", "put", "w_recv", "w_up", "w_seg_open") and entry.get(
+            "name", ""
+        ).startswith("seg"):
             name = f"{name}_seg"
         first.setdefault(name, entry["t"])
     keys = {
-        "dispatch": "t_dispatch", "accepted": "t_accepted", "src": "t_src", "src_first": "t_src_first",
-        "w_ffmpeg": "t_w_ffmpeg", "w_input": "t_w_input", "w_init_open": "t_w_init",
-        "w_seg_open_seg": "t_w_seg", "put_seg": "t_put_seg", "landed_seg": "t_landed_seg", "served": "t_served",
+        "dispatch": "t_dispatch",
+        "accepted": "t_accepted",
+        "src": "t_src",
+        "src_first": "t_src_first",
+        "w_ffmpeg": "t_w_ffmpeg",
+        "w_input": "t_w_input",
+        "w_init_open": "t_w_init",
+        "w_seg_open_seg": "t_w_seg",
+        "put_seg": "t_put_seg",
+        "landed_seg": "t_landed_seg",
+        "served": "t_served",
     }
     return {label: first[event] for event, label in keys.items() if event in first}
 
@@ -714,30 +863,42 @@ class WorkerBlocker:
         self.api = api
         self.worker_id = worker_id
         row = json.loads(nas_python(_BLOCKER_QUERY, ",".join(map(str, excluded))))
-        self.file = {"file_id": row[0], "media_item_id": row[1], "season": row[2], "episode": row[3]}
+        self.file = {
+            "file_id": row[0],
+            "media_item_id": row[1],
+            "season": row[2],
+            "episode": row[3],
+        }
         self.session_id: str | None = None
         self.stop_event = threading.Event()
 
     def start(self) -> None:
         for _ in range(3):
             wait_idle(self.api, self.worker_id)
-            response = self.api.call("POST", "/api/v1/playback/sessions", {
-                "file_id": self.file["file_id"],
-                "media_item_id": self.file["media_item_id"],
-                "season_number": self.file["season"],
-                "episode_number": self.file["episode"],
-                "capability": AVPLAYER_CAPABILITY,
-                "max_height": 720,
-                "start_ms": 60_000,
-                "subtitle_track": "off",
-                "device_id": f"{DEVICE_ID}-blocker",
-            })
+            response = self.api.call(
+                "POST",
+                "/api/v1/playback/sessions",
+                {
+                    "file_id": self.file["file_id"],
+                    "media_item_id": self.file["media_item_id"],
+                    "season_number": self.file["season"],
+                    "episode_number": self.file["episode"],
+                    "capability": AVPLAYER_CAPABILITY,
+                    "max_height": 720,
+                    "start_ms": 60_000,
+                    "subtitle_track": "off",
+                    "device_id": f"{DEVICE_ID}-blocker",
+                },
+            )
             data = response.get("data") or {}
             self.session_id = data.get("session_id")
             token = (data.get("master_url") or "").partition("token=")[2]
-            diagnostics = self.api.call(
-                "GET", f"/api/v1/playback/sessions/{self.session_id}/diagnostics?token={token}"
-            ).get("data") or {}
+            diagnostics = (
+                self.api.call(
+                    "GET", f"/api/v1/playback/sessions/{self.session_id}/diagnostics?token={token}"
+                ).get("data")
+                or {}
+            )
             if diagnostics.get("worker_id") == self.worker_id:
                 log(f"已占住 Worker {self.worker_id}（会话 {self.session_id}）")
                 threading.Thread(target=self._keepalive, daemon=True).start()
@@ -768,22 +929,46 @@ def run_batch(args: argparse.Namespace) -> None:
     health = api.call("GET", "/api/v1/health")
     workers = worker_status(api)
     meta = {
-        "tag": args.tag, "started": time.time(), "server": SERVER, "link": args.link, "mode": args.mode,
-        "scenarios": args.scenarios, "rounds": args.rounds, "expect_worker": args.expect_worker,
-        "spec_hash": health.get("spec_hash"), "worker": workers.get(args.expect_worker),
-        "files": [e["file_id"] for e in entries], "note": args.note,
+        "tag": args.tag,
+        "started": time.time(),
+        "server": SERVER,
+        "link": args.link,
+        "mode": args.mode,
+        "scenarios": args.scenarios,
+        "rounds": args.rounds,
+        "expect_worker": args.expect_worker,
+        "spec_hash": health.get("spec_hash"),
+        "worker": workers.get(args.expect_worker),
+        "files": [e["file_id"] for e in entries],
+        "note": args.note,
     }
     (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
-    upstream_host, upstream_port = SERVER.split("//", 1)[1].split(":")[0], int(SERVER.rsplit(":", 1)[1])
+    upstream_host, upstream_port = (
+        SERVER.split("//", 1)[1].split(":")[0],
+        int(SERVER.rsplit(":", 1)[1]),
+    )
     netem = None
     if args.link != "lan":
         link = LINKS[args.link]
         netem_port = args.proxy_port + 1
-        netem = subprocess.Popen([
-            sys.executable, str(NETEM), "--listen", f"127.0.0.1:{netem_port}",
-            "--upstream", f"{upstream_host}:{upstream_port}", "--rtt-ms", str(link["rtt_ms"]),
-            "--down-mbps", str(link["down_mbps"]), "--up-mbps", str(link["up_mbps"]),
-        ], stdout=(out / "netem.log").open("w"), stderr=subprocess.STDOUT)
+        netem = subprocess.Popen(
+            [
+                sys.executable,
+                str(NETEM),
+                "--listen",
+                f"127.0.0.1:{netem_port}",
+                "--upstream",
+                f"{upstream_host}:{upstream_port}",
+                "--rtt-ms",
+                str(link["rtt_ms"]),
+                "--down-mbps",
+                str(link["down_mbps"]),
+                "--up-mbps",
+                str(link["up_mbps"]),
+            ],
+            stdout=(out / "netem.log").open("w"),
+            stderr=subprocess.STDOUT,
+        )
         time.sleep(1)
         upstream = ("127.0.0.1", netem_port)
     else:
@@ -798,7 +983,10 @@ def run_batch(args: argparse.Namespace) -> None:
         blocker.start()
     scenarios = args.scenarios.split(",")
     results_path = out / "results.jsonl"
-    log(f"批次 {out.name}：{len(entries)} 部 × {len(scenarios)} 场景 × {args.rounds} 轮，线路 {args.link}")
+    log(
+        f"批次 {out.name}：{len(entries)} 部 × {len(scenarios)} 场景 × {args.rounds} 轮，"
+        f"线路 {args.link}"
+    )
     session_ids: list[str] = []
     try:
         for round_index in range(args.rounds):
@@ -806,9 +994,11 @@ def run_batch(args: argparse.Namespace) -> None:
             random.Random(f"{args.seed}-{round_index}").shuffle(order)
             for entry in order:
                 for scenario in scenarios:
-                    for attempt in range(3):
+                    for _attempt in range(3):
                         try:
-                            record = run_one(api, probe, proxy, entry, scenario, args, base, round_index)
+                            record = run_one(
+                                api, probe, proxy, entry, scenario, args, base, round_index
+                            )
                         except (TimeoutError, queue.Empty) as error:
                             log(f"  {entry['name'][:40]} {scenario}: 超时（{error}），重启探针")
                             probe.close()
@@ -831,15 +1021,23 @@ def run_batch(args: argparse.Namespace) -> None:
         if netem:
             netem.terminate()
         logs = nas_logs(meta["started"] - 5)
-        wanted = [line for line in logs.splitlines() if any(sid in line for sid in session_ids)
-                  or "远程" in line or "Worker" in line]
+        wanted = [
+            line
+            for line in logs.splitlines()
+            if any(sid in line for sid in session_ids) or "远程" in line or "Worker" in line
+        ]
         (out / "nas.log").write_text("\n".join(wanted))
         log(f"结果 → {out}")
 
 
 def print_line(record: dict) -> None:
     m = record["metrics"]
-    parts = [f"r{record['round']}", record["scenario"], f"{record['category']:<15}", record["name"][:28]]
+    parts = [
+        f"r{record['round']}",
+        record["scenario"],
+        f"{record['category']:<15}",
+        record["name"][:28],
+    ]
     for key in ("first_frame_ms", "seek_fwd_ms", "seek_back_ms", "seek_in_ms"):
         if m.get(key) is not None:
             parts.append(f"{key.replace('_ms', '')}={m[key]:.0f}")
@@ -848,7 +1046,10 @@ def print_line(record: dict) -> None:
     if m.get("stall_count"):
         parts.append(f"stall={m['stall_count']}/{m['stall_ms']:.0f}ms")
     if not record["valid"]:
-        parts.append(f"无效(tier={record['session'].get('tier')} worker={record['diagnostics'].get('worker_id')})")
+        parts.append(
+            f"无效(tier={record['session'].get('tier')} "
+            f"worker={record['diagnostics'].get('worker_id')})"
+        )
     log("  " + " ".join(parts))
 
 
@@ -885,10 +1086,17 @@ def summarize(rows: list[dict]) -> dict[str, dict[str, float]]:
     table: dict[str, dict[str, float]] = {}
     for key, _ in REPORT_METRICS:
         for scenario in sorted({r["scenario"] for r in rows}):
-            values = [r["metrics"][key] for r in rows if r["scenario"] == scenario and r["metrics"].get(key) is not None]
+            values = [
+                r["metrics"][key]
+                for r in rows
+                if r["scenario"] == scenario and r["metrics"].get(key) is not None
+            ]
             if values:
                 table[f"{scenario}.{key}"] = {
-                    "n": len(values), "p50": statistics.median(values), "p90": pct(values, 0.9), "max": max(values),
+                    "n": len(values),
+                    "p50": statistics.median(values),
+                    "p90": pct(values, 0.9),
+                    "max": max(values),
                 }
     return table
 
@@ -900,16 +1108,23 @@ def report(args: argparse.Namespace) -> None:
         print(f"\n== {name}（有效 {len(rows)} 次）")
         for key, value in summarize(rows).items():
             label = dict(REPORT_METRICS)[key.split(".", 1)[1]]
-            print(f"  {key.split('.')[0]:<7}{label:<6} n={value['n']:<3} p50={value['p50']:>7.0f}  "
-                  f"p90={value['p90']:>7.0f}  max={value['max']:>7.0f}")
+            print(
+                f"  {key.split('.')[0]:<7}{label:<6} n={value['n']:<3} p50={value['p50']:>7.0f}  "
+                f"p90={value['p90']:>7.0f}  max={value['max']:>7.0f}"
+            )
         if args.by_category:
             for category in sorted({r["category"] for r in rows}):
                 subset = [r for r in rows if r["category"] == category]
                 cells = []
                 for key in ("first_frame_ms", "seek_fwd_ms", "seek_back_ms"):
-                    values = [r["metrics"][key] for r in subset if r["metrics"].get(key) is not None]
+                    values = [
+                        r["metrics"][key] for r in subset if r["metrics"].get(key) is not None
+                    ]
                     if values:
-                        cells.append(f"{key.split('_')[0] if key.startswith('first') else key[5:-3]}={statistics.median(values):.0f}")
+                        cells.append(
+                            f"{'first' if key.startswith('first') else key[5:-3]}="
+                            f"{statistics.median(values):.0f}"
+                        )
                 print(f"    {category:<16} " + " ".join(cells))
     if len(batches) == 2:
         (name_a, rows_a), (name_b, rows_b) = batches
@@ -919,26 +1134,37 @@ def report(args: argparse.Namespace) -> None:
             diffs = []
             for row in rows_b:
                 other = index_a.get((row["file_id"], row["scenario"], row["round"]))
-                if other and row["metrics"].get(key) is not None and other["metrics"].get(key) is not None:
+                if (
+                    other
+                    and row["metrics"].get(key) is not None
+                    and other["metrics"].get(key) is not None
+                ):
                     diffs.append(row["metrics"][key] - other["metrics"][key])
             if diffs:
                 faster = sum(1 for d in diffs if d < 0)
-                print(f"  {label:<6} 配对 {len(diffs):<3} 差值中位 {statistics.median(diffs):+7.0f} 毫秒  "
-                      f"变快 {faster}/{len(diffs)}")
+                print(
+                    f"  {label:<6} 配对 {len(diffs):<3} "
+                    f"差值中位 {statistics.median(diffs):+7.0f} 毫秒  "
+                    f"变快 {faster}/{len(diffs)}"
+                )
 
 
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     corpus = sub.add_parser("corpus", help="从 NAS 片库挑语料")
     corpus.add_argument("--per-category", type=int, default=2)
     corpus.add_argument("--seed", type=int, default=20261001)
     run = sub.add_parser("run", help="跑一批")
     run.add_argument("--tag", required=True, help="这一批的组名（对照时区分各组）")
-    run.add_argument("--expect-worker", required=True, help="应当接单的 Worker ID；不是它接的单作废")
+    run.add_argument(
+        "--expect-worker", required=True, help="应当接单的 Worker ID；不是它接的单作废"
+    )
     run.add_argument("--files", default="all", help="all / quick / 逗号分隔的 file_id 或类别")
     run.add_argument("--scenarios", default="resume,head")
     run.add_argument("--rounds", type=int, default=1)
@@ -946,11 +1172,15 @@ def main() -> None:
     run.add_argument("--link", choices=sorted(LINKS), default="lan")
     run.add_argument("--timeout", type=float, default=30, help="等首帧 / 单次跳转出画的上限（秒）")
     run.add_argument("--gap", type=float, default=1.5, help="两次播放之间歇几秒")
-    run.add_argument("--keep-cache", action="store_true", help="不清 NAS 上的转码缓存（量缓存命中）")
+    run.add_argument(
+        "--keep-cache", action="store_true", help="不清 NAS 上的转码缓存（量缓存命中）"
+    )
     run.add_argument("--proxy-port", type=int, default=18700)
     run.add_argument("--seed", default="lab")
     run.add_argument("--note", default="")
-    run.add_argument("--block-worker", default="", help="实验期间占住这台 Worker，让任务落到另一台上")
+    run.add_argument(
+        "--block-worker", default="", help="实验期间占住这台 Worker，让任务落到另一台上"
+    )
     rep = sub.add_parser("report", help="汇总 / 对照")
     rep.add_argument("dirs", nargs="+")
     rep.add_argument("--by-category", action="store_true")

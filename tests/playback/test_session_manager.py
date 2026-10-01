@@ -2195,3 +2195,25 @@ async def test_remote_disc_session_reads_ffconcat_and_follows_worker_caps(manage
     )
     assert "-pix_fmt" not in args
     assert await manager.stop(session.id) is True
+
+
+@pytest.mark.asyncio
+async def test_progressive_segment_is_handed_out_once_its_first_fragment_lands(manager, tmp_path):
+    """边产出边送：能边收边解的客户端不等整段，第一个片段到了就拿到正在写的分片；
+    整段请求（hls.js）照旧等正式分片。"""
+    session = _vod_session(tmp_path, head=5, completed=set())
+    session.remote = True
+    session.remote_job_id = "job-a"
+    session.progressive = True
+    session.partials[5] = session_mod.PartialSegment(
+        index=5, path=tmp_path / ".seg00005.m4s.partial", job="job-a", size=1024, next_part=1
+    )
+    manager._sessions[session.id] = session
+    got = await manager.ensure_segment(session, 5, allow_partial=True)
+    assert isinstance(got, session_mod.PartialSegment)
+    served = [e for e in session.timeline if e["ev"] == "served"]
+    assert served and served[-1].get("partial") is True
+
+    # 上一轮写的半截不给（seek 重启后它会被新一轮重写）
+    session.partials[5].job = "job-old"
+    assert manager._streamable_partial(session, 5) is None
