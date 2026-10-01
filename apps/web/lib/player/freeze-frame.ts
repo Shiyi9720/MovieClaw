@@ -101,9 +101,29 @@ export function drawTile(
  * 定义，正是我们等的那件事。`seeking` 要一并排除——跳转途中 readyState 可能
  * 还留着旧值，这时撤会露出一瞬间的黑，等于白冻。
  */
-export function canReleaseFreeze(input: { seeking: boolean; readyState: number }): boolean {
-  return !input.seeking && input.readyState >= 2;
+export function canReleaseFreeze(input: {
+  seeking: boolean;
+  readyState: number;
+  /**
+   * 原生 HLS 跳转时要撑到的落点（秒，元素时间轴）；null / 不传 = 不额外等。
+   *
+   * Safari 的原生 HLS（AVPlayer）报 `seeked`、readyState 也达标时，新位置的画面常常还没
+   * 上屏：模拟器里真 iOS Safari 实测这段空窗 0.1～1.1 秒，真机上是黑的——按通用判据一撤，
+   * 等于把黑屏亮给用户（2026-10-01「拖动后黑屏」）。播放中就等播放头真的走过落点再撤；
+   * 暂停着播放头不会走，照通用判据。
+   */
+  holdUntilS?: number | null;
+  paused?: boolean;
+  currentTime?: number;
+}): boolean {
+  if (input.seeking || input.readyState < 2) return false;
+  const hold = input.holdUntilS;
+  if (hold == null || input.paused) return true;
+  return (input.currentTime ?? 0) >= hold + NATIVE_FREEZE_PROGRESS_S;
 }
+
+/** 原生 HLS 跳转后播放头走过落点多少秒，才算新画面真的在走（约 3 帧，躲开时间读数的抖动） */
+export const NATIVE_FREEZE_PROGRESS_S = 0.05;
 
 /**
  * 冻结帧的兜底时限（毫秒）。

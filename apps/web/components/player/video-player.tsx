@@ -554,6 +554,11 @@ export function VideoPlayer(props: VideoPlayerProps) {
    */
   const freezeTokenRef = useRef(0);
   /**
+   * 原生 HLS 跳转时冻结帧要撑到的落点（元素秒数），见 freeze-frame.ts 的 canReleaseFreeze。
+   * 每次冻结先清空，只有跳转那条路在冻完之后再设上；null = 照通用判据撤。
+   */
+  const freezeHoldRef = useRef<number | null>(null);
+  /**
    * 松手提交时元素还在为跟随的 seek 忙着、落点又不是同一个：提交的落点
    * （会话秒数）先记在这儿，等元素落地再发。**同一时刻元素上最多只有一次
    * seek 在途**是 §19.5 的规矩——两次叠在一起，浏览器会把上一次正在取的索引
@@ -597,6 +602,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
       if (!video || !canvas) return;
       const token = freezeTokenRef.current + 1;
       freezeTokenRef.current = token;
+      freezeHoldRef.current = null;
       if (captureFrame(video, canvas)) setFrozen(true);
 
       // 走 ref 读 trickplay：把它写进依赖会让 freezeFrame 在索引加载完成时
@@ -645,7 +651,16 @@ export function VideoPlayer(props: VideoPlayerProps) {
       // 松手提交还排在在途 seek 后面：这一刻落地的是**跟随**的位置，盖着的是
       // 落点的缩略图，撤了就先露一帧别处的画面、再黑一下才到落点。等提交发出去
       if (pendingCommitRef.current !== null) return;
-      if (canReleaseFreeze({ seeking: video.seeking, readyState: video.readyState })) {
+      if (
+        canReleaseFreeze({
+          seeking: video.seeking,
+          readyState: video.readyState,
+          holdUntilS: freezeHoldRef.current,
+          paused: video.paused,
+          currentTime: video.currentTime,
+        })
+      ) {
+        freezeHoldRef.current = null;
         // 递增 token 让在途的缩略图作废：晚到的那张不能把已经出画的画面
         // 重新盖回去（远跳时雪碧图与首帧常常是前后脚到）
         freezeTokenRef.current += 1;
@@ -2282,6 +2297,10 @@ export function VideoPlayer(props: VideoPlayerProps) {
     if (!video) return;
     const tracker = createFrameDropTracker();
     const videoIsCopy = state.session?.decision.video?.action === "copy";
+    // 原生 HLS 不判「直通放不动」：AVPlayer 的掉帧数按访问日志粗粒度、滞后地更新，还把跳转时
+    // 从关键帧解到落点、没上屏的那些帧算进去——模拟器里实测把能放的流误判成 26% 掉帧，
+    // 白白切回了更卡的 hls.js。掉帧数照样进播放记录和诊断面板，只是不拿它做决定
+    const nativeHls = mode?.engine === "native-hls";
     const onVisibility = () => tracker.reset();
     const onSeeking = () => tracker.reset();
     document.addEventListener("visibilitychange", onVisibility);
@@ -2291,7 +2310,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
       const stats = engineRef.current?.stats();
       if (stats?.totalFrames == null || stats.droppedFrames == null) return;
       qoe({ type: "frames", dropped: stats.droppedFrames, total: stats.totalFrames });
-      if (!videoIsCopy || document.visibilityState !== "visible" || video.paused) return;
+      if (!videoIsCopy || nativeHls || document.visibilityState !== "visible" || video.paused) return;
       // 长按倍速时浏览器按音频节奏主动丢帧跟上，掉帧是预期内的，不能判成「直通放不动」
       // （iOS 真机实测一按倍速 3 秒就被判掉帧、白白换成了转码）
       if (video.playbackRate !== 1) {
@@ -2313,7 +2332,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
       document.removeEventListener("visibilitychange", onVisibility);
       video.removeEventListener("seeking", onSeeking);
     };
-  }, [video, qoe, state.session]);
+  }, [video, qoe, state.session, mode?.engine]);
 
   /**
    * 进度条缩略图：服务端在开会话时后台生成，这里轮询到就绪为止。
@@ -2833,7 +2852,14 @@ export function VideoPlayer(props: VideoPlayerProps) {
         // 看着像卡了一下。
         // 带上落点：远跳盖的是**落点的缩略图**而不是上一帧，这一跳视觉上
         // 当场就落地（§2.G4）。
-        if (!isWithinRanges(video.buffered, seconds)) freezeFrame(fileMs);
+        // 原生 HLS（iPhone 的 HEVC）例外：缓冲之内也冻，而且要撑到播放头真的走过
+        // 落点——AVPlayer 报跳转完成时新画面常常还没上屏，这段空窗在真机上是黑的
+        // （理由与实测见 freeze-frame.ts 的 canReleaseFreeze）。
+        const nativeHls = mode?.engine === "native-hls";
+        if (nativeHls || !isWithinRanges(video.buffered, seconds)) {
+          freezeFrame(fileMs);
+          if (nativeHls) freezeHoldRef.current = seconds;
+        }
         // 拖动跟随已经为这个落点发了 seek（或早已停在这儿）就不再叠一次：
         // 第二次 seek 会把第一次正在取的索引/数据请求掐掉，浏览器退回顺序扫描
         // ——这正是「松手后画面停在原地、圆点不动」的来路（§19.5）。seek 途中
@@ -3027,7 +3053,10 @@ export function VideoPlayer(props: VideoPlayerProps) {
    * 「手指停住才跟」。转码会话拖出缓冲绝不跟——那是杀 ffmpeg 重启。
    */
   const canScrubFollow = useCallback(
-    (fileMs: number) => mode?.engine === "direct" || isCheapSeek(fileMs),
+    // 原生 HLS（iPhone 的 HEVC）拖动中不跟：AVPlayer 每跳一次都有一段没画面的空窗，
+    // 一秒几次地跟就是一路闪黑。拖的时候看进度条上的缩略图预览，松手再跳
+    (fileMs: number) =>
+      mode?.engine !== "native-hls" && (mode?.engine === "direct" || isCheapSeek(fileMs)),
     [mode, isCheapSeek],
   );
   const canScrubFollowRef = useRef(canScrubFollow);
