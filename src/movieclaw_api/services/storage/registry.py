@@ -207,6 +207,23 @@ DATA_DIRS: tuple[DataDir, ...] = (
         busy=_fonts_with_staging,
     ),
     DataDir(
+        key="cache.audio_fingerprints",
+        title="片头片尾指纹",
+        summary="剧集每一集开头与结尾的声音指纹，用来认出片头片尾",
+        description=(
+            "识别片头片尾时，每集开头 10 分钟、结尾 7 分钟的声音会被算成一份很小的指纹"
+            "（一集约 33 KB），同一季的指纹互相比对就能认出片头片尾。清空后已经认出的片头片尾"
+            "不受影响，播放照常给「跳过片头」；但之后这一季再来新集时，要把旧集重新读一遍"
+            "（每集约 6 秒、几百 MB 的读取），所以只建议在磁盘紧张时清理。"
+        ),
+        default="data/cache/audio-fingerprints",
+        resolve=lambda s: Path(s.audio_fingerprint_dir),
+        group=Group.CACHE,
+        rebuild_cost=RebuildCost.EXPENSIVE,
+        clearable=True,
+        orphans=_orphans_by_id("LibraryFile"),
+    ),
+    DataDir(
         key="cache.reels",
         title="刷片挑点",
         summary="刷片为每个文件挑出的片段位置",
