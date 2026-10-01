@@ -34,6 +34,7 @@ import logging
 import os
 import shutil
 import sys
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -668,6 +669,23 @@ async def enqueue_item_job(
     )
 
 
+async def enqueue_after_library_change(library_id: int) -> bool:
+    """库里有新文件落账之后排一份整库补缺，返回是否入队。
+
+    两个入口共用：扫描作业收尾（含定期对账），以及**监听触发的增量扫描**——后者直接
+    调 ``scan_library`` 不经过扫描作业，手工把文件拷进库目录的用户不该等到下一轮对账
+    才有片头。库没开开关 / 不是剧集库 / ffmpeg 不支持时什么都不做。
+    """
+    async with get_database().session() as session:
+        library = await session.get(Library, library_id)
+        if library is None or library.kind != "tv" or not library.detect_media_segments:
+            return False
+        if not await fingerprint_supported():
+            return False
+        await enqueue_library_job(session, library_id, library.name)
+    return True
+
+
 async def enqueue_ingested_item(
     session: AsyncSession, library: Library | None, media_item_id: int, title: str
 ) -> bool:
@@ -716,16 +734,44 @@ async def apply_library_switch(
     await enqueue_library_job(session, library.id, library.name, origin=origin)
 
 
+#: 一个作业最多连查几轮「还有没有新活」：防止某个季反复出新活时作业永远收不了尾
+_MAX_ROUNDS = 5
+
+
 async def _run_seasons(
     context: jobs.JobContext,
-    seasons: list[tuple[int, int]],
+    find: Callable[[AsyncSession], Awaitable[list[tuple[int, int]]]],
     *,
     subject: str,
     polite: bool = False,
 ) -> dict[str, Any]:
-    """逐季处理的公共循环（整库与条目作业共用）。断点天然：做完的季不再是「有活要干」。"""
-    total = len(seasons)
+    """逐季处理的公共循环（整库与条目作业共用）。断点天然：做完的季不再是「有活要干」。
+
+    做完一轮后**再查一次**还有没有活：同库 / 同条目已有作业在跑时，后来的排队请求会被
+    ``return_existing`` 并进这一个作业——如果它只按开跑时那一刻的清单做，作业运行期间
+    新落位的集就会被漏到下一次触发。出错的季本轮不再重试（否则会原地打转）。
+    """
     stats = {"seasons": 0, "fingerprinted": 0, "failed": 0, "errors": 0}
+    errored: set[tuple[int, int]] = set()
+    for _ in range(_MAX_ROUNDS):
+        async with get_database().session() as session:
+            seasons = [key for key in await find(session) if key not in errored]
+        if not seasons:
+            break
+        await _run_round(context, seasons, stats, errored, polite=polite)
+    logger.info("%s的片头片尾识别完成：%s", subject, stats)
+    return stats
+
+
+async def _run_round(
+    context: jobs.JobContext,
+    seasons: list[tuple[int, int]],
+    stats: dict[str, Any],
+    errored: set[tuple[int, int]],
+    *,
+    polite: bool,
+) -> None:
+    total = len(seasons)
     for index, (item_id, season) in enumerate(seasons, start=1):
         await context.raise_if_cancelled()
         try:
@@ -734,6 +780,7 @@ async def _run_seasons(
             raise
         except Exception:  # noqa: BLE001 —— 一季出错不打断整批
             stats["errors"] += 1
+            errored.add((item_id, season))
             logger.exception("条目 #%s 第 %s 季的片头片尾识别出错", item_id, season)
         else:
             stats["seasons"] += 1
@@ -749,8 +796,6 @@ async def _run_seasons(
                 percent=round(index * 100 / total, 1) if total else 100.0,
                 details=dict(stats),
             )
-    logger.info("%s的片头片尾识别完成：%s", subject, stats)
-    return stats
 
 
 def _summary(stats: dict[str, Any]) -> str:
@@ -785,8 +830,11 @@ async def _run_library_job(context: jobs.JobContext, input_data: dict[str, Any])
             return {"message": f"「{library.name}」没有打开片头片尾识别，本次未处理"}
         if not await fingerprint_supported():
             return {"message": _UNSUPPORTED}
-        seasons = await seasons_needing_work(session, library_id=library_id)
-    stats = await _run_seasons(context, seasons, subject=f"媒体库 #{library_id}", polite=True)
+
+    async def find(session: AsyncSession) -> list[tuple[int, int]]:
+        return await seasons_needing_work(session, library_id=library_id)
+
+    stats = await _run_seasons(context, find, subject=f"媒体库 #{library_id}", polite=True)
     return {"message": _summary(stats), **stats}
 
 
@@ -796,11 +844,13 @@ async def _run_item_job(context: jobs.JobContext, input_data: dict[str, Any]) ->
     season = input_data.get("season_number")
     if not await fingerprint_supported():
         return {"message": _UNSUPPORTED}
-    async with get_database().session() as session:
-        seasons = await seasons_needing_work(
+
+    async def find(session: AsyncSession) -> list[tuple[int, int]]:
+        return await seasons_needing_work(
             session,
             media_item_id=media_item_id,
             season_number=int(season) if season is not None else None,
         )
-    stats = await _run_seasons(context, seasons, subject=f"条目 #{media_item_id}")
+
+    stats = await _run_seasons(context, find, subject=f"条目 #{media_item_id}")
     return {"message": _summary(stats), **stats}

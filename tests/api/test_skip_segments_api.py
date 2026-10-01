@@ -357,6 +357,9 @@ class _Ctx:
     async def update_progress(self, **kwargs) -> None:
         self.messages.append(str(kwargs.get("message")))
 
+    def progress_due(self, **_kwargs) -> bool:
+        return True
+
 
 def test_library_backfill_pauses_while_someone_is_watching(
     client: TestClient, tmp_path: Path, monkeypatch
@@ -415,3 +418,76 @@ def test_item_job_and_ingest_never_wait_for_playback(client: TestClient, tmp_pat
 
     outcome = call(client, scenario)
     assert outcome.fingerprinted == 5 and outcome.analyzed
+
+
+async def _add_episode(tmp_path: Path, ids: dict, number: int) -> int:
+    """作业运行期间又落位了一集：往已有的剧集库里补一行台账（文件是真实存在的假字节）。"""
+    path = tmp_path / "tv" / "Season 01" / f"Show S01E{number:02d}.mp4"
+    path.write_bytes(b"FAKE-MEDIA" * 64)
+    async with get_database().session() as session:
+        row = LibraryFile(
+            library_id=ids["tv"],
+            media_item_id=ids["show"],
+            season_number=1,
+            episode_number=number,
+            file_path=str(path),
+            size_bytes=path.stat().st_size,
+            source=FileSource.SCANNED,
+            state=FileState.IN_PLACE,
+            container="mp4",
+            video_codec="h264",
+            resolution="1080p",
+            duration_seconds=DURATION,
+            audio_streams=[{"codec": "aac", "channels": 2, "default": True}],
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return row.id
+
+
+def test_running_job_picks_up_episode_that_lands_mid_run(
+    client: TestClient, tmp_path: Path, monkeypatch
+) -> None:
+    """同库已有作业在跑时，后来的排队请求会被并进它——它做完一轮要再查一次还有没有新活，
+    否则运行期间新落位的集要漏到下一次触发。"""
+    ids = call(client, _seed, tmp_path, 4)
+    real = skip_segments.compute_fingerprint
+    landed: dict[str, int] = {}
+
+    async def compute_then_land_new_episode(file) -> None:
+        await real(file)
+        if "id" not in landed:
+            landed["id"] = await _add_episode(tmp_path, ids, 5)
+
+    monkeypatch.setattr(skip_segments, "compute_fingerprint", compute_then_land_new_episode)
+    ctx = _Ctx()
+    result = call(client, skip_segments._run_library_job, ctx, {"library_id": ids["tv"]})
+    assert landed, "测试前提：运行期间应当落位了一集"
+    states = call(client, _states)
+    assert landed["id"] in states and states[landed["id"]].fingerprint_status == "ok"
+    assert all(states[i].analyzed_at is not None for i in [*ids["files"], landed["id"]])
+    assert result["fingerprinted"] == 5
+    # 新落位的那一集已经带上片段，不用等下一次触发
+    assert {s["type"] for s in states[landed["id"]].segments} == {"intro", "outro"}
+
+
+def test_enqueue_after_library_change_respects_switch_and_kind(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """扫描作业收尾与监听触发的增量扫描共用这个入口：只有开着开关的剧集库才排。"""
+    ids = call(client, _seed, tmp_path)
+
+    async def _active_jobs() -> list[str]:
+        async with get_database().session() as session:
+            rows = await jobs.list_jobs(
+                session, active_only=True, job_type=skip_segments.LIBRARY_JOB_TYPE
+            )
+            return [str(r.status) for r in rows]
+
+    assert call(client, skip_segments.enqueue_after_library_change, ids["movie_lib"]) is False
+    assert call(client, skip_segments.enqueue_after_library_change, 999_999) is False
+    assert call(client, skip_segments.enqueue_after_library_change, ids["tv"]) is True
+    # 同库重复触发并进同一个作业，不排第二份
+    assert call(client, skip_segments.enqueue_after_library_change, ids["tv"]) is True
+    assert len(call(client, _active_jobs)) <= 1
