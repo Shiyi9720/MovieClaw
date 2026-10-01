@@ -154,6 +154,15 @@ REMOTE_IO_TIMEOUT_US = 30_000_000
 #: 26 秒），与 NAS 30 秒的分片等待窗口相当。
 REMOTE_RECONNECT_DELAY_MAX_S = 15
 
+#: 边产出边送（docs/design/transcode-latency.md §5）时一个片段多长（微秒，movenc 的
+#: ``frag_duration`` 单位）。AVPlayer 收到一个完整的片段（moof + mdat）就能解码出画，
+#: 不必等 4 秒的分片整段转完：片段越短首帧越早，但每个片段都是 Worker 回传的一个请求、
+#: 一份 moof 开销。0.5 秒与 iOS 引擎边产出边送（P57）实测最好的取值一致。
+PROGRESSIVE_FRAGMENT_US = 500_000
+#: 边产出边送时 ffmpeg 往这个产物名推一整条分片化 MP4，Worker 的上传代理切成
+#: init.mp4 与一个个 segNNNNN.m4s 再回传；NAS 产物端点从不接收这个名字。
+PROGRESSIVE_STREAM_NAME = "stream.mp4"
+
 #: 远程 HTTP 输入的断线续读参数。原盘清单（ffconcat）里的每一段也要逐个带上
 #: （concat 的 ``option`` 指令）：命令行上的这几项只作用于清单这一个输入，
 #: 管不到清单里各段剪辑自己的 HTTP 连接。
@@ -435,6 +444,7 @@ def build_hls_command(
     output_url_suffix: str = "",
     input_format: str | None = None,
     worker_caps: WorkerVideoCaps | None = None,
+    progressive: bool = False,
 ) -> TranscodeCommand:
     """把播放计划翻成 ffmpeg 命令。档 0（Direct Play）不该走到这里。
 
@@ -450,6 +460,11 @@ def build_hls_command(
 
     ``worker_caps`` 是接单的远程 Worker 申报的视频能力（远程任务恒传，本机执行为
     None），VideoToolbox 命令按它分流，见 ``_videotoolbox_mode``。
+
+    ``progressive``（只对远程 VOD 的 fMP4 任务有效）：不用 HLS muxer，输出一整条分片化
+    MP4（每 0.5 秒一个片段，时间戳保持文件绝对时间），由 Worker 按分片栅格切段、边产出
+    边回传（docs/design/transcode-latency.md §5）。HLS muxer 把整段攒在内存里、转完才写出，
+    播放器最早也要等一整段——这是转码起播与跳转首帧里最大的一块。
     """
     if plan.tier is PlaybackTier.DIRECT_PLAY:
         raise ValueError("档 0 是原文件直出，不需要 ffmpeg")
@@ -544,13 +559,22 @@ def build_hls_command(
         # 不做归零平移——seek 重启后分片时间戳依旧是文件时间。start_at_zero
         # 处理 start_time != 0 的源（TS 转封装常见），照抄 Jellyfin。
         argv += ["-copyts", "-avoid_negative_ts", "disabled", "-start_at_zero"]
-    argv += _hls_args(
-        session_dir,
-        mpegts=is_mpegts(plan),
-        start_number=start_number,
-        output_base_url=output_base_url,
-        output_url_suffix=output_url_suffix,
+    progressive = (
+        progressive
+        and output_base_url is not None
+        and start_number is not None
+        and not is_mpegts(plan)
     )
+    if progressive:
+        argv += _progressive_args()
+    else:
+        argv += _hls_args(
+            session_dir,
+            mpegts=is_mpegts(plan),
+            start_number=start_number,
+            output_base_url=output_base_url,
+            output_url_suffix=output_url_suffix,
+        )
     if output_base_url:
         # 远程 Worker 将进度写到 stdout 管道并通过控制面低频上报；不把进度
         # 写入 stderr，避免和含有源地址的 ffmpeg 警告混在一起。stdout 不会
@@ -558,7 +582,10 @@ def build_hls_command(
         argv += ["-progress", "pipe:1"]
 
     playlist = session_dir / (LIVE_PLAYLIST_NAME if start_number is not None else PLAYLIST_NAME)
-    if output_base_url:
+    if progressive:
+        assert output_base_url is not None
+        argv.append(f"{output_base_url.rstrip('/')}/{PROGRESSIVE_STREAM_NAME}{output_url_suffix}")
+    elif output_base_url:
         argv.append(
             f"{output_base_url.rstrip('/')}/{playlist.name}{output_url_suffix}"
         )
@@ -858,6 +885,31 @@ def _audio_args(plan: PlaybackPlan, *, has_audio: bool, absolute_ts: bool) -> li
     else:
         args += ["-af", resample]
     return args
+
+
+def _progressive_args() -> list[str]:
+    """边产出边送的输出：一整条分片化 MP4，HTTP PUT 给 Worker 的上传代理。
+
+    - ``frag_keyframe``：每个关键帧另起一个片段——分片边界（强制关键帧）因此总是片段
+      边界，Worker 按片段切段不会把一段切在半个片段里；
+    - ``frag_duration``：片段最长 0.5 秒（见 ``PROGRESSIVE_FRAGMENT_US``）；
+    - ``empty_moov``：先写只有轨道描述的 moov，它就是 HLS 的 init.mp4；
+    - ``default_base_moof``：片段内偏移相对 moof，单独拿出一个片段也能解析；
+    - ``frag_discont``：每个 moof 的 tfdt 写真实时间（与 HLS 那边 Jellyfin 同款的修正）——
+      不写的话片段时间从 0 起算，Worker 无从知道它属于第几段；
+    - ``skip_sidx``：HLS 用不到 sidx。
+
+    ``-method PUT``：与 HLS 产物同一种回传方式，请求体按分块传输边写边送。
+    """
+    return [
+        # 与 HLS 产物同一个单次读写超时：Worker 那头卡住时 ffmpeg 不至于永久阻塞
+        "-rw_timeout", str(REMOTE_IO_TIMEOUT_US),
+        "-f", "mp4",
+        "-movflags", "+frag_keyframe+empty_moov+default_base_moof+frag_discont+skip_sidx",
+        "-frag_duration", str(PROGRESSIVE_FRAGMENT_US),
+        "-method", "PUT",
+        "-y",
+    ]
 
 
 def _hls_args(
