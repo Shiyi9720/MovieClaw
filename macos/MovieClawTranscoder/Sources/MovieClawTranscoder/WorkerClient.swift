@@ -621,6 +621,10 @@ actor WorkerClient {
                     firstRunBlocks: configuration.labFlags.compactMap { flag in
                         flag.hasPrefix("first-run-") ? Int(flag.dropFirst("first-run-".count)) : nil
                     }.first ?? SourceReadProxy.defaultFirstRunBlocks,
+                    // 实验开关 companion-N：落到新区域时并行多取 N 块（companion-0 关掉）
+                    companionBlocks: configuration.labFlags.compactMap { flag in
+                        flag.hasPrefix("companion-") ? Int(flag.dropFirst("companion-".count)) : nil
+                    }.first ?? SourceReadProxy.defaultCompanionBlocks,
                     logRequests: configuration.labFlags.contains("source-log")
                 )
                 let localBaseURL = try await proxy.start()

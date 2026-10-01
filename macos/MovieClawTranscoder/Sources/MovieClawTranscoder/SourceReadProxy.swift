@@ -247,6 +247,10 @@ actor SourceBlockCache {
 final class SourceReadProxy: @unchecked Sendable {
     /// 第一次取几块、之后每次放大几倍、最多几块（8 MiB）。
     static let defaultFirstRunBlocks = 1
+    /// 一个请求落到新区域时，第一块之外同时并行取后面几块（伴随取数）。原盘、TS 的二分查找每一步要读
+    /// 0.6～1.2 MB，一起到手只等一次网络（对照：每步少等一次，续播首帧 −216、前跳 −174 毫秒）；
+    /// 不并成一次 1 MB 的取数，是因为取数整段到齐才交出，首字节要等它全到（从头起播反而慢 82 毫秒）。
+    static let defaultCompanionBlocks = 3
     static let runGrowth = 4
     static let maxRunBlocks = 32
     /// 送出这么多块之后才开始预取。回环口两头的缓冲能吞下约两块（实测 512 KiB），「送出」不等于
@@ -296,6 +300,7 @@ final class SourceReadProxy: @unchecked Sendable {
     let logRequests: Bool
     let prefetchAfterBlocks: Int
     let firstRunBlocks: Int
+    let companionBlocks: Int
     private let queue: DispatchQueue
     private let listener: NWListener
     private let lock = NSLock()
@@ -312,8 +317,10 @@ final class SourceReadProxy: @unchecked Sendable {
         transientAfterBytes: Int64 = SourceReadProxy.defaultTransientAfterBytes,
         prefetchAfterBlocks: Int = SourceReadProxy.defaultPrefetchAfterBlocks,
         firstRunBlocks: Int = SourceReadProxy.defaultFirstRunBlocks,
+        companionBlocks: Int = SourceReadProxy.defaultCompanionBlocks,
         logRequests: Bool = false
     ) throws {
+        self.companionBlocks = max(0, min(companionBlocks, SourceReadProxy.maxRunBlocks))
         self.prefetchAfterBlocks = prefetchAfterBlocks
         self.firstRunBlocks = max(1, min(firstRunBlocks, SourceReadProxy.maxRunBlocks))
         self.jobID = jobID
@@ -768,6 +775,15 @@ private final class SourceConnection: @unchecked Sendable {
         }
 
         let firstIndex = Int(start / blockSize)
+        // 落到新区域：第一块单独取（首字节最快），后面几块同时并行取（见 defaultCompanionBlocks）
+        if proxy.companionBlocks > 0,
+           await cache.cached(resource, firstIndex) == nil,
+           await nextMissing(from: firstIndex + 1, limit: firstIndex + 2) == firstIndex + 1,
+           let companion = await cache.run(resource, index: firstIndex + 1, count: proxy.companionBlocks, fetch: fetch)
+        {
+            held.append(companion)
+            trace.prefetches += 1
+        }
         var data = try await load(firstIndex)
         guard let info = await cache.info(resource) else { throw URLError(.badServerResponse) }
         guard start < info.size else {
