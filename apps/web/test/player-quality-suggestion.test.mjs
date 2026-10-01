@@ -7,6 +7,7 @@ import {
   GRACE_SECONDS,
   QualitySuggestion,
   recommendedHeight,
+  transcodeBitrateBps,
 } from "../lib/player/quality-suggestion.ts";
 
 const mbps = 1_000_000;
@@ -123,4 +124,31 @@ test("码率未知不提示", () => {
   for (let i = 0; i < 9; i += 1) s.tick({ stalled: true, loadingBps: 1 * mbps });
   assert.equal(s.offer({ streamBitrateBps: null, currentHeight: 2160 }), null);
   assert.equal(s.offered, false);
+});
+
+// 下面是网页独有的（App 几乎总是直出原文件，转码流的码率在那边不是问题）
+test("转码流的码率按服务端转码阶梯算，不是片源码率", () => {
+  assert.equal(transcodeBitrateBps({ height: 1080, bitrate_cap_bps: null }), 6 * mbps);
+  // 向上取最近一档，与 ffmpeg_args.maxrate_for_height 同一规则
+  assert.equal(transcodeBitrateBps({ height: 1000, bitrate_cap_bps: null }), 6 * mbps);
+  assert.equal(transcodeBitrateBps({ height: 2160, bitrate_cap_bps: null }), 16 * mbps);
+  assert.equal(transcodeBitrateBps({ height: 360, bitrate_cap_bps: null }), 1.5 * mbps);
+  assert.equal(transcodeBitrateBps({ height: 4320, bitrate_cap_bps: null }), 16 * mbps);
+  // 没有目标高度按 1080p
+  assert.equal(transcodeBitrateBps({ height: null }), 6 * mbps);
+  // 按线路定的上限比阶梯低就取上限（NAS 实测：2.9 Mbps 线路上重开成 480p、1.5 Mbps）
+  assert.equal(transcodeBitrateBps({ height: 480, bitrate_cap_bps: 1.5 * mbps }), 1.5 * mbps);
+  assert.equal(transcodeBitrateBps({ height: 1080, bitrate_cap_bps: 2 * mbps }), 2 * mbps);
+  assert.equal(transcodeBitrateBps({ height: 720, bitrate_cap_bps: 9 * mbps }), 3 * mbps);
+});
+
+test("按线路压过码率的转码流，线路够了就不再提示", () => {
+  // 4K HDR 转 SDR 按 2.9 Mbps 线路重开成 480p / 1.5 Mbps 后，起播的长等里最快一秒 2.9 Mbps：
+  // 拿片源码率（90 Mbps）比会误判「跟不上」、弹一张「这一版需要约 10.7 MB/s」的卡
+  const s = new QualitySuggestion();
+  s.restartGrace();
+  for (let i = 0; i < 9; i += 1) s.tick({ stalled: true, loadingBps: 2.9 * mbps });
+  const bitrate = transcodeBitrateBps({ height: 480, bitrate_cap_bps: 1.5 * mbps });
+  assert.equal(s.offer({ streamBitrateBps: bitrate, currentHeight: 480 }), null);
+  assert.notEqual(s.offer({ streamBitrateBps: 90 * mbps, currentHeight: 2160 }), null);
 });

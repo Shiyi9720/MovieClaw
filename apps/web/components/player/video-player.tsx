@@ -85,11 +85,16 @@ import {
 } from "@/lib/player/playback-record";
 import {
   loadQualityFor,
+  qualityChangeNeedsRestart,
   qualityLimits,
   rememberQualityFor,
   sourceHeight,
 } from "@/lib/player/quality";
-import { type QualityOffer, QualitySuggestion } from "@/lib/player/quality-suggestion";
+import {
+  type QualityOffer,
+  QualitySuggestion,
+  transcodeBitrateBps,
+} from "@/lib/player/quality-suggestion";
 import { rememberedChoicesNotice, shortTrackLabel } from "@/lib/player/remembered-choices";
 import {
   browserReportStorage,
@@ -1644,7 +1649,11 @@ export function VideoPlayer(props: VideoPlayerProps) {
       const stalled = phase === "buffering" || phase === "seeking";
       const suggestion = suggestionRef.current;
       suggestion.tick({ stalled, seeking, loadingBps: stats.loadingBps });
-      const bitrate = stats.bitrate ?? sourceBitrateRef.current;
+      // 这条流的码率：量得到（hls.js 已收完分片）用量的；量到之前，转码流用服务端的转码目标码率，
+      // 视频直通才是片源码率
+      const plan = session.decision.video;
+      const bitrate =
+        stats.bitrate ?? (plan?.action === "transcode" ? transcodeBitrateBps(plan) : sourceBitrateRef.current);
       // 真卡住了、而且这一秒的加载速度确实比码率慢（线路跟不上，不是一时抖动）：放大前向缓冲，
       // 之后暂停就能一直攒（iOS 引擎补丁 P20 同一用意）。线路够快时不放大，免得白下
       if (
@@ -2659,8 +2668,8 @@ export function VideoPlayer(props: VideoPlayerProps) {
    * 换画质上限。与换音轨同一条路：重开会话（约一秒停顿）。
    *
    * 唯一跳过重启的情况：当前是直通（copy）且新上限装得下源分辨率——
-   * 此时服务端会给出一模一样的计划，重启纯属白断一次。videoHeight 在
-   * copy 档就是源高度，可以直接拿来判。
+   * 此时服务端会给出一模一样的计划，重启纯属白断一次。判法见
+   * quality.ts 的 qualityChangeNeedsRestart（起播没出画时 videoHeight 是 0）。
    */
   const selectQuality = useCallback(
     (maxHeight: number | null) => {
@@ -2677,9 +2686,14 @@ export function VideoPlayer(props: VideoPlayerProps) {
       const record = recordRef.current;
       record?.noteBehavior("quality_change", quality === null ? "auto" : String(quality), maxHeight === null ? "auto" : String(maxHeight));
       record?.beginSwitch("quality", quality === null ? null : String(quality), maxHeight === null ? null : String(maxHeight));
-      const copying = session?.decision.video?.action === "copy";
-      if (copying && (maxHeight === null || (video?.videoHeight ?? 0) <= maxHeight)) {
-        record?.closeSwitch(true); // 视频直通且源不超所选档：服务端给的计划一模一样，不用重开
+      const needsRestart = qualityChangeNeedsRestart({
+        copying: session?.decision.video?.action === "copy",
+        maxHeight,
+        sourceResolution: session?.source?.resolution,
+        videoHeight: video?.videoHeight ?? 0,
+      });
+      if (!needsRestart) {
+        record?.closeSwitch(true); // 视频直通且新上限没限住片源：服务端给的计划一模一样，不用重开
         return;
       }
       // 换会话会让画面空一段，先把当前帧冻住盖上去

@@ -55,6 +55,30 @@ export function recommendedHeight(bps: number, currentHeight: number | null): nu
   return (lower.find((rung) => rung.bps <= bps * 0.8) ?? lower[lower.length - 1]).height;
 }
 
+/** 服务端转码的码率阶梯（高度 → maxrate），与 services/playback/ffmpeg_args.py 的 BITRATE_LADDER 同一组数 */
+const TRANSCODE_LADDER: readonly { height: number; bps: number }[] = [
+  { height: 480, bps: 1_500_000 },
+  { height: 720, bps: 3_000_000 },
+  { height: 1080, bps: 6_000_000 },
+  { height: 1440, bps: 10_000_000 },
+  { height: 2160, bps: 16_000_000 },
+];
+
+/**
+ * 转码流的码率：服务端给 ffmpeg 的 maxrate——不小于目标高度的最近一档（没有高度按 1080p），再与按线路
+ * 定的上限取小（ffmpeg_args.maxrate_for_video 同一规则）。
+ *
+ * 判「线路跟不跟得上」要拿这条流的码率比。hls.js 量出第一个分片之前只能靠它：拿片源码率顶替会把
+ * 4K HDR 转 SDR 的片子（片源 90 Mbps、转出来最多 16 Mbps）说成「这一版需要约 10.7 MB/s」（NAS 实测）。
+ */
+export function transcodeBitrateBps(video: { height: number | null; bitrate_cap_bps?: number | null }): number {
+  const { height } = video;
+  const rung = height === null ? undefined : TRANSCODE_LADDER.find((r) => height <= r.height);
+  const ladder = height === null ? 6_000_000 : (rung ?? TRANSCODE_LADDER[TRANSCODE_LADDER.length - 1]).bps;
+  const cap = video.bitrate_cap_bps;
+  return cap !== null && cap !== undefined && cap > 0 ? Math.min(ladder, cap) : ladder;
+}
+
 export class QualitySuggestion {
   /** 观看秒数：只在用户想看（没暂停）的时候走 */
   private clock = 0;

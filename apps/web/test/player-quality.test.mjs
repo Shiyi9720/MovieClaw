@@ -5,6 +5,7 @@ import {
   QUALITY_MEMORY_LIMIT,
   QUALITY_OPTIONS,
   loadQualityFor,
+  qualityChangeNeedsRestart,
   qualityLabel,
   qualityLimits,
   rememberQualityFor,
@@ -97,4 +98,22 @@ test("选项含自动且高度全部在码率阶梯语义内", () => {
   }
   assert.equal(qualityLabel(null), "自动");
   assert.equal(qualityLabel(720), "720p");
+});
+
+test("换画质要不要重开：起播还没出画（videoHeight 为 0）照样按片源规格判", () => {
+  const change = (over) =>
+    qualityChangeNeedsRestart({ copying: true, maxHeight: 720, sourceResolution: "1080p", videoHeight: 0, ...over });
+  // NAS 实测的坑：慢线路起播时弹卡点「改用 720p」，0 <= 720 被当成片源不超 720p、没重开
+  assert.equal(change({}), true);
+  assert.equal(change({ videoHeight: 1080 }), true);
+  // 新上限没限住片源：直通计划不变，不重开
+  assert.equal(change({ maxHeight: 1080 }), false);
+  assert.equal(change({ maxHeight: null }), false);
+  // 规格认不出时看出画后的 videoHeight；还没出画就按限住了算
+  assert.equal(change({ sourceResolution: null, videoHeight: 720 }), false);
+  assert.equal(change({ sourceResolution: null, videoHeight: 1080 }), true);
+  assert.equal(change({ sourceResolution: null }), true);
+  // 已经在转码：换上限一定重开
+  assert.equal(change({ copying: false, maxHeight: 1080 }), true);
+  assert.equal(change({ copying: false, maxHeight: null }), true);
 });

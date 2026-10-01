@@ -118,6 +118,25 @@ export function qualityLimits(maxHeight: number | null, sourceHeightPx: number |
   return sourceHeightPx === null || maxHeight < sourceHeightPx;
 }
 
+/**
+ * 换画质上限要不要重开会话。只有一种情况不用：视频直通、且新上限没限住片源——服务端会给出一模一样的
+ * 计划，重开纯属白断一次。
+ *
+ * 片源高度先看会话给的规格，拿不到才看 `<video>` 的 `videoHeight`（直通档里它就是片源高度），而且只认
+ * 非零值：起播还没出画时它是 0，拿 0 判会把「改用 720p」当成「片源本来就不超 720p」、不重开——
+ * 慢线路起播时弹出的换画质卡点了没反应（NAS 实测）。两头都拿不到按限住了算，重开。
+ */
+export function qualityChangeNeedsRestart(input: {
+  copying: boolean;
+  maxHeight: number | null;
+  sourceResolution: string | null | undefined;
+  videoHeight: number;
+}): boolean {
+  if (!input.copying) return true;
+  const sourceHeightPx = sourceHeight(input.sourceResolution) ?? (input.videoHeight > 0 ? input.videoHeight : null);
+  return qualityLimits(input.maxHeight, sourceHeightPx);
+}
+
 export function qualityLabel(maxHeight: number | null): string {
   return QUALITY_OPTIONS.find((o) => o.maxHeight === maxHeight)?.label ?? "自动";
 }
