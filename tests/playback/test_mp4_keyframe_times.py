@@ -205,7 +205,9 @@ def test_keyframe_index_falls_back_to_ffprobe_unless_fast_only(tmp_path, monkeyp
     path = tmp_path / "movie.mp4"
     _build(path, [H264_IDR, H264_P, H264_SEI_OTHER + H264_P], sync=[1, 3])
     calls = []
-    monkeypatch.setattr(keyframes, "_ffprobe_keyframes", lambda p: calls.append(p) or [0.0, 4.0])
+    monkeypatch.setattr(
+        keyframes, "_ffprobe_keyframes", lambda p, **_kw: calls.append(p) or [0.0, 4.0]
+    )
     keyframes._index_cache.clear()
     # 决策阶段只走快路径：要 ffprobe 通读才拿得到时返回 None，交给三段采样
     assert keyframes.read_keyframe_index(path, allow_ffprobe=False) is None
@@ -233,7 +235,7 @@ def test_full_check_marks_file_untrusted_and_rebuilds_with_ffprobe(tmp_path, mon
     path = tmp_path / "movie.mp4"
     _build(path, [H264_IDR, H264_IDR, H264_SEI_OTHER + H264_P, H264_IDR], sync=[1, 2, 3, 4])
     monkeypatch.setattr(ci, "_VERIFY_MAX", 2)
-    monkeypatch.setattr(keyframes, "_ffprobe_keyframes", lambda _p: [0.0, 1.0, 3.0])
+    monkeypatch.setattr(keyframes, "_ffprobe_keyframes", lambda _p, **_kw: [0.0, 1.0, 3.0])
     for state in (keyframes._index_cache, keyframes._needs_full_check, keyframes._untrusted_mp4):
         state.clear()
 
@@ -241,7 +243,7 @@ def test_full_check_marks_file_untrusted_and_rebuilds_with_ffprobe(tmp_path, mon
     assert first is not None and first.times_s == (0.0, 1.0, 2.0, 3.0)  # 抽检版（含坏条目）
 
     async def run() -> None:
-        keyframes.schedule_full_check(path, delay_s=0)
+        keyframes.schedule_background_index(path, delay_s=0)
         await asyncio.gather(*keyframes._full_check_tasks)
 
     asyncio.run(run())
@@ -278,3 +280,63 @@ def test_edit_start_inside_first_frame_shifts_to_next_kept_frame(tmp_path):
     samples = [H264_IDR, H264_P, H264_IDR]
     _build(path, samples, timescale=1_200_000, delta=48_000, sync=[1, 3], elst=[(3000, 40_039)])
     assert ci.read_mp4_keyframe_times(path) == [-48_000 / 1_200_000, 48_000 / 1_200_000]
+
+
+def _reset_background_state():
+    for state in (
+        keyframes._index_cache,
+        keyframes._needs_full_check,
+        keyframes._untrusted_mp4,
+        keyframes._background_failed,
+    ):
+        state.clear()
+
+
+def _run_background(path):
+    import asyncio
+
+    async def run() -> None:
+        keyframes.schedule_background_index(path, delay_s=0)
+        await asyncio.gather(*keyframes._full_check_tasks)
+
+    asyncio.run(run())
+
+
+def test_ts_index_is_built_in_background_instead_of_on_the_session_path(tmp_path, monkeypatch):
+    # 没有索引可读的容器：开会话只走快路径拿不到（这次走会话相对模式，不再当场通读 120 秒），
+    # 后台低优先级通读，算好的索引给下一次播放
+    path = tmp_path / "movie.ts"
+    path.write_bytes(b"\x47" * 188)
+    calls = []
+
+    def fake_ffprobe(p, **kw):
+        calls.append(kw)
+        return [0.5, 4.0, 8.0]
+
+    monkeypatch.setattr(keyframes, "_ffprobe_keyframes", fake_ffprobe)
+    _reset_background_state()
+    assert keyframes.read_keyframe_index(path, allow_ffprobe=False) is None
+    assert calls == []
+    _run_background(path)
+    assert calls == [{"timeout": keyframes._BACKGROUND_FFPROBE_TIMEOUT, "low_priority": True}]
+    index = keyframes.read_keyframe_index(path, allow_ffprobe=False)
+    assert index is not None and index.times_s == (0.0, 0.5, 4.0, 8.0)
+    # 已经有了就不再排
+    _run_background(path)
+    assert len(calls) == 1
+
+
+def test_background_index_failure_is_not_retried_and_huge_files_are_skipped(tmp_path, monkeypatch):
+    path = tmp_path / "movie.ts"
+    path.write_bytes(b"\x47" * 188)
+    calls = []
+    monkeypatch.setattr(keyframes, "_ffprobe_keyframes", lambda p, **kw: calls.append(p) or [])
+    _reset_background_state()
+    _run_background(path)
+    _run_background(path)
+    assert len(calls) == 1  # 超时 / 读不出：本进程内不再白读
+    big = tmp_path / "big.ts"
+    big.write_bytes(b"\x47" * 188)
+    monkeypatch.setattr(keyframes, "BACKGROUND_INDEX_MAX_BYTES", 100)
+    _run_background(big)
+    assert len(calls) == 1  # 太大的不通读，留在会话相对模式

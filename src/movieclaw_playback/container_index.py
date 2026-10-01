@@ -980,7 +980,7 @@ def read_mp4_keyframes_checked(path: str | Path) -> tuple[list[float], bool] | N
 
     抽检兜不住零星的坏条目（片库实测：一部 2486 个关键帧的片子 stss 里混了 2 个 NAL 类型非法的
     样本，抽 128 个没抽中）。调用方拿到 True 时应在空闲时用 :func:`verify_all_mp4_keyframes`
-    全量核对一遍（keyframes.py 的 ``schedule_full_check``）。
+    全量核对一遍（keyframes.py 的 ``schedule_background_index``）。
     """
     return _read_mp4_keyframes(Path(path), verify_limit=_VERIFY_MAX, workers=_VERIFY_WORKERS)
 
