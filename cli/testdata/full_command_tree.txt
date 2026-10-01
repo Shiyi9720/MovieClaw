@@ -21,6 +21,8 @@ app tasks update
 app update
 app update apply
 app update check
+app update github-token-get
+app update github-token-put
 app update last-exit-dismiss
 app update model-apply
 app update model-check
@@ -280,10 +282,13 @@ people show
 playback
 playback activity
 playback activity end
+playback attempt
+playback attempt get
 playback device
 playback device revoke
 playback history
 playback stats
+playback stats qoe
 playback stats watch
 rules
 rules create

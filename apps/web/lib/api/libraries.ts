@@ -77,8 +77,10 @@ export interface MediaLibrary {
   capabilities: LibraryCapabilities;
   /** 缺图时是否从视频抓帧生成缩略图（本地内容封面、TMDB 无剧照的分集） */
   generate_thumbnails: boolean;
-  /** 是否为视频章节抓取场景图（后台低优先级作业） */
+  /** 是否生成并展示视频章节（默认关；关着时详情页没有章节横排、也不抓图） */
   extract_chapter_images: boolean;
+  /** 是否识别剧集的片头片尾（默认开，只对剧集库起作用；播放时给「跳过片头」） */
+  detect_media_segments: boolean;
   /** 是否从首页「最近添加」等汇总里排除 */
   exclude_from_home: boolean;
   /** 是否按作品系列自动生成合集（展示偏好，不影响落库与写 NFO） */
@@ -203,7 +205,7 @@ export interface LastOrganize {
   renamed: number;
   /** 跟随改名的附属文件数（字幕、分集剧照等） */
   sidecars_renamed: number;
-  /** 跟随条目目录改名的镜像资产数（海报/背景/季海报/条目 NFO） */
+  /** 跟随条目目录改名的镜像资产数（海报/背景/Logo/季海报/条目 NFO） */
   entry_assets_moved: number;
   /** 本就符合规范、无需动作的文件数 */
   already_ok: number;
@@ -252,7 +254,7 @@ export interface OrganizePreview {
   renames: OrganizeRename[];
   skips: OrganizeSkip[];
   /**
-   * 条目目录改名时跟着搬的镜像资产（poster.jpg / fanart.jpg /
+   * 条目目录改名时跟着搬的镜像资产（poster.jpg / fanart.jpg / clearlogo.png /
    * seasonNN-poster.jpg / movie.nfo / tvshow.nfo）——不搬走旧目录就清不掉。
    */
   entry_assets: OrganizeSidecar[];
@@ -361,7 +363,8 @@ export type UnidentifiedCode =
   | "tmdb_unreachable"
   | "ambiguous"
   | "no_match"
-  | "kind_mismatch";
+  | "kind_mismatch"
+  | "unit_unresolved";
 
 /** 待识别清单的一组：同一条目目录下的文件（一部剧几十集算一组）。 */
 export interface UnidentifiedGroup {
@@ -391,8 +394,10 @@ export interface LibraryPayload {
   root_paths: string[];
   /** 缺图时是否从视频抓帧生成缩略图；不传=不改动（新建时默认开） */
   generate_thumbnails?: boolean;
-  /** 是否为视频章节抓取场景图；不传=不改动（新建时默认开） */
+  /** 是否生成并展示视频章节；不传=不改动（新建时默认关） */
   extract_chapter_images?: boolean;
+  /** 是否识别剧集的片头片尾；不传=不改动（新建时默认开） */
+  detect_media_segments?: boolean;
   /** 是否从首页汇总里排除该库；不传=不改动（新建时默认关） */
   exclude_from_home?: boolean;
   auto_series_collections?: boolean;
@@ -984,19 +989,26 @@ export interface ArtworkCandidate {
   vote_count: number | null;
 }
 
+/** 「更换图片」能换的三种图：海报 / 背景 / 片名徽标（透明底 PNG）。 */
+export type ArtworkKind = "poster" | "backdrop" | "logo";
+
 /** 条目的候选图集合（排序与自动选图一致）。 */
 export interface ArtworkCandidates {
   posters: ArtworkCandidate[];
   backdrops: ArtworkCandidate[];
+  logos: ArtworkCandidate[];
   /** 实际在用的图路径——标「当前」用它比对，不能用"列表第一张"推断 */
   current_poster: string | null;
   current_backdrop: string | null;
+  /** null = TMDB 没有合适的徽标 */
+  current_logo: string | null;
   /** 已手动选定，刷新不会覆盖 */
   poster_locked: boolean;
   backdrop_locked: boolean;
+  logo_locked: boolean;
 }
 
-/** 条目的候选海报/背景（「更换图片」弹层数据源）。 */
+/** 条目的候选海报/背景/徽标（「更换图片」弹层数据源）。 */
 export function listArtworkCandidates(
   libraryId: number,
   mediaItemId: number,
@@ -1009,13 +1021,13 @@ export function listArtworkCandidates(
 }
 
 /**
- * 选定海报/背景：当场落盘并覆盖媒体目录，此后刷新不再覆盖。
+ * 选定海报/背景/徽标：当场落盘并覆盖媒体目录，此后刷新不再覆盖。
  * `filePath` 传 null = 解锁并恢复自动选图。
  */
 export function selectArtwork(
   libraryId: number,
   mediaItemId: number,
-  kind: "poster" | "backdrop",
+  kind: ArtworkKind,
   filePath: string | null,
 ): Promise<{ locked: boolean }> {
   return unwrap(
@@ -1070,17 +1082,25 @@ export function assignLibraryFileToTitle(
   );
 }
 
-/** 整组认领：一次把多个待识别文件挂到同一个 TMDB 条目（各自沿用已解析的季集号）。 */
+/**
+ * 整组认领：一次把多个待识别文件挂到同一个 TMDB 条目（各自沿用已解析的季集号）。
+ * 带 seasonNumber 时整组统一改用该季号（季号解析不出的 unit_unresolved 组必填）。
+ */
 export function assignLibraryFilesToTitle(
   fileIds: number[],
   titleRef: string,
+  seasonNumber?: number,
 ): Promise<{ claimed: number }> {
   return unwrap(
     request<ApiEnvelope<{ claimed: number }>>(
       `/libraries/identification/file-title-assignments`,
       {
         method: "POST",
-        body: JSON.stringify({ file_ids: fileIds, title_ref: titleRef }),
+        body: JSON.stringify({
+          file_ids: fileIds,
+          title_ref: titleRef,
+          ...(seasonNumber === undefined ? {} : { season_number: seasonNumber }),
+        }),
       },
     ),
   );
@@ -1346,9 +1366,30 @@ export interface LibraryItemFile {
   audio_streams: AudioStream[] | null;
   /** 字幕列表：内封轨 + 外挂文件 */
   subtitle_streams: SubtitleStream[];
-  /** 有效章节（内嵌或按时长合成）；null=尚未探测章节 */
+  /** 当前成员起播时会放的音轨 / 字幕与原因；null = 原盘或尚未探测轨道（界面退回按片源旗标展示） */
+  playback_defaults: TrackDefaults | null;
+  /** 有效章节（内嵌或按时长合成）；null=所在库没开「生成章节」或尚未探测章节 */
   chapters: LibraryChapter[] | null;
   added_at: string;
+}
+
+/**
+ * 不经用户操作时会放的音轨 / 字幕（与起播同一口径：本集记着的 > 沿用同剧上一集 >
+ * 默认轨策略的原声 / 库语言，见服务端 services/playback/track_defaults）。
+ */
+export interface TrackDefaults {
+  /** 将要放的音轨（embedded:<k>）；没有音轨为 null */
+  audio_track: string | null;
+  /** remembered / series / original_language / default_flag / first / none */
+  audio_reason: string;
+  /** 音轨原因的一句中文 */
+  audio_note: string;
+  /** 将要开的字幕（embedded:<k> / external:<文件名>）；null = 不开字幕 */
+  subtitle_track: string | null;
+  /** remembered / series / library_language / forced / same_language_off / no_language_match / … */
+  subtitle_reason: string;
+  /** 字幕原因的一句中文 */
+  subtitle_note: string;
 }
 
 /** 一个章节（docs/design/video-chapters.md）：详情页「场景」横排的一张卡。 */
@@ -1420,6 +1461,8 @@ export interface LibraryItemDetail {
   year: number | null;
   poster_url: string | null;
   backdrop_url: string | null;
+  /** 片名 Logo（透明底 PNG）；没有时显示文字片名 */
+  logo_url: string | null;
   /** 主图宽高比（同海报墙） */
   primary_aspect: number;
   /** NFO 本地刮削元数据；目录里没有可用 NFO 时为 null */

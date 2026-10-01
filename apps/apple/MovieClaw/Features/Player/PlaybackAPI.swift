@@ -52,11 +52,29 @@ struct PlaybackAPI {
     //
     // 这两个接口标成 nonisolated：起播协商（`negotiate`）要在后台一口气跑完，不能每一步都回主线程排队。
 
-    nonisolated func startSession(_ body: API.PlaybackSessionRequest) async throws -> API.PlaybackSessionView {
+    /// 开会话。登录成员的请求顺带读回响应头 `Server-Timing`（服务端决策 / 准备 / ffmpeg 各段耗时），
+    /// 播放记录据此把起播分段拆成「网络往返」与「服务端处理」（docs/design/playback-qoe.md §2）
+    nonisolated func startSession(_ body: API.PlaybackSessionRequest) async throws -> (API.PlaybackSessionView, [String: Int]) {
         var body = body
         body.deviceId = deviceId
-        if let shareSlug { return try await api.sharePlaybackSessionStart(slug: shareSlug, body: body) }
-        return try await api.playbackSessionStart(body: body)
+        if let shareSlug { return (try await api.sharePlaybackSessionStart(slug: shareSlug, body: body), [:]) }
+        let (view, headers): (API.PlaybackSessionView, [String: String]) =
+            try await api.sendReturningHeaders("POST", "/playback/sessions", body: body)
+        return (view, Self.serverTiming(headers["server-timing"]))
+    }
+
+    /// `decide;dur=12, prep;dur=30` → ["decide": 12, "prep": 30]
+    nonisolated static func serverTiming(_ header: String?) -> [String: Int] {
+        guard let header else { return [:] }
+        var result: [String: Int] = [:]
+        for part in header.split(separator: ",") {
+            let fields = part.split(separator: ";").map { $0.trimmingCharacters(in: .whitespaces) }
+            guard let name = fields.first, !name.isEmpty,
+                  let duration = fields.dropFirst().first(where: { $0.hasPrefix("dur=") }),
+                  let value = Double(duration.dropFirst(4)) else { continue }
+            result[name] = Int(value.rounded())
+        }
+        return result
     }
 
     /// 起播协商用的引擎模式（由控制器按兜底阶梯算好，见 `PlaybackController` 的类注释）
@@ -84,6 +102,8 @@ struct PlaybackAPI {
         var session: API.PlaybackSessionView
         var startedAt: ContinuousClock.Instant
         var sessionAt: ContinuousClock.Instant
+        /// 开会话响应里的服务端各段耗时（毫秒）
+        var serverTiming: [String: Int] = [:]
         /// 给系统播放器预先建好、已经在加载的资源（见 `negotiate` 末尾）；自研引擎或没给出计划时为 nil
         var preparedAsset: AVURLAsset?
     }
@@ -97,7 +117,7 @@ struct PlaybackAPI {
         let clock = ContinuousClock()
         let startedAt = clock.now
         let useNative = inputs.mode == .native
-        let session = try await startSession(useNative ? inputs.native : inputs.system)
+        let (session, serverTiming) = try await startSession(useNative ? inputs.native : inputs.system)
         let sessionAt = clock.now
         // 系统播放器要放的地址此刻已经确定：马上建好资源、开始读文件头 / 播放列表。
         // 主线程这时多半还在忙播放器弹出的转场，挂引擎要再等几十毫秒——AVFoundation 先干起来
@@ -110,7 +130,7 @@ struct PlaybackAPI {
         }
         return Negotiation(
             useNative: useNative, session: session, startedAt: startedAt, sessionAt: sessionAt,
-            preparedAsset: preparedAsset
+            serverTiming: serverTiming, preparedAsset: preparedAsset
         )
     }
 
@@ -166,11 +186,12 @@ struct PlaybackAPI {
     /// 请求包在后台任务里：切后台、暂停、退出时发出的上报不会因为 App 被挂起而丢在半路。
     @discardableResult
     func progress(_ unit: PlaybackUnit, event: String, positionMs: Int?, durationMs: Int? = nil, paused: Bool? = nil,
-                  audio: String?, subtitle: String?) async -> API.PlaybackStateView? {
+                  audio: String?, subtitle: String?, fileId: Int? = nil) async -> API.PlaybackStateView? {
         #if DEBUG
         if Self.progressDisabled { return nil }
         #endif
-        let body = progressBody(unit, event: event, positionMs: positionMs, paused: paused, audio: audio, subtitle: subtitle)
+        let body = progressBody(unit, event: event, positionMs: positionMs, paused: paused, audio: audio, subtitle: subtitle,
+                                fileId: fileId)
         let background = UIApplication.shared.beginBackgroundTask(withName: "playback-progress")
         defer { if background != .invalid { UIApplication.shared.endBackgroundTask(background) } }
         if let shareSlug {
@@ -181,11 +202,13 @@ struct PlaybackAPI {
     }
 
     /// App 即将被结束：同步补发一次 stop，最多等 1.5 秒（异步任务在进程退出前跑不完）
-    func stopBeforeTermination(_ unit: PlaybackUnit, positionMs: Int, durationMs: Int?, audio: String?, subtitle: String?) {
+    func stopBeforeTermination(_ unit: PlaybackUnit, positionMs: Int, durationMs: Int?, audio: String?, subtitle: String?,
+                               fileId: Int? = nil) {
         #if DEBUG
         if Self.progressDisabled { return }
         #endif
-        let body = progressBody(unit, event: "stop", positionMs: positionMs, paused: nil, audio: audio, subtitle: subtitle)
+        let body = progressBody(unit, event: "stop", positionMs: positionMs, paused: nil, audio: audio, subtitle: subtitle,
+                                fileId: fileId)
         let path: String
         if let shareSlug {
             ShareLocalProgress.write(shareSlug, unit, positionMs: Self.localResume(positionMs, durationMs: durationMs), audio: audio, subtitle: subtitle)
@@ -203,12 +226,13 @@ struct PlaybackAPI {
         _ = done.wait(timeout: .now() + 1.5)
     }
 
+    /// `audio` / `subtitle` 只给用户亲手选的轨（见 PlaybackController.audioMemory）；`fileId` 是正在放的版本
     private func progressBody(_ unit: PlaybackUnit, event: String, positionMs: Int?, paused: Bool?,
-                              audio: String?, subtitle: String?) -> API.PlaybackProgressRequest {
+                              audio: String?, subtitle: String?, fileId: Int?) -> API.PlaybackProgressRequest {
         API.PlaybackProgressRequest(
             mediaItemId: unit.mediaItemId, seasonNumber: unit.season, episodeNumber: unit.episode,
             event: event, positionMs: positionMs, audioTrack: audio, subtitleTrack: subtitle,
-            deviceId: deviceId, paused: paused
+            fileId: fileId, deviceId: deviceId, paused: paused
         )
     }
 
@@ -251,5 +275,27 @@ struct PlaybackAPI {
     static func token(in path: String?) -> String? {
         guard let path, let components = URLComponents(string: path) else { return nil }
         return components.queryItems?.first { $0.name == "token" }?.value
+    }
+}
+
+/// 播放前的预连（详情页出现时调）：用户进了详情页多半马上要播，把播放要用的两种连接先连好——
+/// 起播协商的独立连接池（`APIClient.playbackSession`）与引擎取片源的连接（引擎补丁 P43），点播放时都已握手完毕。
+/// 真机（经反向代理的 HTTPS 域名，2026-09-30）：冷连接开会话约 105 毫秒、热连接约 63 毫秒；取流首个请求多一次握手约 20 毫秒。
+/// 20 秒内只预连一次；发的是不要鉴权、不读盘的 HEAD 健康检查，全在后台
+enum PlaybackPreconnect {
+    private static var lastAt: ContinuousClock.Instant?
+
+    static func warm(api: APIClient) {
+        #if DEBUG
+        // -mcNoPagePreconnect YES：页面出现时不预连（真机新旧对照用）
+        if UserDefaults.standard.bool(forKey: "mcNoPagePreconnect") { return }
+        #endif
+        if let lastAt, ContinuousClock.now - lastAt < .seconds(20) { return }
+        guard let health = api.server.resolve("/api/v1/health") else { return }
+        lastAt = .now
+        Task.detached(priority: .utility) {
+            APIClient.preconnectPlayback(health)
+            NativeEngine.preconnect(url: health)
+        }
     }
 }

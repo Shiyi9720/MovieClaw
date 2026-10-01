@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -563,6 +564,10 @@ class PlaybackDiagnosticsView(BaseModel):
     #: 开会话时认领到了同指纹的转码缓存（§B），以及当时可用的分片数
     cache_hit: bool = False
     cached_segments: int = 0
+    #: 服务端时间线（docs/design/transcode-latency.md §2）：每条 ``t`` 是距会话创建的毫秒数，
+    #: ``ev`` 是事件名（dispatch / accepted / src / put / landed / req / served / restart …，
+    #: Worker 报来的带 ``w_`` 前缀），其余是事件自己的字段。不含任何地址或令牌
+    timeline: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PlaybackChapterMarkView(BaseModel):
@@ -574,6 +579,22 @@ class PlaybackChapterMarkView(BaseModel):
 
     start_ms: int
     title: str | None = None
+
+
+class PlaybackSegmentView(BaseModel):
+    """可跳过的一段（docs/design/skip-intro.md）：服务端整季比对认出来的，客户端只管用。
+
+    - ``intro`` 片头：在区间里显示「跳过片头」，点了跳到 ``end_ms``；
+    - ``outro`` 片尾：到 ``start_ms`` 就提前显示「即将播放下一集」；``to_end`` 为假时
+      片尾后面还有内容（下集预告、彩蛋），按钮是「跳过片尾」；
+    - ``other`` 其他重复段（片头前的冠名广告、发行许可）：显示「跳过」。
+    """
+
+    type: Literal["intro", "outro", "other"]
+    start_ms: int
+    end_ms: int
+    #: 片尾一直放到文件结尾（只有 outro 有意义）
+    to_end: bool = False
 
 
 class PlaybackDiscFileView(BaseModel):
@@ -592,6 +613,21 @@ class PlaybackDiscListingView(BaseModel):
     files: list[PlaybackDiscFileView]
     #: 服务端选中的主播放列表文件名（诱饵判定与台账时长同一口径）；读不出时为 None
     playlist: str | None = None
+
+
+class MatroskaCuesView(BaseModel):
+    """MKV 精简索引（docs/design/playback-qoe.md §9.12）：只含视频轨索引点的 Cues 元素。
+
+    App 的播放引擎在解复用器读 SeekHead 登记的 Cues 位置时直接给这份，不必再下载原索引
+    （字幕轨多的片子原索引有几百 KB 到几 MB，外网慢时要单独下好几秒）。
+    索引点的数值与原文件逐位一致。"""
+
+    #: Cues 元素在文件里的绝对位置；引擎核对它与文件头里 SeekHead 登记的位置一致才用
+    offset: int
+    #: 精简后的整个 Cues 元素（含元素头），base64
+    data: str
+    #: 原 Cues 元素多少字节（诊断用）
+    original_bytes: int
 
 
 class PlaybackSessionView(BaseModel):
@@ -636,6 +672,13 @@ class PlaybackSessionView(BaseModel):
     #: 场景图用的，画到进度条上就是一排没有信息量的竖条。没有内嵌章节的
     #: 文件这里是空表，进度条照旧干净。
     chapters: list[PlaybackChapterMarkView] = Field(default_factory=list)
+    #: 片头 / 片尾 / 其他可跳过的段（剧集库开了「识别片头片尾」且这一季识别过才有）。
+    #: 新服务端恒为数组（没有就是空表，不会是 null）；声明成可空只为让 App 的生成模型
+    #: 对旧服务端宽容——旧服务端没有这个字段，非可选的字段缺失会让新 App 的整个会话解码失败、
+    #: 连带起不了播
+    segments: list[PlaybackSegmentView] | None = Field(default_factory=list)
+    #: 档 0 直出的 MKV：服务端缓存里有精简索引时随会话下发（没有就在后台生成，给下次用）
+    matroska_cues: MatroskaCuesView | None = None
 
 
 class PlaybackSessionRequest(PlaybackDecideRequest):
@@ -645,6 +688,11 @@ class PlaybackSessionRequest(PlaybackDecideRequest):
     #: 没看完的接续播点——分享出去的链接因此天然「各看各的进度」。显式给值
     #: （含 0）原样照办：seek 重开、「从头开始」都走这条路。
     start_ms: int | None = None
+    #: 播放编号（docs/design/playback-qoe.md §2）：App 在用户点下时生成，断线重连、原位重开、
+    #: 降级、换画质都沿用同一个。服务端据此建「已开始」的记录，并写进取流令牌
+    attempt_id: str | None = Field(default=None, max_length=64)
+    #: 客户端类型（ios / web），只用于播放记录分组
+    client: str | None = Field(default=None, max_length=16)
 
 
 class PlaybackItemView(BaseModel):
@@ -683,9 +731,13 @@ class PlaybackProgressRequest(BaseModel):
     #: （拖回开头）语义不同——别把「不知道」和「零」合并。
     position_ms: int | None = None
     #: 中性轨引用（external:<文件名> / embedded:<下标> / 字幕的 "off"）。
-    #: None = 本次不报该轨，服务端保持原值不动。
+    #: None = 本次不报该轨，服务端保持原值不动。只报**用户亲手选的**轨：
+    #: 服务端只把和默认挑选不同的当作用户的选择记下（见 apply_track_selection）。
     audio_track: str | None = None
     subtitle_track: str | None = None
+    #: 正在放的版本（会话决策的 decision.file_id）。多版本时据此判断上报的轨是不是
+    #: 这个版本的默认挑选；不给则按这一集的全部在位文件判断。
+    file_id: int | None = None
     #: 浏览器的稳定标识（前端生成、存 localStorage），语义对齐 Jellyfin 客户端
     #: 的 DeviceId：活动页「正在播放」按它区分同一成员的不同浏览器。
     device_id: str | None = Field(default=None, max_length=128)
@@ -819,14 +871,23 @@ class PlaybackClientLogPayload(BaseModel):
 
 
 class PlaybackMetricPayload(BaseModel):
-    """一次播放结束时上报的质量快照。指标口径按 CTA-2066，不自创。"""
+    """一次播放结束时上报的记录。指标口径按 CTA-2066，不自创。
+
+    带 ``attempt_id`` 的是 docs/design/playback-qoe.md 口径的收尾上报：按编号合并进服务端在
+    会话接口建好的那一行，**所有结局都报**（看完、中途退出、出画前退出、失败、异常退出）。
+    不带编号的是网页播放器的旧口径整行快照，原样落库。
+
+    数值超出上下界会被夹住、列表与明细超限会被截断（记一行警告），不拒收。
+    """
 
     library_file_id: int | None = None
+    #: 最终档位；还没定档就结束记 -1
     tier: int
     degraded_from: int | None = None
     # 引擎 / 解码后端是固定的短标识；限长防止超长字符串落库
     engine: str = Field(default="", max_length=64)
     hw_backend: str = Field(default="", max_length=64)
+    #: 旧口径：点击播放 → 首帧（网页）。新口径看 ``first_frame_ms``
     ttff_ms: int | None = None
     rebuffer_ms: int = 0
     rebuffer_count: int = 0
@@ -834,6 +895,41 @@ class PlaybackMetricPayload(BaseModel):
     dropped_frames: int | None = None
     total_frames: int | None = None
     watched_ms: int = 0
+
+    # —— playback-qoe.md 口径 ——
+    attempt_id: str | None = Field(default=None, max_length=64)
+    #: watched / exited / exit_before_start / failed / abnormal_exit
+    outcome: str = ""
+    media_item_id: int | None = None
+    season_number: int | None = None
+    episode_number: int | None = None
+    #: tap / auto_next / deeplink
+    origin: str = ""
+    #: ios / web
+    client: str = ""
+    #: 实验室场景名（启动参数 -mcLab）；空 = 真实使用
+    lab_scenario: str = ""
+    #: loopback / software / remote_bypass / server_transcode
+    route: str = ""
+    #: home / away / unknown
+    network_class: str = ""
+    #: wifi / cellular / wired / other
+    interface: str = ""
+    app_version: str = ""
+    #: 点下 → 首帧出画 / 开始走（毫秒，已扣除 user_wait_ms）
+    first_frame_ms: int | None = None
+    playing_ms: int | None = None
+    user_wait_ms: int = 0
+    #: 最后一次错误：引擎错误类型原值、归类（network / source_missing / storage_full /
+    #: decode）、阶段
+    error_kind: str = ""
+    error_category: str = ""
+    error_stage: str = ""
+    #: 逐条明细：startup / seeks / switches / interruptions / delivery / behaviors / context /
+    #: resources / timeline（字段见 playback-qoe.md §3）
+    detail: dict = {}
+    #: 失败、异常退出或冻帧时附带的引擎日志尾巴（≤ 32 KB）
+    log_tail: str = ""
 
 
 class PlaybackStatsView(BaseModel):
@@ -851,3 +947,137 @@ class PlaybackStatsView(BaseModel):
     rebuffer_ratio: float | None = None
     dropped_ratio: float | None = None
     tier_counts: dict[int, int] = {}
+
+
+class QoePercentilesView(BaseModel):
+    """一组毫秒数的分位（最近秩法）。"""
+
+    p50: int | None = None
+    p90: int | None = None
+    p99: int | None = None
+    count: int = 0
+
+
+class QoeAttemptBriefView(BaseModel):
+    """一次播放的摘要（统计里的「最差 N 条」与小样本明细）。"""
+
+    attempt_id: str | None = None
+    created_at: str | None = None
+    status: str | None = None
+    outcome: str | None = None
+    client: str | None = None
+    media_item_id: int | None = None
+    season_number: int | None = None
+    episode_number: int | None = None
+    library_file_id: int | None = None
+    tier: int | None = None
+    source_class: str | None = None
+    route: str | None = None
+    network_class: str | None = None
+    first_frame_ms: int | None = None
+    seek_max_ms: int | None = None
+    interrupt_count: int | None = None
+    error_kind: str | None = None
+    avoidable_loss: bool | None = None
+    misguess_count: int | None = None
+    undisturbed: bool | None = None
+
+
+class QoeGroupStatsView(BaseModel):
+    """一组播放的体验统计。样本少于 30 条时各项为 null，改列 ``samples`` 明细——不编数字。"""
+
+    attempts: int = 0
+    reported: int = 0
+    unreported: int = 0
+    in_progress: int = 0
+    small_sample: bool = False
+    #: 北极星：无打扰播放率（只算已收尾且判定过的）
+    undisturbed_rate: float | None = None
+    first_frame_ms: QoePercentilesView | None = None
+    seek_in_buffer_ms: QoePercentilesView | None = None
+    seek_out_buffer_ms: QoePercentilesView | None = None
+    interrupts_per_hour: float | None = None
+    failure_rate: float | None = None
+    exit_before_start_rate: float | None = None
+    abnormal_exit_rate: float | None = None
+    avoidable_loss_rate: float | None = None
+    misguess_rate: float | None = None
+    samples: list[QoeAttemptBriefView] | None = None
+
+
+class QoeGroupView(QoeGroupStatsView):
+    key: str
+    label: str
+
+
+class QoeReasonView(BaseModel):
+    """打扰原因的帕累托：一种原因打扰了多少次播放。"""
+
+    reason: str
+    label: str
+    count: int
+
+
+class PlaybackQoeStatsView(BaseModel):
+    """播放体验统计（docs/design/playback-qoe.md §5.5）：北极星、快 / 稳 / 对、打扰原因、
+    最差的播放。"""
+
+    days: int
+    since: str
+    include_lab: bool
+    group_by: str | None = None
+    overall: QoeGroupStatsView
+    groups: list[QoeGroupView] = []
+    reasons: list[QoeReasonView] = []
+    worst: list[QoeAttemptBriefView] = []
+
+
+class PlaybackAttemptView(BaseModel):
+    """一次播放的完整记录与时间线（docs/design/playback-qoe.md §5.5）。"""
+
+    attempt_id: str
+    status: str
+    outcome: str
+    client: str
+    origin: str
+    lab_scenario: str
+    member_id: int
+    media_item_id: int | None = None
+    season_number: int | None = None
+    episode_number: int | None = None
+    library_file_id: int | None = None
+    tier: int
+    degraded_from: int | None = None
+    engine: str
+    route: str
+    source_class: str
+    network_class: str
+    interface: str
+    app_version: str
+    first_frame_ms: int | None = None
+    playing_ms: int | None = None
+    user_wait_ms: int
+    seek_in_count: int
+    seek_in_p90_ms: int | None = None
+    seek_in_max_ms: int | None = None
+    seek_out_count: int
+    seek_out_p90_ms: int | None = None
+    seek_out_max_ms: int | None = None
+    rebuffer_count: int
+    rebuffer_ms: int
+    freeze_count: int
+    freeze_ms: int
+    reconnect_count: int
+    reconnect_ms: int
+    interrupt_count: int
+    error_kind: str
+    error_category: str
+    error_stage: str
+    avoidable_loss: bool | None = None
+    misguess_count: int
+    undisturbed: bool | None = None
+    watched_ms: int
+    created_at: str
+    ended_at: str | None = None
+    detail: dict = {}
+    log_tail: str = ""

@@ -574,6 +574,29 @@ def test_switches_track_instead_of_transcoding():
     assert decision.audio.track_ref == "embedded:2"
 
 
+def test_automatic_switch_stays_within_the_same_language():
+    """首选轨放不了、能直通的只有另一种语言：宁可转码音频也不换语言——换轨只在同语言里找。
+
+    为省一路（很便宜的）音频转码把国语换成英语，是拿听感换 CPU；换过去的轨以前还会被
+    当成记忆带到别的设备上。同语言的兼容轨照换（换轨是免费的）。
+    """
+    zh_dts = AudioTrack(ref="embedded:1", codec="dts", channels=6, language="chi", is_default=True)
+    en_aac = AudioTrack(ref="embedded:2", codec="aac", channels=2, language="eng")
+    decision = decide_playback(
+        media(video_codec="hevc", audio_tracks=(zh_dts, en_aac)), CHROME_HEVC, WITH_GPU
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.audio.track_ref == "embedded:1"
+    assert decision.tier is PlaybackTier.AUDIO_TRANSCODE
+
+    zh_aac = AudioTrack(ref="embedded:3", codec="aac", channels=2, language="chi")
+    decision = decide_playback(
+        media(video_codec="hevc", audio_tracks=(zh_dts, en_aac, zh_aac)), CHROME_HEVC, WITH_GPU
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.audio.track_ref == "embedded:3"
+
+
 def test_downmix_marked_when_channels_exceed_device():
     """5.1 → 立体声必须标 downmix：不带中置加权系数，对白会明显偏小。"""
     decision = decide_playback(media(audio_tracks=(AAC_51,)), PHONE_SOFT_HEVC, WITH_GPU)
@@ -795,6 +818,34 @@ def test_picking_default_audio_keeps_direct_play():
         preferred_audio="embedded:1",
     )
     assert decision.tier is PlaybackTier.DIRECT_PLAY
+
+
+def test_policy_pick_plays_without_being_asked_and_needs_remux():
+    """默认轨策略挑中的轨（``preferred``，如英文片的英语原声）不经用户点选就放它；
+    它不是容器默认轨（国语配音标了默认），直出放不了它，要重封装——和用户点选同一个判定。"""
+    dub = AudioTrack(ref="embedded:1", codec="aac", channels=2, language="chi", is_default=True)
+    original = AudioTrack(
+        ref="embedded:2", codec="aac", channels=2, language="eng", preferred=True
+    )
+    decision = decide_playback(
+        media(container="mp4", audio_tracks=(dub, original)), CHROME_HEVC, WITH_GPU
+    )
+    assert isinstance(decision, PlaybackPlan)
+    assert decision.audio.track_ref == "embedded:2"
+    assert decision.tier is PlaybackTier.REMUX
+
+
+def test_policy_pick_on_the_container_default_keeps_direct_play():
+    """策略挑的就是容器默认轨（绝大多数片子）：照旧直出，不为策略多起一次重封装。"""
+    original = AudioTrack(
+        ref="embedded:1", codec="aac", channels=2, language="eng", is_default=True, preferred=True
+    )
+    dub = AudioTrack(ref="embedded:2", codec="aac", channels=2, language="chi")
+    decision = decide_playback(
+        media(container="mp4", audio_tracks=(original, dub)), CHROME_HEVC, WITH_GPU
+    )
+    assert decision.tier is PlaybackTier.DIRECT_PLAY
+    assert decision.audio.track_ref == "embedded:1"
 
 
 def test_unrecognized_audio_codec_is_never_the_automatic_pick():

@@ -448,6 +448,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `playlistShiftSeconds` (updated dynamically per gate open).
     public private(set) var firstKeyframeSeconds: Double = 0
 
+    /// [MovieClaw P36] 可信关键帧表（MKV Cues / MP4 stss，与关键帧对齐的分片计划同源），源时间轴上的秒，升序。
+    /// 没有可信索引（TS、均匀切分）时为空：跳转照旧精确落点。见 `KeyframeSnapPolicy`
+    private(set) var seekKeyframeSourceSeconds: [Double] = []
+    /// [MovieClaw P36] 每秒源时长逐帧解码的估计耗时（秒），按帧率与画面尺寸折算
+    private(set) var seekDecodeCostPerSecond: Double = 0
+
     /// AE#270: source PTS the container's timeline starts at, clamped at 0. The published playhead folds
     /// it out so it stays on the same 0-based axis as `duration`.
     public private(set) var sourceStartSeconds: Double = 0
@@ -804,9 +810,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private var hasReportedHDR10Plus = false
     private let hdr10PlusLock = NSLock()
 
-    /// Target segment duration (4 s). Apple spec recommends 6 s; 4 s cuts ~370 ms first-segment
+    /// Target segment duration. Apple spec recommends 6 s; 4 s cuts ~370 ms first-segment
     /// latency on a 24 fps 1440p LAN source and stays within the spec's 2-6 s range.
-    static let targetSegmentDuration: Double = 4.0
+    /// [MovieClaw P33] 点播改为 2 秒（`AetherEngine.vodSegmentTargetSeconds`，宿主可在装载前改）；直播仍按 4 秒切
+    static var targetSegmentDuration: Double { AetherEngine.vodSegmentTargetSeconds }
+
+    /// [MovieClaw P33] 上游的 4 秒。直播标准档、量不出关键帧间隔的均匀切分仍用它：
+    /// 步长短于 GOP 会切出没有关键帧的空段（#358），间隔未知时不冒这个险
+    static let upstreamSegmentTargetSeconds: Double = 4.0
 
     /// [MovieClaw patch P3] Cut target for segment 0 only. AVPlayer cannot start before the first
     /// segment is fully produced and served, so its size is start latency: on an 87 Mbit/s UHD remux
@@ -824,7 +835,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Resolve a host `LiveJoinProfile` to the live segment cut target.
     static func liveCutTargetSeconds(for profile: LiveJoinProfile) -> Double {
         switch profile {
-        case .standard: return targetSegmentDuration
+        case .standard: return upstreamSegmentTargetSeconds   // [MovieClaw P33]
         case .fastZap: return fastZapLiveCutTargetSeconds
         }
     }
@@ -912,7 +923,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         heldSourceConnection: Bool = false,
         declaredDurationSeconds: Double? = nil,
         forwardBufferSegments: Int? = nil,
-        backwardBufferSegments: Int? = nil
+        backwardBufferSegments: Int? = nil,
+        hostMatroskaCues: MatroskaHostCues? = nil
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
@@ -928,6 +940,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
+            .withHostMatroskaCues(hostMatroskaCues)   // [MovieClaw P58]
+        self.hostMatroskaCues = hostMatroskaCues
         self.dvModeAvailable = dvModeAvailable
         self.displaySupportsHDR = displaySupportsHDR
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
@@ -1129,6 +1143,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     let openProfile: DemuxerOpenProfile
     /// #377: opt-in held source transport, carried onto every open this session makes itself.
     let heldSourceConnection: Bool
+    /// [MovieClaw P58] 服务端给的 Matroska 精简索引：卡死重开的新解复用器也要带上，否则它得把原索引整段重新下载
+    let hostMatroskaCues: MatroskaHostCues?
 
     /// The profile the VOD scrub restart opens its replacement demuxer with. Bounded
     /// find_stream_info budget, and the same SOURCE declarations as the first open: a ranged reopen
@@ -1139,6 +1155,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         DemuxerOpenProfile.restartReopen
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
+            .withHostMatroskaCues(hostMatroskaCues)   // [MovieClaw P58]
     }
 
     /// `LoadOptions.sequentialOrigin` for this session. Gates the VOD readError revive
@@ -1270,7 +1287,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
             guard durationSeconds > 0 else {
                 throw HLSVideoEngineError.zeroDuration
             }
-            sourceBitrate = dem.bitRate
+            // [MovieClaw P37] 容器没声明码率时按总字节 ÷ 时长估，别让 BANDWIDTH 落到兜底值
+            sourceBitrate = dem.estimatedBitRate(durationSeconds: durationSeconds)
+            if dem.bitRate <= 0, sourceBitrate > 0 {
+                EngineLog.emit("[HLSVideoEngine] [MovieClaw P37] 容器未声明码率，按片源大小估 \(sourceBitrate / 1_000_000) Mbit/s", category: .session)
+            }
 
             // #409: settle the composition-offset repair while the demuxer still stands at the head.
             // It reads a short sample and holds those packets, so nothing is consumed; doing it later
@@ -1310,11 +1331,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
                           + "and the prefix it consumes is the producer's only pass)"
                 )
             } else {
+                // [MovieClaw P45] 跳到起播点而不是片中间：任何一次跳转都会让 libavformat 加载延后的 Cues，索引一样到手；
+                // 跳完读到的那一簇正是生产者接下来要读的。片源字节缓存跨启动保留（P42）以后，续播时文件头、Cues 与续播点
+                // 附近都在本机，片中间那一簇却多半不在——真机开着 P42 续播 MKV，这一步仍有 45～70 毫秒是它的网络冷读
+                let prewarmTarget = AetherEngine.cuePrewarmTargetsStart
+                    ? min(max(0, initialStartSeconds ?? 0), max(0, durationSeconds - 1))
+                    : durationSeconds * 0.5
                 let prewarmStart = DispatchTime.now()
-                let prewarmOK = dem.seekBounded(to: durationSeconds * 0.5, timeout: Self.cuePrewarmTimeout)
+                let prewarmOK = dem.seekBounded(to: prewarmTarget, timeout: Self.cuePrewarmTimeout)
                 let prewarmMs = Double(DispatchTime.now().uptimeNanoseconds - prewarmStart.uptimeNanoseconds) / 1_000_000
                 if prewarmOK {
-                    EngineLog.emit("[HLSVideoEngine] cue prewarm: seek to \(String(format: "%.1f", durationSeconds * 0.5))s took \(String(format: "%.1f", prewarmMs))ms")
+                    EngineLog.emit("[HLSVideoEngine] cue prewarm: seek to \(String(format: "%.1f", prewarmTarget))s took \(String(format: "%.1f", prewarmMs))ms")
                 } else {
                     EngineLog.emit("[HLSVideoEngine] cue prewarm: capped at \(String(format: "%.1f", prewarmMs))ms (no usable Cues index, index points past EOF or is absent); building plan from whatever keyframes were scanned")
                 }
@@ -1362,6 +1389,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     sourceDurationSeconds: durationSeconds
                 )
                 planBoundariesClaimRandomAccess = true
+                // [MovieClaw P36] 留下关键帧表与解码代价，供主力通路跳转按代价吸附
+                let tbSeconds = Double(videoTimeBase.num) / Double(videoTimeBase.den)
+                seekKeyframeSourceSeconds = keyframes.sorted().map { Double($0) * tbSeconds }
+                seekDecodeCostPerSecond = KeyframeSnapPolicy.decodeCostPerSecond(
+                    frameRate: AetherEngine.detectFrameRate(stream: videoStream),
+                    width: Int(videoStream.pointee.codecpar.pointee.width),
+                    height: Int(videoStream.pointee.codecpar.pointee.height))
                 // AE#561: these boundaries ARE this container's index entries, so they carry its
                 // stamping. Read from the demuxer that produced them, never from the URL or the
                 // host's metadata: on a remux session the delivered container is the one indexed.
@@ -1400,7 +1434,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     // soften don't bite this path: the append playlist gives zero-duration holes no
                     // URI and its EXTINF is real by construction.
                     spacing = .unknown
-                    stride = Self.targetSegmentDuration
+                    stride = Self.upstreamSegmentTargetSeconds   // [MovieClaw P33]
                 } else {
                     spacing = measureKeyframeSpacing(
                         demuxer: dem,
@@ -1634,7 +1668,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             convertP7ToProfile81: convertP7ToProfile81,
             colorOverride: p5ColorOverride,
             extradataOverride: hevcExtradataOverride,
-            nalFramingOverride: measuredVideoNALFraming
+            nalFramingOverride: measuredVideoNALFraming,
+            annexBSamplesKeepParameterSets: framingNormalization.annexBSamplesKeepParameterSets
         )
         self.videoStreamIndex = videoIndex
         self.savedVideoConfig = videoConfig

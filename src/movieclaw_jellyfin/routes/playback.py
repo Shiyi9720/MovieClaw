@@ -34,7 +34,8 @@ from sqlalchemy import select
 
 from movieclaw_api.api.routes.playback import get_session_segment
 from movieclaw_api.exceptions import NotFoundException
-from movieclaw_api.services.library.access import member_visible_ids
+from movieclaw_api.services.library import skip_segments
+from movieclaw_api.services.library.access import member_content_limit, member_visible_ids
 from movieclaw_api.services.playback import watch as playback_watch
 from movieclaw_api.services.playback.adaptive import adapt_to_downlink
 from movieclaw_api.services.playback.disc_source import disc_source_for_file
@@ -70,10 +71,11 @@ from movieclaw_api.services.playback.session import (
     get_session_manager,
 )
 from movieclaw_api.services.playback.signing import issue_stream_token, verify_stream_token
+from movieclaw_api.services.playback.track_context import files_with_contexts, track_context
 from movieclaw_api.settings import PlaybackPolicySetting
 from movieclaw_api.settings.store import get_setting_store
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import LibraryFile
+from movieclaw_db.models import LibraryFile, MediaMetadata
 from movieclaw_jellyfin.catalog import (
     audio_track_for_index,
     index_for_subtitle_track,
@@ -134,10 +136,14 @@ from movieclaw_playback.subtitles import (
     SubtitleServeError,
     embedded_track,
     parse_embedded_track,
-    resolve_default_audio,
-    resolve_default_subtitle,
     resolve_external_subtitle,
     serve_subtitle_async,
+)
+from movieclaw_playback.track_policy import (
+    NO_CONTEXT,
+    TrackContext,
+    resolve_audio,
+    resolve_subtitle,
 )
 
 logger = logging.getLogger("movieclaw_jellyfin.playback")
@@ -148,11 +154,31 @@ router = APIRouter(dependencies=[Depends(require_device)])
 async def _files_for_ref(ref, member_id: int = 0) -> list[LibraryFile]:
     """按条目/单元 GUID 取在位文件行（多版本多行，稳定排序）。
 
-    成员的库可见性在这里强制（三个播放处理器共用本装载点）：白名单外
-    库里的文件直接不出现，条目因此对该成员表现为 404——GUID 可枚举，
-    不能只在浏览路径挡、放播放路径直进（member-management.md §3.6）。
+    成员的库可见性与内容分级都在这里强制（起播、取流、下载、续播上报共用本
+    装载点）：白名单外库里的文件、超出年龄上限的条目直接不出现，条目因此对该
+    成员表现为 404——GUID 可枚举，不能只在浏览路径挡、放播放路径直进
+    （member-management.md §3.6、member-permissions-v2.md §2.1 S4）。
     """
+    return (await _files_and_contexts_for_ref(ref, member_id, with_contexts=False))[0]
+
+
+async def _files_and_contexts_for_ref(
+    ref, member_id: int = 0, *, with_contexts: bool = True
+) -> tuple[list[LibraryFile], dict[int, TrackContext]]:
+    """同 :func:`_files_for_ref`，连带各文件的默认轨策略上下文（库语言、原始语言）——
+    同一条 SQL 取出（PlaybackInfo 要按它给默认轨，不为此多查一次）。"""
     async with get_database().session() as session:
+        limit = await member_content_limit(session, member_id)
+        if not limit.unrestricted:
+            rating = (
+                await session.execute(
+                    select(MediaMetadata.content_rating).where(
+                        MediaMetadata.media_item_id == ref.entity_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if not limit.allows(rating):
+                return [], {}
         visible = await member_visible_ids(session, member_id)
         q = select(LibraryFile).where(
             LibraryFile.media_item_id == ref.entity_id,
@@ -167,9 +193,12 @@ async def _files_for_ref(ref, member_id: int = 0) -> list[LibraryFile]:
             )
         elif ref.kind == EntityKind.ITEM:
             q = q.where(LibraryFile.season_number == 0, LibraryFile.episode_number == 0)
-        rows = list((await session.execute(q)).scalars())
+        if with_contexts:
+            rows, contexts = await files_with_contexts(session, q)
+        else:
+            rows, contexts = list((await session.execute(q)).scalars()), {}
     rows.sort(key=lambda f: f.id)
-    return rows
+    return rows, contexts
 
 
 def _select_source(
@@ -186,6 +215,60 @@ def _select_source(
     if normalized == item_norm and files:
         return [files[0]]
     return []
+
+
+#: 片段类型 → Jellyfin MediaSegmentType（10.10 的枚举名）。「其他」是片头前的冠名广告、
+#: 发行许可这类，最接近 Commercial
+_SEGMENT_TYPES = {"intro": "Intro", "outro": "Outro", "other": "Commercial"}
+
+
+@router.get("/MediaSegments/{item_id}")
+async def media_segments(
+    request: Request,
+    item_id: str,
+    identity: RequestIdentity = Depends(require_device),
+) -> JSONResponse:
+    """片头 / 片尾分段（Jellyfin 10.9+，docs/design/skip-intro.md）。
+
+    Infuse 每次起播都会查；有分段时显示「跳过片头」。数据是 movieclaw 整季音频比对
+    认出来的（库开了「识别片头片尾」、这一季识别过才有），没有时返回空 QueryResult——
+    形态对齐真 Jellyfin 无分段时的响应。分段按集给：同一集有多个版本时取第一个识别过的
+    版本（片头片尾在不同版本里位置几乎一致）。
+    """
+    empty = {"Items": [], "TotalRecordCount": 0, "StartIndex": 0}
+    ref = decode_guid(item_id)
+    if ref is None or ref.kind != EntityKind.EPISODE:
+        return JSONResponse(empty)
+    wanted = {
+        part.strip().lower()
+        for raw in request.query_params.getlist("includeSegmentTypes")
+        for part in raw.split(",")
+        if part.strip()
+    }
+    files = await _files_for_ref(ref, identity.device.member_id)
+    async with get_database().session() as session:
+        segments: list[dict] = []
+        for f in files:
+            segments = await skip_segments.segments_for_file(session, f)
+            if segments:
+                break
+    item_guid = episode_guid(ref.entity_id, ref.season, ref.episode)
+    items = []
+    for index, seg in enumerate(segments):
+        kind = _SEGMENT_TYPES.get(str(seg.get("type")))
+        if kind is None or (wanted and kind.lower() not in wanted):
+            continue
+        items.append(
+            {
+                # 分段 id：同一集内按序号派生，稳定即可（客户端只拿来去重）
+                "Id": f"{item_guid[:28]}{index:04x}",
+                "ItemId": item_guid,
+                "Type": kind,
+                "StartTicks": int(seg["start_ms"]) * 10_000,
+                "EndTicks": int(seg["end_ms"]) * 10_000,
+            }
+        )
+    return JSONResponse({"Items": items, "TotalRecordCount": len(items), "StartIndex": 0})
 
 
 @router.get("/Items/{item_id}/PlaybackInfo")
@@ -217,7 +300,8 @@ async def playback_info(
     negotiation = parse_negotiation(request.query_params, body)
     audio_stream_index = negotiation.audio_stream_index
 
-    files = await _files_for_ref(ref, identity.device.member_id)
+    # 默认轨策略的上下文（库语言、原始语言）随取文件的同一条 SQL 取出
+    files, contexts = await _files_and_contexts_for_ref(ref, identity.device.member_id)
     selected = _select_source(files, media_source_id, item_id)
     if not selected:
         return JSONResponse({"MediaSources": [], "ErrorCode": "NoCompatibleStream"})
@@ -247,7 +331,8 @@ async def playback_info(
     )
     for f, source in pairs:
         _apply_subtitle_delivery(source, f, ref, identity.device.token)
-        _apply_default_tracks(source, f, audio_mem, subtitle_mem)
+        context = contexts.get(f.id or 0, NO_CONTEXT)
+        _apply_default_tracks(source, f, audio_mem, subtitle_mem, context)
         if f.is_disc():
             _apply_disc_transcoding(
                 source, f, ref, identity.device.token, play_session_id, audio_stream_index
@@ -520,22 +605,33 @@ def _apply_subtitle_delivery(source: dict, f: LibraryFile, ref: EntityRef, token
         )
 
 
+async def _track_context_for(f: LibraryFile) -> TrackContext:
+    """取流端点里客户端没指定音轨时，按默认轨策略补：取这个文件的上下文（一次查询）。"""
+    async with get_database().session() as session:
+        return await track_context(session, f)
+
+
 def _apply_default_tracks(
-    source: dict, f: LibraryFile, audio_mem: str | None, subtitle_mem: str | None
+    source: dict,
+    f: LibraryFile,
+    audio_mem: str | None,
+    subtitle_mem: str | None,
+    context: TrackContext,
 ) -> None:
-    """默认轨输出：记忆优先、失效回落选择策略（jellyfin-subtitle.md §4.3/S3）。
+    """默认轨输出：记忆优先、失效回落默认轨策略（jellyfin-subtitle.md §4.3/S3、track_policy）。
 
+    - 音轨：记忆有效用记忆，否则按默认轨策略（原声语言、同语言音质最好的），覆盖
+      media_source_dto 按容器 default 旗标算出的值；
     - 字幕：记忆 "off" → -1（协议里"-1=用户明确不要字幕"是有效值）；
-      记忆有效 → 其 Index；无记忆/失效 → Default 模式策略；策略也无 →
-      不输出字段（客户端默认不开字幕）；
-    - 音轨：记忆有效则覆盖 media_source_dto 按 default 旗标算出的值。
+      记忆有效 → 其 Index；无记忆/失效 → 默认轨策略（库语言，看将要放的音轨）；策略也不开 →
+      不输出字段（客户端默认不开字幕）。
     """
-    audio_index = resolve_default_audio(f, audio_mem)
-    if audio_index is not None:
+    audio = resolve_audio(f, audio_mem, context)
+    if audio.index is not None:
         # Jellyfin 把外挂流置前，video/audio 的协议编号随外挂数量整体后移。
-        source["DefaultAudioStreamIndex"] = len(f.external_subtitles or []) + 1 + audio_index
+        source["DefaultAudioStreamIndex"] = len(f.external_subtitles or []) + 1 + audio.index
 
-    track = resolve_default_subtitle(f, subtitle_mem)
+    track = resolve_subtitle(f, subtitle_mem, context, audio.ref).ref
     if track == SUBTITLE_OFF:
         source["DefaultSubtitleStreamIndex"] = -1
     elif track is not None:
@@ -1027,7 +1123,7 @@ async def _capped_transcode_spec(f: LibraryFile, params: TranscodeParams) -> _Se
         else None
     )
     if audio_ref is None:
-        default_index = resolve_default_audio(f, None)
+        default_index = resolve_audio(f, None, await _track_context_for(f)).index
         audio_ref = embedded_track(default_index if default_index is not None else 0)
     decision = plan_capped_transcode(
         media_profile_from_file(f),
@@ -1111,7 +1207,7 @@ async def _disc_remux_spec(f: LibraryFile, params: TranscodeParams) -> _SessionS
     if params.audio_stream_index is not None:
         requested_ref = audio_track_for_index(f, params.audio_stream_index)
     if requested_ref is None:
-        default_index = resolve_default_audio(f, None)
+        default_index = resolve_audio(f, None, await _track_context_for(f)).index
         requested_ref = f"embedded:{default_index if default_index is not None else 0}"
     track = fmp4_copy_audio_track(media_profile_from_file(f).audio_tracks, requested_ref)
     if track is not None and track.ref != requested_ref:

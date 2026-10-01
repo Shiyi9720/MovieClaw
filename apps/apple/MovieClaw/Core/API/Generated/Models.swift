@@ -268,28 +268,37 @@ nonisolated extension API {
     struct ArtworkCandidatesView: Codable, Hashable, Sendable {
         var posters: [API.ArtworkCandidateView]
         var backdrops: [API.ArtworkCandidateView]
+        /// 片名徽标（透明底 PNG，镜像为 clearlogo.png）
+        var logos: [API.ArtworkCandidateView]
         /// 当前在用的海报路径
         var currentPoster: String?
         /// 当前在用的背景路径
         var currentBackdrop: String?
+        /// 当前在用的徽标路径；null=没有（TMDB 无合适徽标）
+        var currentLogo: String?
         /// 海报已手动选定，刷新不覆盖
         var posterLocked: Bool
         /// 背景已手动选定，刷新不覆盖
         var backdropLocked: Bool
+        /// 徽标已手动选定，刷新不覆盖
+        var logoLocked: Bool
 
         enum CodingKeys: String, CodingKey {
             case posters
             case backdrops
+            case logos
             case currentPoster = "current_poster"
             case currentBackdrop = "current_backdrop"
+            case currentLogo = "current_logo"
             case posterLocked = "poster_locked"
             case backdropLocked = "backdrop_locked"
+            case logoLocked = "logo_locked"
         }
     }
 
-    /// 选图请求：kind 指海报还是背景；file_path 为 null 表示恢复自动选图。
+    /// 选图请求：kind 指哪种图；file_path 为 null 表示恢复自动选图。
     struct ArtworkSelectPayload: Codable, Hashable, Sendable {
-        /// poster=海报 / backdrop=背景图
+        /// poster=海报 / backdrop=背景图 / logo=片名徽标
         var kind: String
         /// TMDB 图片路径；null=解锁并恢复自动选图
         var filePath: String?
@@ -791,17 +800,21 @@ nonisolated extension API {
     }
 
     /// 整组认领：一次把多个待识别文件挂到同一个 TMDB 条目。
-    /// 季集号不在这里指定——每个文件沿用扫描时已从文件名解析出的季集号，
-    /// 这正是"一部剧几十集一次认领"能成立的前提。
+    /// 季集号默认不在这里指定——每个文件沿用扫描时已从文件名解析出的季集号，
+    /// 这正是"一部剧几十集一次认领"能成立的前提。季号解析不出的一组（待识别
+    /// 分类 ``unit_unresolved``）用 ``season_number`` 统一指定季号，集号照旧沿用。
     struct ClaimBatchPayload: Codable, Hashable, Sendable {
         /// 待识别文件 id 数组（来自待识别清单接口），如 [101,102]
         var fileIds: [Int]
         /// Discover 返回的 TMDB 影视条目稳定引用，如 tmdb:tv:1396
         var titleRef: String
+        /// 整组统一指定的季号（剧集；0=特别篇）；缺省沿用各文件解析出的季号
+        var seasonNumber: Int?
 
         enum CodingKeys: String, CodingKey {
             case fileIds = "file_ids"
             case titleRef = "title_ref"
+            case seasonNumber = "season_number"
         }
     }
 
@@ -955,8 +968,10 @@ nonisolated extension API {
         var visibility: String
         /// 内置合集标识；null=用户创建
         var builtin: String?
-        /// 能不能改规则（builtin 为 null 才能）
+        /// 当前观看者能不能改规则与名单（用户创建的合集，且 manageable 为真）
         var editable: Bool
+        /// 当前观看者能不能管理这个合集（改名、排序、可见性、隐藏、删除）：超管恒为真；成员只能管理自己的私有合集与自己建的全家合集
+        var manageable: Bool
         /// 规则驱动（会自己长）还是名单驱动（固定）
         var ruleDriven: Bool
         /// 当前可见成员数
@@ -980,6 +995,7 @@ nonisolated extension API {
             case visibility
             case builtin
             case editable
+            case manageable
             case ruleDriven = "rule_driven"
             case itemCount = "item_count"
             case coverItemId = "cover_item_id"
@@ -2850,9 +2866,9 @@ nonisolated extension API {
         }
     }
 
-    /// 预检还没有结论：内封轨正在后台抽取，稍后重试同一个接口即可。
-    /// 与 ``blocker`` 互斥语义：blocker 说「这份片源做不了」，pending 说
-    /// 「再等一会儿」。前端据此显示进度文案并轮询，而不是把用户挡在错误里。
+    /// 旧版服务端的「预检还没有结论，稍后重试」信号。
+    /// 新版预检不再读视频，永远当场给结论，这个字段恒为 null；保留它是为了让
+    /// 新版 App 连到旧版服务端时，仍能识别旧服务端返回的 pending 并照旧轮询。
     struct GenPreviewPendingView: Codable, Hashable, Sendable {
         /// 面向用户的等待文案
         var message: String
@@ -2881,6 +2897,8 @@ nonisolated extension API {
         var blocker: API.GenPreviewBlockerView?
         var outputFilename: String?
         var pending: API.GenPreviewPendingView?
+        /// 非空 = 参考字幕还没读取过（内封轨首次使用），确认后由任务先读取；此时 event_count 为 0，estimated_tokens 按片长粗估
+        var referenceNotice: String?
 
         enum CodingKeys: String, CodingKey {
             case candidates
@@ -2894,6 +2912,7 @@ nonisolated extension API {
             case blocker
             case outputFilename = "output_filename"
             case pending
+            case referenceNotice = "reference_notice"
         }
     }
 
@@ -2915,6 +2934,27 @@ nonisolated extension API {
             case sourceCandidateKey = "source_candidate_key"
             case convertPgs = "convert_pgs"
             case pgsOcrLanguage = "pgs_ocr_language"
+        }
+    }
+
+    /// 保存 GitHub 访问令牌的请求体。空串 = 清除令牌。
+    struct GithubTokenPayload: Codable, Hashable, Sendable {
+        /// GitHub 访问令牌；空 = 清除
+        var token: String?
+
+        enum CodingKeys: String, CodingKey {
+            case token
+        }
+    }
+
+    /// GitHub 访问令牌的配置状态。令牌明文永不回传，只给打码后的尾号供用户辨认。
+    struct GithubTokenView: Codable, Hashable, Sendable {
+        var configured: Bool
+        var masked: String
+
+        enum CodingKeys: String, CodingKey {
+            case configured
+            case masked
         }
     }
 
@@ -3685,7 +3725,7 @@ nonisolated extension API {
         var renamed: Int
         /// 跟随改名的附属文件数（字幕、分集剧照等）
         var sidecarsRenamed: Int
-        /// 跟随条目目录改名的镜像资产数（海报/背景/季海报/条目 NFO）
+        /// 跟随条目目录改名的镜像资产数（海报/背景/Logo/季海报/条目 NFO）
         var entryAssetsMoved: Int
         /// 本就符合规范、无需动作的文件数
         var alreadyOk: Int
@@ -3863,7 +3903,9 @@ nonisolated extension API {
         var audioStreams: [API.AudioStreamView]?
         /// 字幕列表：内封轨 + 外挂文件
         var subtitleStreams: [API.SubtitleStreamView]
-        /// 有效章节列表（内嵌或按时长合成）；null=尚未探测
+        /// 当前成员起播时会放的音轨 / 字幕与原因；null = 原盘或尚未探测轨道（界面退回按片源标注的默认旗标展示）
+        var playbackDefaults: API.TrackDefaultsView?
+        /// 有效章节列表（内嵌或按时长合成）；null=所在库未开启「生成章节」或尚未探测
         var chapters: [API.ChapterView]?
         var addedAt: String
 
@@ -3895,6 +3937,7 @@ nonisolated extension API {
             case keptAt = "kept_at"
             case audioStreams = "audio_streams"
             case subtitleStreams = "subtitle_streams"
+            case playbackDefaults = "playback_defaults"
             case chapters
             case addedAt = "added_at"
         }
@@ -4013,6 +4056,8 @@ nonisolated extension API {
         var year: Int?
         var posterUrl: String?
         var backdropUrl: String?
+        /// 片名 Logo（透明底 PNG）；没有时前端显示文字片名
+        var logoUrl: String?
         /// 主图宽高比（同海报墙）
         var primaryAspect: Double
         /// NFO 本地刮削元数据；目录里没有可用 NFO 时为 null
@@ -4049,6 +4094,7 @@ nonisolated extension API {
             case year
             case posterUrl = "poster_url"
             case backdropUrl = "backdrop_url"
+            case logoUrl = "logo_url"
             case primaryAspect = "primary_aspect"
             case localMeta = "local_meta"
             case entryDirs = "entry_dirs"
@@ -4152,8 +4198,10 @@ nonisolated extension API {
         var source: String?
         /// 缺图时是否从视频抓帧生成缩略图：本地来源内容的封面、剧集库里 TMDB 没有剧照的分集（网络挂载库抓帧等于全量下载，可关）；不传表示不改动，新建时默认开启
         var generateThumbnails: Bool?
-        /// 是否为视频章节抓取场景图（后台低优先级作业，每个文件按章节数 seek 若干次）；不传表示不改动，新建时默认开启
+        /// 是否生成并展示视频章节：场景图在后台低优先级作业里抓（每个文件按章节数 seek 若干次），详情页章节横排、图廊章节图与 Jellyfin 合成章节都随它开关；关闭时文件自带的内嵌章节仍供播放器跳章，已生成的图保留。从关改为开会立即在后台补齐库内已有视频的章节，从开改为关会停掉进行中的章节生成。不传表示不改动，新建时默认关闭
         var extractChapterImages: Bool?
+        /// 是否识别剧集的片头片尾（只对剧集库起作用）：每集入库时算一次音频指纹、整季比对，播放时给「跳过片头」与提前的「下一集」。从关改为开会在后台补齐库内已有剧集，从开改为关会停掉进行中的识别、播放时不再给按钮（已算的结果保留）。不传表示不改动，新建时默认开启
+        var detectMediaSegments: Bool?
         /// 是否从首页「最近添加」等汇总里排除该库；不传表示不改动，新建时默认关闭
         var excludeFromHome: Bool?
         /// 是否按作品系列自动生成合集（《哈利·波特》这种）。这是**展示**偏好：关掉之后系列信息照常落库、NFO 的 <set> 照常写，只是合集页不自动多出几十个系列；重新打开会把已有的系列补齐，不重新联网刮削。不传表示不改动，新建时默认开启
@@ -4181,6 +4229,7 @@ nonisolated extension API {
             case source
             case generateThumbnails = "generate_thumbnails"
             case extractChapterImages = "extract_chapter_images"
+            case detectMediaSegments = "detect_media_segments"
             case excludeFromHome = "exclude_from_home"
             case autoSeriesCollections = "auto_series_collections"
             case accessMode = "access_mode"
@@ -4332,8 +4381,10 @@ nonisolated extension API {
         var capabilities: API.LibraryCapabilitiesView
         /// 缺图时是否抓帧生成缩略图（本地内容封面、TMDB 无剧照的分集）
         var generateThumbnails: Bool
-        /// 是否为视频章节抓取场景图
+        /// 是否生成并展示视频章节（默认关，按库打开）
         var extractChapterImages: Bool
+        /// 是否识别剧集的片头片尾（默认开，只对剧集库起作用）
+        var detectMediaSegments: Bool
         /// 是否从首页汇总里排除
         var excludeFromHome: Bool
         /// 是否按作品系列自动生成合集（展示偏好）
@@ -4390,6 +4441,7 @@ nonisolated extension API {
             case capabilities
             case generateThumbnails = "generate_thumbnails"
             case extractChapterImages = "extract_chapter_images"
+            case detectMediaSegments = "detect_media_segments"
             case excludeFromHome = "exclude_from_home"
             case autoSeriesCollections = "auto_series_collections"
             case accessMode = "access_mode"
@@ -4716,40 +4768,54 @@ nonisolated extension API {
     /// 预检未收敛时留给用户确认的 TMDB 候选。
     struct ManualDownloadCandidateView: Codable, Hashable, Sendable {
         var tmdbId: Int
+        var kind: String
         var title: String
         var year: Int?
         var episodeCount: Int?
+        var posterUrl: String?
 
         enum CodingKeys: String, CodingKey {
             case tmdbId = "tmdb_id"
+            case kind
             case title
             case year
             case episodeCount = "episode_count"
+            case posterUrl = "poster_url"
         }
     }
 
-    /// 手动下载的识别预检输入：只接受搜索结果已解析出的最小身份线索。
+    /// 手动下载的识别预检输入：搜索结果已解析出的身份线索 + 用户的搜索词。
+    /// 种子身份（kind/title/year）三件套齐全时先按它自动收敛；收敛失败或种子
+    /// 根本没解析出身份时，改用 ``hint``（用户在搜索框里输入的关键词，或在弹窗
+    /// 里「换个词搜」的输入）检索 TMDB，把结果作为候选请用户点选确认——乱码/
+    /// 拼音命名的种子，用户自己输入的片名往往才是最可靠的线索。
     struct ManualDownloadTargetPayload: Codable, Hashable, Sendable {
-        /// 搜索结果识别出的媒体类型
-        var kind: String
-        /// 搜索结果识别出的主标题
-        var title: String
+        /// 搜索结果识别出的媒体类型；未解析出身份时缺省
+        var kind: String?
+        /// 搜索结果识别出的主标题；未解析出身份时缺省
+        var title: String?
         /// 搜索结果识别出的发行/首播年份
-        var year: Int
+        var year: Int?
         /// 种子副标题（中文别名等识别补强）
         var subtitle: String?
+        /// 搜索关键词：自动识别失败时据此检索 TMDB 给出候选
+        var hint: String?
         /// 预检指定下载器；缺省用默认下载器
         var downloaderId: Int?
         /// 用户从本次识别候选中确认的 TMDB 条目 ID
         var selectedTmdbId: Int?
+        /// 确认候选的媒体类型；缺省同 kind
+        var selectedKind: String?
 
         enum CodingKeys: String, CodingKey {
             case kind
             case title
             case year
             case subtitle
+            case hint
             case downloaderId = "downloader_id"
             case selectedTmdbId = "selected_tmdb_id"
+            case selectedKind = "selected_kind"
         }
     }
 
@@ -4757,6 +4823,9 @@ nonisolated extension API {
     struct ManualDownloadTargetView: Codable, Hashable, Sendable {
         var status: String
         var tmdbId: Int?
+        var kind: String?
+        var title: String?
+        var year: Int?
         var candidates: [API.ManualDownloadCandidateView]
         var libraryId: Int?
         var libraryName: String?
@@ -4779,6 +4848,9 @@ nonisolated extension API {
         enum CodingKeys: String, CodingKey {
             case status
             case tmdbId = "tmdb_id"
+            case kind
+            case title
+            case year
             case candidates
             case libraryId = "library_id"
             case libraryName = "library_name"
@@ -4790,6 +4862,22 @@ nonisolated extension API {
             case routeReason = "route_reason"
             case ok
             case warning
+        }
+    }
+
+    /// MKV 精简索引（docs/design/playback-qoe.md §9.12）：只含视频轨索引点的 Cues 元素。
+    /// App 的播放引擎在解复用器读 SeekHead 登记的 Cues 位置时直接给这份，不必再下载原索引
+    /// （字幕轨多的片子原索引有几百 KB 到几 MB，外网慢时要单独下好几秒）。
+    /// 索引点的数值与原文件逐位一致。
+    struct MatroskaCuesView: Codable, Hashable, Sendable {
+        var offset: Int
+        var data: String
+        var originalBytes: Int
+
+        enum CodingKeys: String, CodingKey {
+            case offset
+            case data
+            case originalBytes = "original_bytes"
         }
     }
 
@@ -5201,7 +5289,7 @@ nonisolated extension API {
         var namingSeasonDir: String
         /// 剧集文件名模板；空 = 默认 {title} ({year}) - S{season:02d}E{episode:02d}
         var namingEpisodeFile: String
-        /// 镜像条目图片到媒体目录（poster/fanart/季海报）
+        /// 镜像条目图片到媒体目录（poster/fanart/clearlogo/季海报）
         var mirrorImages: Bool
         /// 镜像 NFO 元数据到媒体目录
         var mirrorNfo: Bool
@@ -5259,7 +5347,7 @@ nonisolated extension API {
         var namingSeasonDir: String?
         /// 剧集文件名模板；空 = 默认 {title} ({year}) - S{season:02d}E{episode:02d}
         var namingEpisodeFile: String?
-        /// 镜像条目图片到媒体目录（poster/fanart/季海报）
+        /// 镜像条目图片到媒体目录（poster/fanart/clearlogo/季海报）
         var mirrorImages: Bool?
         /// 镜像 NFO 元数据到媒体目录
         var mirrorNfo: Bool?
@@ -5576,7 +5664,7 @@ nonisolated extension API {
         var alreadyOk: Int
         var renames: [API.OrganizeRenameView]
         var skips: [API.OrganizeSkipView]
-        /// 条目目录改名时跟着搬的镜像资产（poster.jpg / fanart.jpg / seasonNN-poster.jpg / movie.nfo / tvshow.nfo）——不搬走旧目录就清不掉
+        /// 条目目录改名时跟着搬的镜像资产（poster.jpg / fanart.jpg / clearlogo.png / seasonNN-poster.jpg / movie.nfo / tvshow.nfo）——不搬走旧目录就清不掉
         var entryAssets: [API.OrganizeSidecarView]
 
         enum CodingKeys: String, CodingKey {
@@ -5909,6 +5997,105 @@ nonisolated extension API {
         }
     }
 
+    /// 一次播放的完整记录与时间线（docs/design/playback-qoe.md §5.5）。
+    struct PlaybackAttemptView: Codable, Hashable, Sendable {
+        var attemptId: String
+        var status: String
+        var outcome: String
+        var client: String
+        var origin: String
+        var labScenario: String
+        var memberId: Int
+        var mediaItemId: Int?
+        var seasonNumber: Int?
+        var episodeNumber: Int?
+        var libraryFileId: Int?
+        var tier: Int
+        var degradedFrom: Int?
+        var engine: String
+        var route: String
+        var sourceClass: String
+        var networkClass: String
+        var interface: String
+        var appVersion: String
+        var firstFrameMs: Int?
+        var playingMs: Int?
+        var userWaitMs: Int
+        var seekInCount: Int
+        var seekInP90Ms: Int?
+        var seekInMaxMs: Int?
+        var seekOutCount: Int
+        var seekOutP90Ms: Int?
+        var seekOutMaxMs: Int?
+        var rebufferCount: Int
+        var rebufferMs: Int
+        var freezeCount: Int
+        var freezeMs: Int
+        var reconnectCount: Int
+        var reconnectMs: Int
+        var interruptCount: Int
+        var errorKind: String
+        var errorCategory: String
+        var errorStage: String
+        var avoidableLoss: Bool?
+        var misguessCount: Int
+        var undisturbed: Bool?
+        var watchedMs: Int
+        var createdAt: String
+        var endedAt: String?
+        var detail: [String: API.JSONValue]
+        var logTail: String
+
+        enum CodingKeys: String, CodingKey {
+            case attemptId = "attempt_id"
+            case status
+            case outcome
+            case client
+            case origin
+            case labScenario = "lab_scenario"
+            case memberId = "member_id"
+            case mediaItemId = "media_item_id"
+            case seasonNumber = "season_number"
+            case episodeNumber = "episode_number"
+            case libraryFileId = "library_file_id"
+            case tier
+            case degradedFrom = "degraded_from"
+            case engine
+            case route
+            case sourceClass = "source_class"
+            case networkClass = "network_class"
+            case interface
+            case appVersion = "app_version"
+            case firstFrameMs = "first_frame_ms"
+            case playingMs = "playing_ms"
+            case userWaitMs = "user_wait_ms"
+            case seekInCount = "seek_in_count"
+            case seekInP90Ms = "seek_in_p90_ms"
+            case seekInMaxMs = "seek_in_max_ms"
+            case seekOutCount = "seek_out_count"
+            case seekOutP90Ms = "seek_out_p90_ms"
+            case seekOutMaxMs = "seek_out_max_ms"
+            case rebufferCount = "rebuffer_count"
+            case rebufferMs = "rebuffer_ms"
+            case freezeCount = "freeze_count"
+            case freezeMs = "freeze_ms"
+            case reconnectCount = "reconnect_count"
+            case reconnectMs = "reconnect_ms"
+            case interruptCount = "interrupt_count"
+            case errorKind = "error_kind"
+            case errorCategory = "error_category"
+            case errorStage = "error_stage"
+            case avoidableLoss = "avoidable_loss"
+            case misguessCount = "misguess_count"
+            case undisturbed
+            case watchedMs = "watched_ms"
+            case createdAt = "created_at"
+            case endedAt = "ended_at"
+            case detail
+            case logTail = "log_tail"
+        }
+    }
+
     /// 进度条上的章节刻度（docs/design/player-feel.md §2.C1）。
     /// 只有起点与标题：预览图由 trickplay 雪碧图负责，章节图片再塞一份会把
     /// 起播响应撑大好几倍，而进度条上根本画不下。
@@ -6071,6 +6258,7 @@ nonisolated extension API {
         var pauseReasons: [String]
         var cacheHit: Bool
         var cachedSegments: Int
+        var timeline: [[String: API.JSONValue]]
 
         enum CodingKeys: String, CodingKey {
             case sessionState = "session_state"
@@ -6111,6 +6299,7 @@ nonisolated extension API {
             case pauseReasons = "pause_reasons"
             case cacheHit = "cache_hit"
             case cachedSegments = "cached_segments"
+            case timeline
         }
     }
 
@@ -6288,7 +6477,11 @@ nonisolated extension API {
         }
     }
 
-    /// 一次播放结束时上报的质量快照。指标口径按 CTA-2066，不自创。
+    /// 一次播放结束时上报的记录。指标口径按 CTA-2066，不自创。
+    /// 带 ``attempt_id`` 的是 docs/design/playback-qoe.md 口径的收尾上报：按编号合并进服务端在
+    /// 会话接口建好的那一行，**所有结局都报**（看完、中途退出、出画前退出、失败、异常退出）。
+    /// 不带编号的是网页播放器的旧口径整行快照，原样落库。
+    /// 数值超出上下界会被夹住、列表与明细超限会被截断（记一行警告），不拒收。
     struct PlaybackMetricPayload: Codable, Hashable, Sendable {
         var libraryFileId: Int?
         var tier: Int
@@ -6302,6 +6495,26 @@ nonisolated extension API {
         var droppedFrames: Int?
         var totalFrames: Int?
         var watchedMs: Int?
+        var attemptId: String?
+        var outcome: String?
+        var mediaItemId: Int?
+        var seasonNumber: Int?
+        var episodeNumber: Int?
+        var origin: String?
+        var client: String?
+        var labScenario: String?
+        var route: String?
+        var networkClass: String?
+        var interface: String?
+        var appVersion: String?
+        var firstFrameMs: Int?
+        var playingMs: Int?
+        var userWaitMs: Int?
+        var errorKind: String?
+        var errorCategory: String?
+        var errorStage: String?
+        var detail: [String: API.JSONValue]?
+        var logTail: String?
 
         enum CodingKeys: String, CodingKey {
             case libraryFileId = "library_file_id"
@@ -6316,6 +6529,26 @@ nonisolated extension API {
             case droppedFrames = "dropped_frames"
             case totalFrames = "total_frames"
             case watchedMs = "watched_ms"
+            case attemptId = "attempt_id"
+            case outcome
+            case mediaItemId = "media_item_id"
+            case seasonNumber = "season_number"
+            case episodeNumber = "episode_number"
+            case origin
+            case client
+            case labScenario = "lab_scenario"
+            case route
+            case networkClass = "network_class"
+            case interface
+            case appVersion = "app_version"
+            case firstFrameMs = "first_frame_ms"
+            case playingMs = "playing_ms"
+            case userWaitMs = "user_wait_ms"
+            case errorKind = "error_kind"
+            case errorCategory = "error_category"
+            case errorStage = "error_stage"
+            case detail
+            case logTail = "log_tail"
         }
     }
 
@@ -6362,6 +6595,7 @@ nonisolated extension API {
         var positionMs: Int?
         var audioTrack: String?
         var subtitleTrack: String?
+        var fileId: Int?
         var deviceId: String?
         var paused: Bool?
 
@@ -6373,8 +6607,52 @@ nonisolated extension API {
             case positionMs = "position_ms"
             case audioTrack = "audio_track"
             case subtitleTrack = "subtitle_track"
+            case fileId = "file_id"
             case deviceId = "device_id"
             case paused
+        }
+    }
+
+    /// 播放体验统计（docs/design/playback-qoe.md §5.5）：北极星、快 / 稳 / 对、打扰原因、
+    /// 最差的播放。
+    struct PlaybackQoeStatsView: Codable, Hashable, Sendable {
+        var days: Int
+        var since: String
+        var includeLab: Bool
+        var groupBy: String?
+        var overall: API.QoeGroupStatsView
+        var groups: [API.QoeGroupView]
+        var reasons: [API.QoeReasonView]
+        var worst: [API.QoeAttemptBriefView]
+
+        enum CodingKeys: String, CodingKey {
+            case days
+            case since
+            case includeLab = "include_lab"
+            case groupBy = "group_by"
+            case overall
+            case groups
+            case reasons
+            case worst
+        }
+    }
+
+    /// 可跳过的一段（docs/design/skip-intro.md）：服务端整季比对认出来的，客户端只管用。
+    /// - ``intro`` 片头：在区间里显示「跳过片头」，点了跳到 ``end_ms``；
+    /// - ``outro`` 片尾：到 ``start_ms`` 就提前显示「即将播放下一集」；``to_end`` 为假时
+    /// 片尾后面还有内容（下集预告、彩蛋），按钮是「跳过片尾」；
+    /// - ``other`` 其他重复段（片头前的冠名广告、发行许可）：显示「跳过」。
+    struct PlaybackSegmentView: Codable, Hashable, Sendable {
+        var type: String
+        var startMs: Int
+        var endMs: Int
+        var toEnd: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case type
+            case startMs = "start_ms"
+            case endMs = "end_ms"
+            case toEnd = "to_end"
         }
     }
 
@@ -6392,6 +6670,8 @@ nonisolated extension API {
         var deviceId: String?
         var downlinkBps: Int?
         var startMs: Int?
+        var attemptId: String?
+        var client: String?
 
         enum CodingKeys: String, CodingKey {
             case fileId = "file_id"
@@ -6406,6 +6686,8 @@ nonisolated extension API {
             case deviceId = "device_id"
             case downlinkBps = "downlink_bps"
             case startMs = "start_ms"
+            case attemptId = "attempt_id"
+            case client
         }
     }
 
@@ -6424,6 +6706,8 @@ nonisolated extension API {
         var watch: API.PlaybackStateView?
         var source: API.PlaybackSourceView?
         var chapters: [API.PlaybackChapterMarkView]
+        var segments: [API.PlaybackSegmentView]?
+        var matroskaCues: API.MatroskaCuesView?
 
         enum CodingKeys: String, CodingKey {
             case decision
@@ -6437,6 +6721,8 @@ nonisolated extension API {
             case watch
             case source
             case chapters
+            case segments
+            case matroskaCues = "matroska_cues"
         }
     }
 
@@ -6815,6 +7101,162 @@ nonisolated extension API {
         }
     }
 
+    /// 一次播放的摘要（统计里的「最差 N 条」与小样本明细）。
+    struct QoeAttemptBriefView: Codable, Hashable, Sendable {
+        var attemptId: String?
+        var createdAt: String?
+        var status: String?
+        var outcome: String?
+        var client: String?
+        var mediaItemId: Int?
+        var seasonNumber: Int?
+        var episodeNumber: Int?
+        var libraryFileId: Int?
+        var tier: Int?
+        var sourceClass: String?
+        var route: String?
+        var networkClass: String?
+        var firstFrameMs: Int?
+        var seekMaxMs: Int?
+        var interruptCount: Int?
+        var errorKind: String?
+        var avoidableLoss: Bool?
+        var misguessCount: Int?
+        var undisturbed: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case attemptId = "attempt_id"
+            case createdAt = "created_at"
+            case status
+            case outcome
+            case client
+            case mediaItemId = "media_item_id"
+            case seasonNumber = "season_number"
+            case episodeNumber = "episode_number"
+            case libraryFileId = "library_file_id"
+            case tier
+            case sourceClass = "source_class"
+            case route
+            case networkClass = "network_class"
+            case firstFrameMs = "first_frame_ms"
+            case seekMaxMs = "seek_max_ms"
+            case interruptCount = "interrupt_count"
+            case errorKind = "error_kind"
+            case avoidableLoss = "avoidable_loss"
+            case misguessCount = "misguess_count"
+            case undisturbed
+        }
+    }
+
+    /// 一组播放的体验统计。样本少于 30 条时各项为 null，改列 ``samples`` 明细——不编数字。
+    struct QoeGroupStatsView: Codable, Hashable, Sendable {
+        var attempts: Int
+        var reported: Int
+        var unreported: Int
+        var inProgress: Int
+        var smallSample: Bool
+        var undisturbedRate: Double?
+        var firstFrameMs: API.QoePercentilesView?
+        var seekInBufferMs: API.QoePercentilesView?
+        var seekOutBufferMs: API.QoePercentilesView?
+        var interruptsPerHour: Double?
+        var failureRate: Double?
+        var exitBeforeStartRate: Double?
+        var abnormalExitRate: Double?
+        var avoidableLossRate: Double?
+        var misguessRate: Double?
+        var samples: [API.QoeAttemptBriefView]?
+
+        enum CodingKeys: String, CodingKey {
+            case attempts
+            case reported
+            case unreported
+            case inProgress = "in_progress"
+            case smallSample = "small_sample"
+            case undisturbedRate = "undisturbed_rate"
+            case firstFrameMs = "first_frame_ms"
+            case seekInBufferMs = "seek_in_buffer_ms"
+            case seekOutBufferMs = "seek_out_buffer_ms"
+            case interruptsPerHour = "interrupts_per_hour"
+            case failureRate = "failure_rate"
+            case exitBeforeStartRate = "exit_before_start_rate"
+            case abnormalExitRate = "abnormal_exit_rate"
+            case avoidableLossRate = "avoidable_loss_rate"
+            case misguessRate = "misguess_rate"
+            case samples
+        }
+    }
+
+    struct QoeGroupView: Codable, Hashable, Sendable {
+        var attempts: Int
+        var reported: Int
+        var unreported: Int
+        var inProgress: Int
+        var smallSample: Bool
+        var undisturbedRate: Double?
+        var firstFrameMs: API.QoePercentilesView?
+        var seekInBufferMs: API.QoePercentilesView?
+        var seekOutBufferMs: API.QoePercentilesView?
+        var interruptsPerHour: Double?
+        var failureRate: Double?
+        var exitBeforeStartRate: Double?
+        var abnormalExitRate: Double?
+        var avoidableLossRate: Double?
+        var misguessRate: Double?
+        var samples: [API.QoeAttemptBriefView]?
+        var key: String
+        var label: String
+
+        enum CodingKeys: String, CodingKey {
+            case attempts
+            case reported
+            case unreported
+            case inProgress = "in_progress"
+            case smallSample = "small_sample"
+            case undisturbedRate = "undisturbed_rate"
+            case firstFrameMs = "first_frame_ms"
+            case seekInBufferMs = "seek_in_buffer_ms"
+            case seekOutBufferMs = "seek_out_buffer_ms"
+            case interruptsPerHour = "interrupts_per_hour"
+            case failureRate = "failure_rate"
+            case exitBeforeStartRate = "exit_before_start_rate"
+            case abnormalExitRate = "abnormal_exit_rate"
+            case avoidableLossRate = "avoidable_loss_rate"
+            case misguessRate = "misguess_rate"
+            case samples
+            case key
+            case label
+        }
+    }
+
+    /// 一组毫秒数的分位（最近秩法）。
+    struct QoePercentilesView: Codable, Hashable, Sendable {
+        var p50: Int?
+        var p90: Int?
+        var p99: Int?
+        var count: Int
+
+        enum CodingKeys: String, CodingKey {
+            case p50
+            case p90
+            case p99
+            case count
+        }
+    }
+
+    /// 打扰原因的帕累托：一种原因打扰了多少次播放。
+    struct QoeReasonView: Codable, Hashable, Sendable {
+        var reason: String
+        var label: String
+        var count: Int
+
+        enum CodingKeys: String, CodingKey {
+            case reason
+            case label
+            case count
+        }
+    }
+
     /// 「刚刚入库」一批里的一个季集单元（电影是哨兵 0/0）。
     struct RecentArrivalUnitView: Codable, Hashable, Sendable {
         var seasonNumber: Int
@@ -6871,6 +7313,304 @@ nonisolated extension API {
         enum CodingKeys: String, CodingKey {
             case libraryId = "library_id"
             case mediaItemId = "media_item_id"
+        }
+    }
+
+    struct ReelByteRangeView: Codable, Hashable, Sendable {
+        /// 起始字节
+        var offset: Int
+        /// 长度
+        var length: Int
+        /// head 文件头 / index 索引 / start 起点后约 4 秒
+        var purpose: String
+
+        enum CodingKeys: String, CodingKey {
+            case offset
+            case length
+            case purpose
+        }
+    }
+
+    struct ReelEpisodeView: Codable, Hashable, Sendable {
+        /// 季号
+        var season: Int
+        /// 集号
+        var episode: Int
+        /// 集名
+        var name: String?
+        /// 分集简介
+        var overview: String?
+
+        enum CodingKeys: String, CodingKey {
+            case season
+            case episode
+            case name
+            case overview
+        }
+    }
+
+    struct ReelEventBatch: Codable, Hashable, Sendable {
+        /// 一批事件
+        var events: [API.ReelEventIn]
+
+        enum CodingKeys: String, CodingKey {
+            case events
+        }
+    }
+
+    struct ReelEventIn: Codable, Hashable, Sendable {
+        /// 片段标识
+        var reelId: String
+        /// impression 曝光 / first_frame 出画面 / leave 滑走 / complete 看完 / continue 接着看 / open 看正片 / fullscreen 全屏观看 / detail 看详情 / fail 放不出
+        var kind: String
+        /// 当时的放法
+        var mode: String?
+        var mediaItemId: Int?
+        var fileId: Int?
+        /// 原片上的位置
+        var positionMs: Int?
+        /// 这一条累计看了多久
+        var watchedMs: Int?
+        /// 滑到这一条到出画面等了多久
+        var waitMs: Int?
+        /// 补充信息
+        var detail: [String: API.JSONValue]?
+
+        enum CodingKeys: String, CodingKey {
+            case reelId = "reel_id"
+            case kind
+            case mode
+            case mediaItemId = "media_item_id"
+            case fileId = "file_id"
+            case positionMs = "position_ms"
+            case watchedMs = "watched_ms"
+            case waitMs = "wait_ms"
+            case detail
+        }
+    }
+
+    struct ReelEventResult: Codable, Hashable, Sendable {
+        /// 落库条数
+        var accepted: Int
+
+        enum CodingKeys: String, CodingKey {
+            case accepted
+        }
+    }
+
+    /// 刷片筛选菜单的候选值与计数（与 ``GET /reels`` 同一组筛选参数）。
+    /// 维度与取值沿用媒体库筛选（docs/design/library-filtering.md）：类型是 TMDB genre id、
+    /// 地区是国家码、年代 / 片长是档名、评分是下限。每一维的计数都排除本维自身的条件
+    /// （否则勾了「动画」其他类型全变 0，多选就废了）；为 0 的照常返回，App 置灰不可点。
+    struct ReelFacetsView: Codable, Hashable, Sendable {
+        /// 当前条件下能刷到几部
+        var total: Int
+        /// 类型 / 地区 / 年代 / 评分 / 片长这几维筛选是否可用。False = 当前池子是「其他」（选了「其他」，或库里只有其他视频）：它没有 TMDB 档案，只剩观看状态可筛，App 收起那几个菜单
+        var filterable: Bool
+        /// 电影 / 剧集 / 其他；空 = 没有可切换的类型（只有「其他」库），App 不显示这一行
+        var kinds: [API.FacetValueView]
+        /// 类型，按数量倒序
+        var genres: [API.FacetValueView]
+        /// 地区，按数量倒序
+        var countries: [API.FacetValueView]
+        /// 年代，按时间倒序
+        var decades: [API.FacetValueView]
+        /// 评分下限，高的在前
+        var ratings: [API.FacetValueView]
+        /// 片长档，短的在前
+        var runtimes: [API.FacetValueView]
+        /// 观看状态：只有「没看过」（unwatched）一项
+        var watch: [API.FacetValueView]
+
+        enum CodingKeys: String, CodingKey {
+            case total
+            case filterable
+            case kinds
+            case genres
+            case countries
+            case decades
+            case ratings
+            case runtimes
+            case watch
+        }
+    }
+
+    struct ReelFeedView: Codable, Hashable, Sendable {
+        /// 这次刷片的随机种子，翻页时原样带回
+        var seed: Int
+        /// 下一页的 offset
+        var nextOffset: Int
+        /// 后面还有没有
+        var hasMore: Bool
+        var items: [API.ReelItemView]
+
+        enum CodingKeys: String, CodingKey {
+            case seed
+            case nextOffset = "next_offset"
+            case hasMore = "has_more"
+            case items
+        }
+    }
+
+    struct ReelItemView: Codable, Hashable, Sendable {
+        /// 片段标识（事件上报用）
+        var id: String
+        var title: API.ReelTitleView
+        /// 封面：起点那一帧；没有时是剧照
+        var coverUrl: String?
+        var segment: API.ReelSegmentView
+        var play: API.ReelPlayView
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case title
+            case coverUrl = "cover_url"
+            case segment
+            case play
+        }
+    }
+
+    struct ReelPersonView: Codable, Hashable, Sendable {
+        /// 姓名
+        var name: String
+        /// TMDB 影人 ID（打开人物页用）；只有姓名时为空
+        var tmdbPersonId: Int?
+        /// 头像（TMDB 图床地址）
+        var avatarUrl: String?
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case tmdbPersonId = "tmdb_person_id"
+            case avatarUrl = "avatar_url"
+        }
+    }
+
+    /// 怎么放这一条。mode=seek：自研引擎打开原片、从 segment.start_ms 起播。
+    struct ReelPlayView: Codable, Hashable, Sendable {
+        /// 放法：seek=从原片中间起播（一期仅此一种）
+        var mode: String
+        /// seek：原片取流地址（带 /api/v1 的相对路径，含令牌）
+        var streamUrl: String?
+        /// seek：原片大小（片源字节缓存的键要用）
+        var sizeBytes: Int?
+        /// seek：起播音轨的同类型序号
+        var audioOrdinal: Int?
+        /// seek：要显示的中文字幕；None 不开
+        var subtitle: API.ReelSubtitleView?
+        /// seek：上一条播放期间应预取的字节范围
+        var prefetch: [API.ReelByteRangeView]
+
+        enum CodingKeys: String, CodingKey {
+            case mode
+            case streamUrl = "stream_url"
+            case sizeBytes = "size_bytes"
+            case audioOrdinal = "audio_ordinal"
+            case subtitle
+            case prefetch
+        }
+    }
+
+    /// 放原片的哪一段（原片时间轴，与怎么放无关）。
+    struct ReelSegmentView: Codable, Hashable, Sendable {
+        /// 原片文件（台账行 id）
+        var fileId: Int
+        /// 起点（落在关键帧上）
+        var startMs: Int
+        /// 终点（落在两句对白之间）
+        var endMs: Int
+        /// 原片总长（剧集是这一集）
+        var durationMs: Int?
+        /// 挑法：bitrate 码率最高段 / chapter 章节起点 / position 固定位置
+        var method: String
+
+        enum CodingKeys: String, CodingKey {
+            case fileId = "file_id"
+            case startMs = "start_ms"
+            case endMs = "end_ms"
+            case durationMs = "duration_ms"
+            case method
+        }
+    }
+
+    struct ReelSubtitleView: Codable, Hashable, Sendable {
+        /// 内封字幕的同类型序号（embedded:<k> 的 k）
+        var ordinal: Int
+        var language: String?
+        var title: String?
+        var codec: String?
+        /// 只含这一段（前后各留几秒）的字幕文件地址（带 /api/v1 的相对路径，含令牌），时间戳是文件时间。放转码流、全屏片段模式用：读不到内封轨时靠它出字幕，不必等 NAS 通读整个文件抽整轨。只有能原样拷贝的文字轨才有（srt / ass），否则为 None
+        var url: String?
+        /// url 那份字幕的格式：srt / ass
+        var format: String?
+
+        enum CodingKeys: String, CodingKey {
+            case ordinal
+            case language
+            case title
+            case codec
+            case url
+            case format
+        }
+    }
+
+    /// 这一条属于哪部片：展示用的信息。图片地址都是不带 /api/v1 的相对路径或完整外链。
+    struct ReelTitleView: Codable, Hashable, Sendable {
+        /// 条目 id
+        var mediaItemId: Int
+        /// 这一条的文件所在的媒体库（分享要用）
+        var libraryId: Int
+        /// 电影 / 剧集 / 其他
+        var kind: String
+        /// 片名
+        var name: String
+        /// 年份
+        var year: Int?
+        /// 评分（0～10）
+        var rating: Double?
+        /// 片长；剧集是这一集的时长
+        var runtimeMinutes: Int?
+        /// 类型，最多 3 个
+        var genres: [String]
+        /// 宣传语
+        var tagline: String?
+        /// 简介（剧集是整剧的，分集简介在 episode 里）
+        var overview: String?
+        /// 本人收藏了没有（电影 / 整剧）
+        var favorite: Bool
+        /// 本人看过没有（电影看整部，剧集看这一集）
+        var played: Bool
+        /// 看了一半时的进度（1～99，同「继续观看」口径）；没看过、已看完为空
+        var progressPercent: Int?
+        /// 电影是导演、剧集是主创，最多两位
+        var directors: [API.ReelPersonView]
+        /// 海报
+        var posterUrl: String?
+        /// 横版剧照
+        var backdropUrl: String?
+        /// 片名 Logo（本地资产）
+        var logoUrl: String?
+        /// 剧集：这一段出自哪一集
+        var episode: API.ReelEpisodeView?
+
+        enum CodingKeys: String, CodingKey {
+            case mediaItemId = "media_item_id"
+            case libraryId = "library_id"
+            case kind
+            case name
+            case year
+            case rating
+            case runtimeMinutes = "runtime_minutes"
+            case genres
+            case tagline
+            case overview
+            case favorite
+            case played
+            case progressPercent = "progress_percent"
+            case directors
+            case posterUrl = "poster_url"
+            case backdropUrl = "backdrop_url"
+            case logoUrl = "logo_url"
+            case episode
         }
     }
 
@@ -8558,6 +9298,8 @@ nonisolated extension API {
         var createdAt: String
         var updatedAt: String
         var wanted: [API.WantedView]
+        /// 当前观看者能否调整这条订阅（改季、暂停、立即搜索、洗版、手动选种）：超管与发起人为 true；只关注不发起的成员为 false，只能取消关注
+        var canManage: Bool
         /// 资源发布时间预测正在后台刷新（订阅创建/调整/恢复后的几秒内）；为 true 时 wanted[].release_forecast 可能还是旧值或空值，稍后重取即可
         var forecastPending: Bool
 
@@ -8574,6 +9316,7 @@ nonisolated extension API {
             case createdAt = "created_at"
             case updatedAt = "updated_at"
             case wanted
+            case canManage = "can_manage"
             case forecastPending = "forecast_pending"
         }
     }
@@ -9271,6 +10014,32 @@ nonisolated extension API {
         }
     }
 
+    /// 不经用户操作时会放的音轨 / 字幕（与起播同一口径：本集记着的 > 沿用同剧上一集 >
+    /// 默认轨策略，见 services/playback/track_defaults）。详情页据此标「默认」并说明原因。
+    struct TrackDefaultsView: Codable, Hashable, Sendable {
+        /// 将要放的音轨（中性引用 embedded:<k>）；没有音轨为 null
+        var audioTrack: String?
+        /// remembered 上次换的 / series 沿用上一集 / original_language 影片原声 / default_flag 片源标注的默认 / first 第一条 / none 没有音轨
+        var audioReason: String
+        /// 音轨原因的一句中文，界面直接展示
+        var audioNote: String
+        /// 将要开的字幕（embedded:<k> / external:<文件名>）；null = 不开字幕
+        var subtitleTrack: String?
+        /// remembered / series / library_language 媒体库语言 / forced 强制字幕 / same_language_off 原声就是库语言 / no_language_match 没有库语言字幕 / external / default_flag / forced_only / none（后四个是没有库语言可比时的旧规则）
+        var subtitleReason: String
+        /// 字幕原因的一句中文，界面直接展示
+        var subtitleNote: String
+
+        enum CodingKeys: String, CodingKey {
+            case audioTrack = "audio_track"
+            case audioReason = "audio_reason"
+            case audioNote = "audio_note"
+            case subtitleTrack = "subtitle_track"
+            case subtitleReason = "subtitle_reason"
+            case subtitleNote = "subtitle_note"
+        }
+    }
+
     /// 转移预览里的一个搬运单元。
     struct TransferMoveView: Codable, Hashable, Sendable {
         var sourcePath: String
@@ -9795,7 +10564,7 @@ nonisolated extension API {
         var episodeNumber: Int
         /// 识别失败原因整句（展开/悬停查看；清单上只显示标签）
         var reason: String?
-        /// 失败分类：unparsable / tmdb_unreachable / ambiguous / no_match
+        /// 失败分类：unparsable / tmdb_unreachable / ambiguous / no_match / kind_mismatch / unit_unresolved
         var code: String?
         var candidates: [API.UnidentifiedCandidateView]
 

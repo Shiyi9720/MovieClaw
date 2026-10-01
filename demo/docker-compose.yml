@@ -20,8 +20,7 @@ name: movieclaw-demo
 
 services:
   movieclaw:
-    # 必须用本分支（feat/demo）构建的镜像：官方镜像没有演示模式，
-    # 也没有 iOS App 需要的设备登录接口
+    # 必须用本分支（feat/demo）构建的镜像：官方镜像没有演示模式
     image: ${MOVIECLAW_DEMO_IMAGE:-movieclaw:demo}
     container_name: movieclaw-demo
     init: true

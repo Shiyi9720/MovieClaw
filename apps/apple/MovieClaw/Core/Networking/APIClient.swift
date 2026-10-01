@@ -94,6 +94,14 @@ nonisolated struct APIClient: Sendable {
     /// 服务端处理只要 17 毫秒。
     static let playbackSession = makeSession("playback")
 
+    /// 预连播放专用连接池：发一个不要鉴权的 HEAD，把 TCP / TLS 握手先做掉，之后开会话落在已连好的连接上。
+    /// 真机（经反向代理的 HTTPS 域名）：冷连接开会话约 105 毫秒，热连接约 63 毫秒。见 `PlaybackPreconnect`
+    static func preconnectPlayback(_ url: URL) {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 5)
+        request.httpMethod = "HEAD"
+        playbackSession.dataTask(with: request).resume()
+    }
+
     private static func makeSession(_ name: String) -> URLSession {
         let config = URLSessionConfiguration.default
         config.httpCookieStorage = nil
@@ -179,6 +187,29 @@ nonisolated struct APIClient: Sendable {
         return envelope.data
     }
 
+    /// 发请求并拆信封，同时带回响应头（播放记录读开会话响应的 `Server-Timing`，docs/design/playback-qoe.md §2）。
+    @concurrent
+    func sendReturningHeaders<T: Decodable & Sendable>(
+        _ method: String,
+        _ path: String,
+        body: (any Encodable & Sendable)? = nil,
+        as type: T.Type = T.self
+    ) async throws -> (T, [String: String]) {
+        var request = URLRequest(url: url(path))
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try Self.encoder.encode(body)
+        }
+        let (data, headers) = try await performReturningHeaders(request)
+        do {
+            return (try Self.decoder.decode(APIEnvelope<T>.self, from: data).data, headers)
+        } catch {
+            throw APIError.decoding(Self.describe(error))
+        }
+    }
+
     /// 不拆信封（少数接口如 `/health` 直接返回对象）。
     @concurrent
     func raw<T: Decodable & Sendable>(
@@ -240,6 +271,11 @@ nonisolated struct APIClient: Sendable {
 
     /// 执行请求、统一处理错误；返回响应体原始字节。
     func perform(_ request: URLRequest) async throws -> Data {
+        try await performReturningHeaders(request).0
+    }
+
+    /// 同 `perform`，另外带回响应头（键为小写）
+    func performReturningHeaders(_ request: URLRequest) async throws -> (Data, [String: String]) {
         let data: Data
         let response: URLResponse
         do {
@@ -264,7 +300,11 @@ nonisolated struct APIClient: Sendable {
             }
             throw APIError.http(status: http.statusCode, message: message, code: body?.code)
         }
-        return data
+        var headers: [String: String] = [:]
+        for (key, value) in http.allHeaderFields {
+            if let key = key as? String, let value = value as? String { headers[key.lowercased()] = value }
+        }
+        return (data, headers)
     }
 
     /// 这些接口的 401 不是「会话过期」，不能把用户踢回登录页：

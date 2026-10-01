@@ -319,6 +319,7 @@ class LibraryConfigService:
         scrape_overrides: dict | None = None,
         generate_thumbnails: bool | None = None,
         extract_chapter_images: bool | None = None,
+        detect_media_segments: bool | None = None,
         exclude_from_home: bool | None = None,
         auto_series_collections: bool | None = None,
         access_mode: str | None = None,
@@ -357,8 +358,11 @@ class LibraryConfigService:
             realtime_watch=True if realtime_watch is None else bool(realtime_watch),
             scrape_overrides=overrides,
             generate_thumbnails=True if generate_thumbnails is None else bool(generate_thumbnails),
-            extract_chapter_images=(
-                True if extract_chapter_images is None else bool(extract_chapter_images)
+            # 生成章节默认关（抓帧成本高，按库自行打开）；不传按默认
+            extract_chapter_images=bool(extract_chapter_images),
+            # 识别片头片尾默认开（用户决策 2026-10-01）；不传按默认
+            detect_media_segments=(
+                True if detect_media_segments is None else bool(detect_media_segments)
             ),
             exclude_from_home=bool(exclude_from_home),
             auto_series_collections=(
@@ -392,6 +396,7 @@ class LibraryConfigService:
         scrape_overrides: dict | None = None,
         generate_thumbnails: bool | None = None,
         extract_chapter_images: bool | None = None,
+        detect_media_segments: bool | None = None,
         exclude_from_home: bool | None = None,
         auto_series_collections: bool | None = None,
         access_mode: str | None = None,
@@ -429,6 +434,7 @@ class LibraryConfigService:
             scrape_overrides=overrides,
             generate_thumbnails=generate_thumbnails,
             extract_chapter_images=extract_chapter_images,
+            detect_media_segments=detect_media_segments,
             exclude_from_home=exclude_from_home,
             auto_series_collections=auto_series_collections,
             access_mode=mode,

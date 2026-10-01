@@ -58,9 +58,11 @@ struct LibraryShareSheet: View {
                             createSections
                         }
                     }
-                    .scrollContentBackground(.hidden)
+                    .subsFormStyle()
                 }
             }
+            // 高度贴合内容、半透明的液态玻璃弹层（2026-09-30 用户要求：不必拉全屏，同订阅弹层）；上拉仍可到全高
+            .modifier(SubsFittedDetents(ready: resolved))
             .navigationTitle(share != nil ? "《\(title)》已分享" : "分享《\(title)》")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbar }
@@ -71,7 +73,6 @@ struct LibraryShareSheet: View {
                 Text("链接立即失效，正在播放的访客会在一分钟内中断。之后可以重新生成一条新链接。")
             }
         }
-        .presentationDetents([.large])
         .interactiveDismissDisabled(busy)
         .task { await resolveCurrent() }
     }
@@ -127,7 +128,7 @@ struct LibraryShareSheet: View {
         }
 
         Section {
-            Toggle("密码保护", isOn: Binding(get: { passwordOn }, set: { _ in togglePassword() }))
+            Toggle("密码保护", isOn: Binding(mcGet: { passwordOn }, set: { _ in togglePassword() }))
             if passwordOn {
                 HStack(spacing: 10) {
                     TextField("访问密码", text: Binding(

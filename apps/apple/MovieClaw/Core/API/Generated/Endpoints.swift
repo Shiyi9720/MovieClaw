@@ -58,6 +58,18 @@ nonisolated extension APIClient {
         return try await send("POST", "/app/update/check")
     }
 
+    /// 读取 GitHub 访问令牌的配置状态（只返回打码尾号）
+    /// `GET /app/update/github-token`
+    func appUpdateGithubTokenGet() async throws -> API.GithubTokenView {
+        return try await send("GET", "/app/update/github-token")
+    }
+
+    /// 保存 GitHub 访问令牌（空串清除），检查更新时带上以避开匿名限流
+    /// `PUT /app/update/github-token`
+    func appUpdateGithubTokenPut(body: API.GithubTokenPayload) async throws -> API.GithubTokenView {
+        return try await send("PUT", "/app/update/github-token", body: body)
+    }
+
     /// 确认上一次异常退出告警（清除记录，不再展示）
     /// `POST /app/update/last-exit/dismiss`
     func appUpdateLastExitDismiss() async throws -> Void {
@@ -1166,13 +1178,13 @@ nonisolated extension APIClient {
         return try await send("GET", "/libraries/\(libraryId)/items/\(mediaItemId)")
     }
 
-    /// 条目的候选海报/背景图列表（选图前先看这里）
+    /// 条目的候选海报/背景图/徽标列表（选图前先看这里）
     /// `GET /libraries/{library_id}/items/{media_item_id}/artwork/candidates`
     func libraryArtworkListCandidates(libraryId: Int, mediaItemId: Int) async throws -> API.ArtworkCandidatesView {
         return try await send("GET", "/libraries/\(libraryId)/items/\(mediaItemId)/artwork/candidates")
     }
 
-    /// 选定海报/背景（当场落盘并覆盖媒体目录；此后刷新不再覆盖）
+    /// 选定海报/背景/徽标（当场落盘并覆盖媒体目录；此后刷新不再覆盖）
     /// `POST /libraries/{library_id}/items/{media_item_id}/artwork/select`
     func libraryArtworkSelect(libraryId: Int, mediaItemId: Int, body: API.ArtworkSelectPayload) async throws -> [String: API.JSONValue] {
         return try await send("POST", "/libraries/\(libraryId)/items/\(mediaItemId)/artwork/select", body: body)
@@ -1532,6 +1544,12 @@ nonisolated extension APIClient {
         let _: API.JSONValue? = try await send("POST", "/playback/activity/sessions/\(deviceId)/end")
     }
 
+    /// 一次播放的完整记录与时间线
+    /// `GET /playback/attempts/{attempt_id}`
+    func playbackAttemptGet(attemptId: String) async throws -> API.PlaybackAttemptView {
+        return try await send("GET", "/playback/attempts/\(attemptId)")
+    }
+
     /// 播放器客户端日志
     /// `POST /playback/client-log`
     func playbackClientLog(body: API.PlaybackClientLogPayload) async throws -> [String: API.JSONValue] {
@@ -1724,6 +1742,17 @@ nonisolated extension APIClient {
         return try await send("GET", "/playback/stats")
     }
 
+    /// 播放体验统计：无打扰播放率、起播与跳转分位、中断、规格损失、最差的播放
+    /// `GET /playback/stats/qoe`
+    func playbackStatsQoe(days: Int? = nil, groupBy: String? = nil, includeLab: Bool? = nil, worst: Int? = nil) async throws -> API.PlaybackQoeStatsView {
+        var query: [URLQueryItem] = []
+        if let days { query.append(URLQueryItem(name: "days", value: "\(days)")) }
+        if let groupBy { query.append(URLQueryItem(name: "group_by", value: "\(groupBy)")) }
+        if let includeLab { query.append(URLQueryItem(name: "include_lab", value: "\(includeLab)")) }
+        if let worst { query.append(URLQueryItem(name: "worst", value: "\(worst)")) }
+        return try await send("GET", "/playback/stats/qoe", query: query)
+    }
+
     /// 一段时间的观看总览：看了多久、多少场、看完率、活跃了几个人
     /// `GET /playback/stats/watch`
     func playbackStatsWatch(days: Int? = nil, tzOffset: Int? = nil, memberId: Int? = nil, scope: String? = nil) async throws -> API.PlaybackWatchStatsView {
@@ -1737,10 +1766,59 @@ nonisolated extension APIClient {
 
     /// 接下来继续
     /// `GET /playback/up-next`
-    func playbackUpNext(limit: Int? = nil) async throws -> API.UpNextView {
+    func playbackUpNext(limit: Int? = nil, thisDevice: Bool? = nil) async throws -> API.UpNextView {
         var query: [URLQueryItem] = []
         if let limit { query.append(URLQueryItem(name: "limit", value: "\(limit)")) }
+        if let thisDevice { query.append(URLQueryItem(name: "this_device", value: "\(thisDevice)")) }
         return try await send("GET", "/playback/up-next", query: query)
+    }
+
+    /// 刷片：取一页片段
+    /// `GET /reels`
+    func reelsFeed(seed: Int? = nil, offset: Int? = nil, limit: Int? = nil, modes: String? = nil, kind: String? = nil, g: String? = nil, c: String? = nil, d: String? = nil, w: String? = nil, ratingGte: Double? = nil, rt: String? = nil, lang: String? = nil, res: String? = nil, hdr: Bool? = nil, stock: String? = nil, seriesKeys: String? = nil) async throws -> API.ReelFeedView {
+        var query: [URLQueryItem] = []
+        if let seed { query.append(URLQueryItem(name: "seed", value: "\(seed)")) }
+        if let offset { query.append(URLQueryItem(name: "offset", value: "\(offset)")) }
+        if let limit { query.append(URLQueryItem(name: "limit", value: "\(limit)")) }
+        if let modes { query.append(URLQueryItem(name: "modes", value: "\(modes)")) }
+        if let kind { query.append(URLQueryItem(name: "kind", value: "\(kind)")) }
+        if let g { query.append(URLQueryItem(name: "g", value: "\(g)")) }
+        if let c { query.append(URLQueryItem(name: "c", value: "\(c)")) }
+        if let d { query.append(URLQueryItem(name: "d", value: "\(d)")) }
+        if let w { query.append(URLQueryItem(name: "w", value: "\(w)")) }
+        if let ratingGte { query.append(URLQueryItem(name: "rating_gte", value: "\(ratingGte)")) }
+        if let rt { query.append(URLQueryItem(name: "rt", value: "\(rt)")) }
+        if let lang { query.append(URLQueryItem(name: "lang", value: "\(lang)")) }
+        if let res { query.append(URLQueryItem(name: "res", value: "\(res)")) }
+        if let hdr { query.append(URLQueryItem(name: "hdr", value: "\(hdr)")) }
+        if let stock { query.append(URLQueryItem(name: "stock", value: "\(stock)")) }
+        if let seriesKeys { query.append(URLQueryItem(name: "series_keys", value: "\(seriesKeys)")) }
+        return try await send("GET", "/reels", query: query)
+    }
+
+    /// 刷片：上报事件
+    /// `POST /reels/events`
+    func reelsEvents(body: API.ReelEventBatch) async throws -> API.ReelEventResult {
+        return try await send("POST", "/reels/events", body: body)
+    }
+
+    /// 刷片：筛选菜单的候选值与计数（每一维排除自身条件后算）
+    /// `GET /reels/facets`
+    func reelsFacets(kind: String? = nil, g: String? = nil, c: String? = nil, d: String? = nil, w: String? = nil, ratingGte: Double? = nil, rt: String? = nil, lang: String? = nil, res: String? = nil, hdr: Bool? = nil, stock: String? = nil, seriesKeys: String? = nil) async throws -> API.ReelFacetsView {
+        var query: [URLQueryItem] = []
+        if let kind { query.append(URLQueryItem(name: "kind", value: "\(kind)")) }
+        if let g { query.append(URLQueryItem(name: "g", value: "\(g)")) }
+        if let c { query.append(URLQueryItem(name: "c", value: "\(c)")) }
+        if let d { query.append(URLQueryItem(name: "d", value: "\(d)")) }
+        if let w { query.append(URLQueryItem(name: "w", value: "\(w)")) }
+        if let ratingGte { query.append(URLQueryItem(name: "rating_gte", value: "\(ratingGte)")) }
+        if let rt { query.append(URLQueryItem(name: "rt", value: "\(rt)")) }
+        if let lang { query.append(URLQueryItem(name: "lang", value: "\(lang)")) }
+        if let res { query.append(URLQueryItem(name: "res", value: "\(res)")) }
+        if let hdr { query.append(URLQueryItem(name: "hdr", value: "\(hdr)")) }
+        if let stock { query.append(URLQueryItem(name: "stock", value: "\(stock)")) }
+        if let seriesKeys { query.append(URLQueryItem(name: "series_keys", value: "\(seriesKeys)")) }
+        return try await send("GET", "/reels/facets", query: query)
     }
 
     /// 规则组列表（首次访问自动创建默认组）

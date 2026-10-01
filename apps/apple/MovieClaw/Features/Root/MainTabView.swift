@@ -3,9 +3,9 @@ import SwiftUI
 
 /// 登录后的主界面：iOS 26 原生液态玻璃标签栏。
 ///
-/// 页签只显示图标（参照 Instagram iOS 底栏，2026-09-26 用户要求）：发现 / 媒体库 / 订阅（有订阅权限）/
-/// 活动（管理员）/ 头像。最右的头像页签是当前用户头像，点开「更多」页（账号、设置、会话），
-/// 前四个与 Web 银玻璃主题手机底栏（components/glass-tab-bar.tsx）同序；下滑时标签栏自动收起。
+/// 页签只显示图标（参照 Instagram iOS 底栏，2026-09-26 用户要求）：媒体库（首页）/ 订阅（有订阅权限）/ 发现 /
+/// 活动（管理员）/ 头像。最右的头像页签是当前用户头像，点开「更多」页（账号、设置、会话）。
+/// 2026-09-30 起媒体库排最左作首页（与 Web 手机底栏 components/glass-tab-bar.tsx 的顺序不再一致）；下滑时标签栏自动收起。
 ///
 /// 搜索不占页签，在各标签根页右上角（见 AppTopBar）：iPhone 标签栏最多放 5 个页签，管理员
 /// 四个内容页签加头像已满，再放搜索页签会被系统收进「More」。标签栏的高度与玻璃质感是系统定的
@@ -31,19 +31,44 @@ struct MainTabView: View {
     /// 主界面出现之后是否已经在前台过：冷启动用快照直接进主界面时，主界面比场景「变成前台」还早，
     /// 那一次激活不是「回到前台」，不补做身份校验与更新检查（冷启动那份由 AppModel.revalidate、角标轮询首轮做）
     @State private var wasActive = false
+    /// 头像页签在窗口里的位置（账号手势提示气泡对准它，见 TabBarAccountGestures）
+    @State private var avatarTabFrame: CGRect = .zero
+    @State private var showAccountTip = false
+    /// 成员有没有可见库（搜索的「媒体库」分区要它，见 AppTopBar 的放大镜）；nil = 还没查到。
+    /// 只有这一项要异步查：影视 / 资源分区由权限同步得出，超管恒有媒体库分区——放大镜对他们第一帧就在，不闪。
+    /// 换账号时整棵主界面按账号重建（见 MovieClawApp），这份状态随之清空，不会串号
+    @State private var memberHasLibrary: Bool?
+    /// 账号手势提示看过没有（只提示一次）。只在气泡真的显示出来时才记：头像页签的位置还没找到时
+    /// 气泡画不出来，照样记下就等于没提示过却再也不提示了（v1 键在测试包里就这样被误记过，换了新键）
+    @AppStorage("movieclaw.tips.accountGestures.v2") private var accountTipShown = false
+    /// 双击切换进行中：切换要向服务器校验一次令牌，期间再双击不重复发起
+    @State private var switchingAccount = false
+    /// 标签栏上方的「接着看」条（见 ResumeAccessory）
+    @State private var resume = ResumeBarStore()
+
+    /// 当前停在「片段」页（媒体库页签栈顶）
+    private var onReels: Bool {
+        router.selectedTab == .library && router.paths[.library]?.last == .reels
+    }
+
+    /// 当前停在 AI 会话页（新会话或已有会话）：那页隐藏了标签栏，附件却还会贴在输入框下面，要一起收掉
+    private var onAgentSession: Bool {
+        switch router.paths[router.selectedTab]?.last {
+        case .newSession?, .session?: true
+        default: false
+        }
+    }
 
     var body: some View {
         let session = model.session
         let permissions = session.map(Permissions.init(session:)) ?? .none
         let api = model.api ?? EnvironmentValues().api
 
-        TabView(selection: $router.selectedTab) {
-            Tab(value: MainTab.discover) {
-                TabRoot(tab: .discover) { DiscoverView(kind: "movie") }
-            } label: {
-                iconLabel(.discover)
-            }
-            .accessibilityLabel(MainTab.discover.title)
+        TabView(selection: Binding(get: { router.selectedTab }, set: { tab in
+            // 再点一次当前页签：回到这个页签的根页（iOS 惯例）。「片段」这类不带返回键的二级页靠它回去
+            if tab == router.selectedTab { router.popToRoot() }
+            router.selectedTab = tab
+        })) {
             Tab(value: MainTab.library) {
                 TabRoot(tab: .library) { LibraryHomeView() }
             } label: {
@@ -58,6 +83,12 @@ struct MainTabView: View {
                 }
                 .accessibilityLabel(MainTab.subscriptions.title)
             }
+            Tab(value: MainTab.discover) {
+                TabRoot(tab: .discover) { DiscoverView(kind: "movie") }
+            } label: {
+                iconLabel(.discover)
+            }
+            .accessibilityLabel(MainTab.discover.title)
             if permissions.isAdmin {
                 Tab(value: MainTab.activity) {
                     TabRoot(tab: .activity) { ActivityView() }
@@ -79,8 +110,39 @@ struct MainTabView: View {
             .accessibilityLabel(MainTab.more.title)
             .accessibilityIdentifier("open-more")
         }
-        .tabBarMinimizeBehavior(.onScrollDown)
+        // 「片段」上下滑动是在换条，不是在往下读：停在它上面时标签栏不收起（docs/design/reels.md）
+        .tabBarMinimizeBehavior(onReels ? .never : .onScrollDown)
+        // 「接着看」条：片段页自己占满底部、AI 会话页底部是输入框（2026-09-30 用户反馈条贴在输入框下面很怪），都不显示
+        .modifier(ResumeAccessoryModifier(item: resume.visibleItem, enabled: !onReels && !onAgentSession,
+                                          onHide: { resume.hide() }))
+        // 进主界面、关掉播放器（看过就变了）、回到前台、换账号时重新取最近播放的那一条
+        .task(id: "\(router.player == nil)|\(scenePhase == .active)|\(session?.nickname ?? "")|\(api.server.origin)") {
+            guard router.player == nil, scenePhase == .active else { return }
+            await resume.refresh(api: api)
+        }
         .background { PageWarmup(tabs: warmupTabs) }
+        // 头像页签：长按弹切换账号抽屉、双击切回上一个账号（仿 Instagram，见 AccountGestureHub）
+        .background(TabBarAccountGestures(onAvatarFrame: { if avatarTabFrame != $0 { avatarTabFrame = $0 } }))
+        .onReceive(NotificationCenter.default.publisher(for: .avatarTabLongPressed)) { _ in openAccountSwitcher() }
+        .onReceive(NotificationCenter.default.publisher(for: .avatarTabDoubleTapped)) { _ in
+            Task { await switchToPreviousAccount() }
+        }
+        .overlay {
+            if showAccountTip, avatarTabFrame != .zero {
+                AccountGestureTip(avatarFrame: avatarTabFrame) { withAnimation { showAccountTip = false } }
+            }
+        }
+        // 本机账号超过一个时才提示账号手势（一个账号时这两个手势都没意义），只提示一次；
+        // 等找到头像页签的位置再提示（气泡要对准它）
+        .task(id: "\(model.savedAccountCount)|\(avatarTabFrame != .zero)") {
+            guard model.savedAccountCount > 1, !accountTipShown, avatarTabFrame != .zero else { return }
+            try? await Task.sleep(for: .seconds(1.2))
+            guard !Task.isCancelled, avatarTabFrame != .zero else { return }
+            accountTipShown = true
+            withAnimation { showAccountTip = true }
+            try? await Task.sleep(for: .seconds(6))
+            withAnimation { showAccountTip = false }
+        }
         // 活动页签（红 > 绿 > 蓝，同网页）与头像页签（有待安装的更新）的状态点：
         // SwiftUI 的 .badge 只能红底文字，下到 UIKit 画小圆点
         .background(TabBarDotBridge(
@@ -103,6 +165,31 @@ struct MainTabView: View {
         .fullScreenCover(item: $router.player) { request in
             PlayerScreen(request: request)
         }
+        .onAppear {
+            #if DEBUG
+            // -mcNoEarlyStart YES：播放器视图出现才起播（提前起播之前的行为，真机新旧对照用）
+            if UserDefaults.standard.bool(forKey: "mcNoEarlyStart") { return }
+            #endif
+            // 点播放就开始起播（见 Router.startPlaybackEarly）。API 客户端在点击那一刻取：换过账号用的是新的
+            router.startPlaybackEarly = { [router, model] request in
+                if let current = router.activePlayback, current.isClosed || (!current.viewAttached && current.request.id != request.id) {
+                    current.close()
+                    router.activePlayback = nil
+                }
+                guard router.activePlayback?.request.id != request.id else { return }
+                let controller = PlaybackController(
+                    request: request, api: model.api ?? EnvironmentValues().api, requestedAt: router.playRequestedAt)
+                router.activePlayback = controller
+                controller.start()
+            }
+        }
+        .onChange(of: router.player?.id) { _, presented in
+            // 提前起播了、播放器却没弹出来就被撤掉（视图从没出现过，不会走它的收尾）：这里关掉，免得会话与引擎空跑
+            if let early = router.activePlayback, !early.viewAttached, early.request.id != presented {
+                early.close()
+                router.activePlayback = nil
+            }
+        }
         .modifier(FeedbackHost(feedback: feedback))
         #if DEBUG
         .task {
@@ -113,7 +200,15 @@ struct MainTabView: View {
             if let delay = DebugLaunch.routeDelay, delay > 0 {
                 try? await Task.sleep(for: .seconds(delay))
             }
+            MainThreadProbe.run()  // -mcMainProbe YES：打开播放器后 3 秒内主线程的忙碌段
             router.open(webPath: path)
+            // -mcRouteThen <站内路径> -mcRouteThenDelay <秒>：先开 -mcRoute（比如首页），到点再开这个（比如播放页）——
+            // 量「在页面上停一会儿再点播放」这种真实动线（页面出现时的预连、空闲后的冷连接都在里面）
+            if let then = UserDefaults.standard.string(forKey: "mcRouteThen") {
+                try? await Task.sleep(for: .seconds(max(0.5, UserDefaults.standard.double(forKey: "mcRouteThenDelay"))))
+                MainThreadProbe.run()  // 同上，从打开播放页起量
+                router.open(webPath: then)
+            }
             // -mcRouteReopenAfter <秒>：到点关掉播放器、2 秒后原样再打开（验证退出再进同一部片的起播与流量）
             let reopenAfter = UserDefaults.standard.double(forKey: "mcRouteReopenAfter")
             if reopenAfter > 0 {
@@ -177,12 +272,20 @@ struct MainTabView: View {
             }
         }
         .task(id: permissions.isAdmin) {
+            // 成员的媒体库分区要拉一次可见库列表才知道；每个账号只查一次
+            guard !permissions.isAdmin, memberHasLibrary == nil else { return }
+            let libraries = try? await api.libraryList(scope: "all")
+            guard !Task.isCancelled else { return }
+            // 拉取失败先给入口：搜索页进去会自己再核一次分区，别让一次网络抖动把入口藏到下次登录
+            memberHasLibrary = libraries.map { !$0.isEmpty } ?? true
+        }
+        .task(id: permissions.isAdmin) {
             guard permissions.isAdmin else { return }
             await FirstFrameGate.wait()
             await badges.run(api: api)
         }
         .task(id: session?.username) {
-            // 空闲预热：落地页（管理员是发现页）先显示完，空闲下来再处理还没打开的媒体库首页、订阅首页——
+            // 空闲预热：落地页（媒体库）先显示完，空闲下来再处理还没打开的媒体库首页、订阅首页——
             // 1. 页面预热：用本机快照在背后不可见地画一遍，消化「第一次上屏」的一次性开销（见 PageWarmup）；
             // 2. 静默刷新：页面第一帧用的是快照，这里让快照在切过去之前就换成最新的，切过去后不会再换一遍内容；
             // 3. 首屏图片解码进内存：第一次切过去不再先出占位底、再渐显（见 FirstScreenImages）。
@@ -224,16 +327,48 @@ struct MainTabView: View {
         .environment(badges)
         .environment(\.api, api)
         .environment(\.permissions, permissions)
+        .environment(\.searchAccess, SearchAccess(
+            canMedia: permissions.canSubscribe,
+            canTorrent: permissions.canSearch,
+            canLibrary: permissions.isAdmin || memberHasLibrary == true,
+            ready: permissions.isAdmin || memberHasLibrary != nil
+        ))
         .tint(Theme.accentStrong)
     }
 }
 
 extension MainTabView {
+    /// 长按头像页签：弹出切换账号抽屉（已经有弹层开着时不叠第二个）
+    private func openAccountSwitcher() {
+        guard router.sheet == nil, router.player == nil else { return }
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        withAnimation { showAccountTip = false }
+        router.present(.accountSwitcher)
+    }
+
+    /// 双击头像页签：切回上一个账号。本机只有一个账号时什么都不做——那只是两下普通的点选
+    private func switchToPreviousAccount() async {
+        guard model.savedAccountCount > 1, !switchingAccount, router.player == nil else { return }
+        switchingAccount = true
+        defer { switchingAccount = false }
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        do {
+            _ = try await model.switchToPreviousAccount()
+        } catch AppModel.AccountError.needsPassword {
+            // 那个账号的登录已失效：打开切换抽屉，它在那里标着「需要重新登录」，点一下输密码
+            feedback.error("那个账号的登录已失效，点它重新输入密码")
+            router.present(.accountSwitcher)
+        } catch {
+            feedback.error(error)
+        }
+    }
+
     /// 当前账号能看到的页签，按标签栏上从左到右的顺序（与上面 TabView 的声明顺序一致，
     /// TabBarDotBridge 靠这个顺序找页签）
     static func visibleTabs(_ permissions: Permissions) -> [MainTab] {
-        var tabs: [MainTab] = [.discover, .library]
+        var tabs: [MainTab] = [.library]
         if permissions.canSubscribe { tabs.append(.subscriptions) }
+        tabs.append(.discover)
         if permissions.isAdmin { tabs.append(.activity) }
         tabs.append(.more)
         return tabs
@@ -261,14 +396,15 @@ extension MainTabView {
         }
         #endif
         // 已经被别处（深链、调试启动路由）导航过就不再抢落点
-        guard router.selectedTab == .discover, router.paths.values.allSatisfy(\.isEmpty), router.rootParameter == nil else { return }
+        guard router.selectedTab == .library, router.paths.values.allSatisfy(\.isEmpty), router.rootParameter == nil else { return }
         if let resume = model.takeResume(), router.availableTabs.contains(resume.tab),
            resume.path.allSatisfy(permissions.allows) {
             router.selectedTab = resume.tab
             router.paths[resume.tab] = resume.path
             return
         }
-        router.selectedTab = permissions.isAdmin ? .discover : .library
+        // 媒体库是首页：管理员、成员都落在这里（原来管理员落「发现」，2026-09-30 用户调整）
+        router.selectedTab = .library
     }
 }
 
@@ -359,15 +495,17 @@ enum TabIcon {
 ///
 /// 页面自己的按钮用 `.toolbar` 追加（发现页的筛选、媒体库的 ⋯ 菜单）。
 /// 外层注入的 `.topBarTrailing` 会排到页面按钮前面，所以放 `.primaryAction`（固定在最右），
-/// 再用固定间隔隔开：页面按钮在左边自成一组，搜索在每个标签根页都是同一位置的独立圆钮。
+/// 再用固定间隔隔开：页面按钮在左边自成一组，搜索是独立圆钮。例外是媒体库：「▶ 片段」作为本页主操作
+/// 也放 `.primaryAction`，排在搜索右边（2026-09-30 用户拍板「⋯ · 搜索 · ▶ 片段」）。
 struct AppTopBar: ViewModifier {
     let tab: MainTab
     @Environment(Router.self) private var router
-    @Environment(\.permissions) private var permissions
+    @Environment(\.searchAccess) private var searchAccess
 
     func body(content: Content) -> some View {
         content.toolbar {
-            if permissions.canSearch {
+            // 任一搜索分区可用就给入口（影视 / 资源 / 媒体库，见 SearchAccess.canOpenSearch）
+            if searchAccess.canOpenSearch {
                 ToolbarSpacer(.fixed, placement: .primaryAction)
                 ToolbarItem(placement: .primaryAction) {
                     Button {

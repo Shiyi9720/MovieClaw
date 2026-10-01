@@ -55,6 +55,15 @@ struct DemuxerOpenProfile: Sendable {
     /// ~300 ms). nil keeps the open-ended behaviour for every other path (playback streams from 0).
     var boundedInitialFetch: Int64? = nil
 
+    /// [MovieClaw P56] 这次播放从文件头起（没有续播点）。读取器据此决定索引提前取一到就把文件头连接续上：从头播时
+    /// 那正是接下来要播的字节；续播时引擎马上要跳到续播点，续上文件头只会在慢线路上白占带宽。默认 true（原来的行为）
+    var playbackStartsAtHead: Bool = true
+
+    /// [MovieClaw P58] 服务端给的 Matroska 精简索引：读取器在解复用器读 SeekHead 登记的 Cues 位置时直接给它。只挂在
+    /// 主播放的配置上（探测兼会话的那次打开、HLS 生成器的兜底打开与卡死重开）；旁路解复用器从 `.playback` 另起配置，
+    /// 照旧读原索引
+    var hostMatroskaCues: MatroskaHostCues? = nil
+
     /// `LoadOptions.sequentialOrigin`: the origin fabricates range answers, so the AVIO reader must
     /// run its forward-only streaming mode (one unranged GET from byte 0) and never issue a ranged
     /// request. Lives in the profile so the probe demuxer, the session demuxer, and every fresh
@@ -86,6 +95,20 @@ struct DemuxerOpenProfile: Sendable {
     /// playback open, so the probe, the HLS producer's own open and every rebuild agree; off for the
     /// disposable still extractor.
     var auditsRecordlessDolbyVision: Bool = true
+
+    /// [MovieClaw P56] 带上「这次从文件头起播」的声明，写法同 `withSequentialOrigin`，调用点链在已有的配置后面
+    func withPlaybackStartsAtHead(_ startsAtHead: Bool) -> DemuxerOpenProfile {
+        var copy = self
+        copy.playbackStartsAtHead = startsAtHead
+        return copy
+    }
+
+    /// [MovieClaw P58] 带上服务端给的精简索引（开关 `AetherEngine.usesHostMatroskaCues` 关着时不带），写法同上
+    func withHostMatroskaCues(_ cues: MatroskaHostCues?) -> DemuxerOpenProfile {
+        var copy = self
+        copy.hostMatroskaCues = AetherEngine.usesHostMatroskaCues ? cues : nil
+        return copy
+    }
 
     /// A copy of `self` under a different reader name, for two call sites that share a profile.
     func withReaderLabel(_ label: String) -> DemuxerOpenProfile {
@@ -604,7 +627,9 @@ public final class Demuxer: @unchecked Sendable {
             chunkMaxRetries: openProfile.avioMaxRetries,
             boundedInitialFetch: openProfile.boundedInitialFetch,
             sequentialOnly: openProfile.avioSequentialOnly,
-            heldConnection: openProfile.avioHeldConnection
+            heldConnection: openProfile.avioHeldConnection,
+            expectsHeadPlayback: openProfile.playbackStartsAtHead,
+            hostMatroskaCues: openProfile.hostMatroskaCues   // [MovieClaw P58]
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         reader.playIntentProvider = playIntentProvider
@@ -858,7 +883,16 @@ public final class Demuxer: @unchecked Sendable {
         boundProbeForDeclaredDiscTitle(ctx)
         let parked = parkUnresolvableAudio(ctx)
         let parkedPGS = parkUnsizedPGS(ctx)  // [MovieClaw P12]
+        // [MovieClaw] 探测流的耗时与读量：起播分段里「探测」一段慢在读数据还是慢在解码，看这一行
+        let probeStarted = DispatchTime.now()
+        let bytesBefore = ctx.pointee.pb?.pointee.bytes_read ?? 0
         let findRet = avformat_find_stream_info(ctx, nil)
+        let probeMs = Double(DispatchTime.now().uptimeNanoseconds - probeStarted.uptimeNanoseconds) / 1_000_000
+        let bytesRead = (ctx.pointee.pb?.pointee.bytes_read ?? 0) - bytesBefore
+        EngineLog.emit(
+            "[Demuxer] [MovieClaw] find_stream_info took \(Int(probeMs))ms, read \(bytesRead / 1024) KB "
+            + "(fps_probe_size=\(ctx.pointee.fps_probe_size))",
+            category: .demux)
         unparkUnsizedPGS(ctx, parkedPGS)
         unparkUnresolvableAudio(ctx, parked)
         guard findRet >= 0 else {
@@ -965,8 +999,9 @@ public final class Demuxer: @unchecked Sendable {
     /// 尺寸、字幕包又稀疏，探测于是一直读到预算上限（50 MB）。真机实测带 PGS 的片子起播里「探测流」一项 0.6～1.1 秒，
     /// 同样是 DTS 转码、不带 PGS 的《九门》只要 0.00 秒；蓝光原盘几乎都带 PGS。引擎画 PGS 时画布尺寸取自画面
     /// （旁路读字幕的解复用器本来就不跑 find_stream_info），用不上这里探出来的尺寸
-    private func parkUnsizedPGS(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [(index: Int, type: AVMediaType)] {
-        var parked: [(index: Int, type: AVMediaType)] = []
+    private func parkUnsizedPGS(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [(index: Int, type: AVMediaType, placeholderCodec: Bool)] {
+        var parked: [(index: Int, type: AVMediaType, placeholderCodec: Bool)] = []
+        var sawTrueHD = false
         let formatName = ctx.pointee.iformat.map { String(cString: $0.pointee.name) } ?? ""
         let declaresCodecs = formatName.hasPrefix("mov,") || formatName.hasPrefix("matroska")
         for i in 0..<Int(ctx.pointee.nb_streams) {
@@ -981,23 +1016,31 @@ public final class Demuxer: @unchecked Sendable {
             // MP4 / MKV 由容器声明编码，认不出就是真没有解码器（国产 4K 剧的 Audio Vivid「av3a」5.1.4 音轨）：
             // 同样判「参数不全」拖满探测预算，真机《交锋》探测 1.5 秒。TS / PS 的未知流可能靠嗅探认出来，不动
             let unknownAudio = declaresCodecs && type == AVMEDIA_TYPE_AUDIO && codecpar.pointee.codec_id == AV_CODEC_ID_NONE
-            guard unsizedPGS || unknownData || unknownAudio else { continue }
+            // [MovieClaw P34] 第二条起的 TrueHD：容器已声明采样率与声道，探测只差「采样格式」一项，要解出一帧才有；
+            // 解不出来（真机《变形金刚4》第二条 TrueHD）就读满 50 MB 预算，探测 0.76 秒。TrueHD 一律经音频桥接，
+            // 桥接自己开解码器、按解出的帧配重采样，用不上探出来的采样格式。第一条照常探（全景声等判定不受影响）
+            let isTrueHD = declaresCodecs && type == AVMEDIA_TYPE_AUDIO && codecpar.pointee.codec_id == AV_CODEC_ID_TRUEHD
+                && codecpar.pointee.sample_rate > 0 && codecpar.pointee.ch_layout.nb_channels > 0
+            let secondaryTrueHD = isTrueHD && sawTrueHD && AetherEngine.parkSecondaryTrueHDDuringProbe
+            if isTrueHD { sawTrueHD = true }
+            guard unsizedPGS || unknownData || unknownAudio || secondaryTrueHD else { continue }
             codecpar.pointee.codec_type = AVMEDIA_TYPE_ATTACHMENT
             // 编码号为 NONE 的流不论什么类型都判「参数不全」（unknown codec），探测期间给个占位的二进制数据编码号
             if unknownData || unknownAudio { codecpar.pointee.codec_id = AV_CODEC_ID_BIN_DATA }
-            parked.append((i, type))
+            parked.append((i, type, unknownData || unknownAudio))
         }
         if !parked.isEmpty {
-            EngineLog.emit("[Demuxer] [MovieClaw P12] \(parked.count) PGS / unknown data / unknown audio stream(s) held out of find_stream_info", category: .demux)
+            EngineLog.emit("[Demuxer] [MovieClaw P12/P34] \(parked.count) PGS / unknown data / unknown audio / secondary TrueHD stream(s) held out of find_stream_info", category: .demux)
         }
         return parked
     }
 
-    private func unparkUnsizedPGS(_ ctx: UnsafeMutablePointer<AVFormatContext>, _ parked: [(index: Int, type: AVMediaType)]) {
-        for (i, type) in parked where i < Int(ctx.pointee.nb_streams) {
+    private func unparkUnsizedPGS(_ ctx: UnsafeMutablePointer<AVFormatContext>,
+                                  _ parked: [(index: Int, type: AVMediaType, placeholderCodec: Bool)]) {
+        for (i, type, placeholderCodec) in parked where i < Int(ctx.pointee.nb_streams) {
             guard let codecpar = ctx.pointee.streams[i]?.pointee.codecpar else { continue }
             codecpar.pointee.codec_type = type
-            if type != AVMEDIA_TYPE_SUBTITLE { codecpar.pointee.codec_id = AV_CODEC_ID_NONE }
+            if placeholderCodec { codecpar.pointee.codec_id = AV_CODEC_ID_NONE }
         }
     }
 
@@ -1105,6 +1148,21 @@ public final class Demuxer: @unchecked Sendable {
     var bitRate: Int64 {
         guard let ctx = formatContext else { return 0 }
         return ctx.pointee.bit_rate
+    }
+
+    /// [MovieClaw P37] 平均码率：容器声明了就用它，没声明（原盘 / 光盘镜像的 MPEG-TS 时长是 NOPTS、bit_rate 为 0）
+    /// 按片源总字节 × 8 ÷ 时长估。宿主拿它填 HLS 的 BANDWIDTH：原来这时兜底 25 Mbit/s、峰值声明 50 Mbit/s，
+    /// UHD 原盘一段 2 秒 12～15 MB（约 60 Mbit/s）超出声明，真机 AVPlayer 报 -12318 后只放声音不出画面（《黑豹2》续播 20 秒无画）
+    func estimatedBitRate(durationSeconds: Double) -> Int64 {
+        let declared = bitRate
+        if declared > 0 { return declared }
+        let size: Int64? = {
+            accessLock.lock()
+            defer { accessLock.unlock() }
+            return avioProvider?.resolvedByteSize
+        }()
+        guard let size, size > 0, durationSeconds > 0 else { return 0 }
+        return Int64(Double(size) * 8 / durationSeconds)
     }
 
     /// AVFormatContext.start_time in AV_TIME_BASE units. Non-zero on re-muxed

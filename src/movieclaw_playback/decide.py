@@ -98,7 +98,11 @@ class AudioTrack:
     codec: str | None = None
     channels: int | None = None
     language: str | None = None
+    #: 容器里标的默认轨——直出（档 0）时浏览器放的就是它，判断「选的轨要不要重封装」只看这个
     is_default: bool = False
+    #: 默认轨策略挑中的那条（track_policy：按原声语言、同语言挑音质最好的）。用户没表态时放它；
+    #: 与 ``is_default`` 分开，是因为挑中的轨不是容器默认轨时，直出就放不了它、必须重封装
+    preferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -624,6 +628,8 @@ def _judge_audio(
         return _AudioVerdict(can_copy=True, track=None, reason="无音轨")
 
     default = _preferred_audio(tracks)
+    # 直出时浏览器放的那条（容器默认轨）：放的不是它就得重封装（needs_remap）
+    container_default = _container_default_audio(tracks)
     chosen = next((t for t in tracks if t.ref == preferred_audio), None)
 
     # 原生 HLS（AVPlayer）的解码链比 MSE/hls.js 更挑剔：即使能力探测报告
@@ -642,7 +648,7 @@ def _judge_audio(
                 can_copy=True,
                 track=track,
                 reason=f"音轨 {_track_label(track)} 已是 AAC-LC 双声道，可直通",
-                needs_remap=track.ref != default.ref,
+                needs_remap=track.ref != container_default.ref,
             )
         return _transcode_audio(
             track,
@@ -660,12 +666,15 @@ def _judge_audio(
                 can_copy=True,
                 track=chosen,
                 reason=f"音轨 {label} 可直通",
-                needs_remap=chosen.ref != default.ref,
+                needs_remap=chosen.ref != container_default.ref,
             )
         return _transcode_audio(chosen, capability, prefix=f"选中的音轨 {label}")
 
-    # 用户没表态：首选轨能直通最好；否则在其它轨里找一条能直通的（换轨优于转码）。
-    for track, is_preferred in ((default, True), *((t, False) for t in tracks)):
+    # 用户没表态：首选轨能直通最好；否则在**同语言**的其它轨里找一条能直通的（换轨优于转码）。
+    # 只在同语言里换（2026-09-29）：为省一路音频转码把国语换成英语，是拿听感换服务器的 CPU，
+    # 而音频转码本来就便宜；换过去的轨还会被当成记忆带到别的设备上。都没标语言的轨视为同一种。
+    alternatives = (t for t in tracks if _same_language(t, default))
+    for track, is_preferred in ((default, True), *((t, False) for t in alternatives)):
         support = capability.audio_support(track.codec)
         if support is None:
             continue
@@ -677,11 +686,24 @@ def _judge_audio(
             can_copy=True,
             track=track,
             reason=f"音轨 {(track.codec or '未知').upper()} 可直通{note}",
-            needs_remap=track.ref != default.ref,
+            needs_remap=track.ref != container_default.ref,
         )
 
     # 都不能直通 → 转码首选轨。
     return _transcode_audio(default, capability, prefix=f"音轨 {(default.codec or '未知').upper()}")
+
+
+def _same_language(a: AudioTrack, b: AudioTrack) -> bool:
+    """两条音轨的语言标记是否相同（大小写不敏感）。
+
+    没标或标 und 的算「不知道」，只和同样不知道的相同。
+    """
+
+    def norm(language: str | None) -> str | None:
+        value = (language or "").strip().lower()
+        return None if value in {"", "und"} else value
+
+    return norm(a.language) == norm(b.language)
 
 
 def _transcode_audio(
@@ -1213,7 +1235,14 @@ def _decide_strm(
 
 
 def _preferred_audio(tracks: tuple[AudioTrack, ...]) -> AudioTrack:
-    """首选音轨：标了 default 的优先，否则取第一条。
+    """用户没表态时放的音轨：默认轨策略挑中的（``preferred``，见 track_policy）优先，
+    没有策略标记时退回容器默认轨（``_container_default_audio``）。"""
+    usable = tuple(t for t in tracks if t.codec) or tracks
+    return next((t for t in usable if t.preferred), None) or _container_default_audio(tracks)
+
+
+def _container_default_audio(tracks: tuple[AudioTrack, ...]) -> AudioTrack:
+    """容器默认轨：标了 default 的优先，否则取第一条（直出时浏览器放的就是它）。
 
     探测认不出编码的轨（codec 为空，如国产 4K 剧的菁彩声 Audio Vivid「av3a」）谁也解不了——
     客户端（含 App 的自研引擎）、服务端转码用的 FFmpeg 都没有它的解码器——有别的轨时不选它。

@@ -71,6 +71,9 @@ from movieclaw_api.services.library.layout import (
     STRM_EXT,
     VIDEO_EXTS,
     entry_dirs,
+    explicit_episode,
+    explicit_unit,
+    pack_season,
     season_from_dir,
     trailing_index_episode,
 )
@@ -85,6 +88,7 @@ from movieclaw_api.services.library.profile import IgnoreProfile, LibraryProfile
 from movieclaw_api.services.library.reanchor import migrate_watch_state
 from movieclaw_api.services.library.resolve import (
     LocalEvidence,
+    ResolveCandidate,
     normalize_title,
     parse_total_episodes,
     resolve_with_candidates,
@@ -103,7 +107,7 @@ from movieclaw_api.services.media_probe import (
 )
 from movieclaw_api.services.subtitle_gen.extract import cache_dir as subtitle_cache_dir
 from movieclaw_api.services.task_state import TaskState
-from movieclaw_db.engine import get_database
+from movieclaw_db.engine import get_database, refresh_query_statistics
 from movieclaw_db.models import (
     DownloadHint,
     FileSource,
@@ -228,7 +232,10 @@ _BRACKET_GROUP = re.compile(r"[\[{][^\]}]*[\]}]")
 #             神奇4侠）；目录名 Title (Year) 惯例作备选查询词
 #         5 = 电影的「Title (Year)」条目目录名压过文件名（issue #107：正片
 #             旁边的花絮/片段按自己的文件名搜出别的影片）
-RESOLVER_VERSION = 5
+#         6 = 季目录容忍装饰（「Season 4-第 4 季-(2007)」不再被当成条目目录，
+#             issue #497）；带片名的季包目录归到父条目；剧集钉死身份按播出
+#             区间校验年份；结构上确定的剧集目录整名作查询词
+RESOLVER_VERSION = 6
 
 
 def conventional_title(text: str) -> tuple[str, int] | None:
@@ -241,6 +248,26 @@ def conventional_title(text: str) -> tuple[str, int] | None:
     cleaned = _BRACKET_GROUP.sub(" ", text).strip()
     matched = re.match(r"^(.+?)\s*\((\d{4})\)", cleaned)
     return (matched.group(1).strip(), int(matched.group(2))) if matched else None
+
+
+def _clean_title(text: str, attrs: TorrentAttrs) -> str | None:
+    """整理过的干净目录名 → 去掉方括号标记组后的整名；带技术/季集标记返回 None。
+
+    「人世间」「The Office」这类只有片名的目录名是整理工具或用户手写的结果，
+    整名本身就是片名。NER 面向种子名训练，对这种孤立的干净中文名大量漏抽或
+    截断（「人世间」→「世间」、「庆余年」→ 空），所以在结构上能确定它是
+    条目目录时，整名比模型切出来的片段可信（见 ``guess_evidence``）。
+    """
+    cleaned = _BRACKET_GROUP.sub(" ", text).strip()
+    if not normalize_title(cleaned):
+        return None
+    if attrs.resolution or attrs.video_codec or attrs.media_source or attrs.audio:
+        return None
+    if attrs.seasons or attrs.episodes or pack_season(cleaned) is not None:
+        return None
+    if explicit_unit(cleaned) or explicit_episode(cleaned) is not None:
+        return None
+    return cleaned
 
 
 def extras_marker(name: str) -> str | None:
@@ -586,7 +613,12 @@ async def _rescan_later(library_id: int, delay: float) -> None:
     await asyncio.sleep(delay)
     # 这一轮只为接住刚写完的新文件；历史规格补探必须由用户主动扫描触发，
     # 否则下载期间一次短暂的 mtime 波动也会重新扫到整库未补探的旧文件。
-    await scan_library(library_id, backfill_existing_specs=False)
+    summary = await scan_library(library_id, backfill_existing_specs=False)
+    # 暂缓的新文件这轮终于入账了：同样要识别片头片尾（docs/design/skip-intro.md），
+    # 这条路径不经过扫描作业，扫描作业收尾的那个挂钩够不着
+    from movieclaw_api.services.library.skip_segments import enqueue_after_scan
+
+    await enqueue_after_scan(library_id, summary)
 
 
 def last_scan(library_id: int) -> tuple | None:
@@ -618,6 +650,10 @@ async def _refresh_stats_snapshot(library_id: int, summary: ScanSummary) -> None
             # refresh_stats 自己 commit，ensure 之后要再收一次事务边界
             await ensure_series_collections_for_library(session, library_id)
             await session.commit()
+        # 大批入库后立刻刷查询统计：否则要等下次重启才更新，期间 SQLite 拿着
+        # 入库前的行数挑索引，大库上的筛选面板可能退化成整库扫描。
+        # PRAGMA optimize 只动统计缺失/明显过期的表，几乎零成本，失败只记日志
+        await refresh_query_statistics(db)
     except Exception:  # noqa: BLE001 -- 统计失败不应把已完成的入库事务回滚
         logger.exception("媒体库 #%s 库存统计刷新失败", library_id)
         message = "库存统计刷新失败，将在下次扫描时重试"
@@ -864,6 +900,11 @@ async def _run_scan_job(
 
         async with db.session() as session:
             await enqueue_library_chapter_images_job(session, library_id, library.name)
+    # 片头片尾识别（docs/design/skip-intro.md）：同章节一样走独立的低优先级整库作业，
+    # 覆盖扫描新发现的剧集与存量回填；同库已有一份在跑则复用
+    from movieclaw_api.services.library.skip_segments import enqueue_after_library_change
+
+    await enqueue_after_library_change(library_id)
     # 扫描改动了台账，上一轮的重复结论可能已经不作数：排一轮重复扫描
     # （docs/design/library-duplicate-files.md §9）。用户打开重复文件页时通常
     # 就已经有新鲜结果，而不必自己先按一次「开始扫描」
@@ -2970,7 +3011,7 @@ async def _ingest_file(
         unidentified_code = identified.code
         item_id = identified.item.id if identified.item is not None else None
         # 季集解析进线程池：要读分集 NFO（磁盘 IO），解析层兜底还会跑 NER
-        season, episode = (0, 0) if is_disc else await asyncio.to_thread(_unit_for, kind, file)
+        season, episode = (0, 0) if is_disc else await _scan_unit(kind, file, identified)
         identity_source = identified.source if item_id is not None else None
         # 临时身份没有"识别器版本"可言：它压根没识别成功
         resolved_version = RESOLVER_VERSION if item_id is not None and not provisional else None
@@ -3424,6 +3465,9 @@ class _Identified:
     # 临时本地身份：影视库里 TMDB 没认出、先挂了本地条目——文件可见可播，
     # 但仍算"待识别"（reason/code/candidates 照记，每轮扫描重试）
     provisional: bool = False
+    # 剧集认出作品后按该作品的季台账解出的 (季, 集)。None = 没算（电影、
+    # 原盘、临时身份），由调用方走不带台账的 ``_unit_for``
+    unit: tuple[int, int] | None = None
 
 
 async def _identify_with_fallback(
@@ -3467,6 +3511,8 @@ async def _identify_with_fallback(
             hint=hint,
             is_disc=is_disc,
         )
+        if identified.item is not None and kind is MediaKind.TV and not is_disc:
+            identified = await _with_unit(media_service, file, identified)
         if identified.item is not None or identified.code == UnidentifiedCode.KIND_MISMATCH:
             return identified
         evidence = identified.evidence
@@ -3494,6 +3540,48 @@ async def _identify_with_fallback(
         source=IdentitySource.LOCAL if profile.scraped else identity.identity_source,
         provisional=profile.scraped,
     )
+
+
+async def _with_unit(
+    media_service: MediaLibraryService, file: Path, identified: _Identified
+) -> _Identified:
+    """剧集认出作品后，按作品的季台账解季集号；季号定不下来就改判为待识别。
+
+    台账在这里才拿得到（身份确定之后），它让季集解析和监听导入同一口径：
+    推断出的季号必须是该剧真实存在的季，单季剧的「第01集.mp4」直接归第 1 季。
+    多季剧而文件名/目录都不带季号时，第几季确实无从判断——以前落成第 0 季，
+    正片静默变特别篇；现在进待识别并把认出的作品作为候选带上，用户点选时
+    指定季号即可（见 ``claim.claim_files`` 的 ``season_override``）。
+    """
+    item = identified.item
+    assert item is not None and item.id is not None
+    known = {season.season_number for season in await media_service.seasons(item.id)}
+    season, episode = await asyncio.to_thread(_unit_for, MediaKind.TV, file, known)
+    if season is not None:
+        return replace(identified, unit=(season, episode))
+    regular = sum(1 for number in known if number > 0)
+    count = f"共 {regular} 季" if regular else "季数未知"
+    candidate = ResolveCandidate(
+        tmdb_id=item.tmdb_id or 0, title=item.title, year=item.year, reasons=["已认出作品"]
+    )
+    return _Identified(
+        None,
+        f"认出是《{item.title}》（{count}），但文件名和目录名里都没有季号，无法确定是第几季",
+        [asdict(candidate)],
+        code=UnidentifiedCode.UNIT_UNRESOLVED,
+    )
+
+
+async def _scan_unit(kind: MediaKind, file: Path, identified: _Identified) -> tuple[int, int]:
+    """台账行要落的 (季, 集)：认出作品时用按台账解好的结论，否则不带台账现解。
+
+    季号仍解不出（临时身份、待识别的行）时落 0——``library_file`` 的季号列
+    非空；这些行本就挂着失败原因、每轮扫描重试，认领时再定季号。
+    """
+    if identified.unit is not None:
+        return identified.unit
+    season, episode = await asyncio.to_thread(_unit_for, kind, file)
+    return (0 if season is None else season), episode
 
 
 async def _refresh_local_identity(
@@ -3662,11 +3750,21 @@ async def _identify(
                 if kind is MediaKind.MOVIE and item.id is not None
                 else None
             )
+            # 剧集的年份轴按播出区间比（季播年不是反证）
+            last_air_year = (
+                max(
+                    (s.air_date.year for s in await media_service.seasons(item.id) if s.air_date),
+                    default=None,
+                )
+                if kind is MediaKind.TV and item.id is not None
+                else None
+            )
             mismatch = _pinned_mismatch(
                 item,
                 evidence,
                 duration_seconds=duration_seconds,
                 runtime_minutes=runtime_minutes,
+                last_air_year=last_air_year,
             )
             if mismatch is None:
                 return _Identified(item, source=id_source)
@@ -3835,6 +3933,7 @@ def _pinned_mismatch(
     *,
     duration_seconds: int | None = None,
     runtime_minutes: int | None = None,
+    last_air_year: int | None = None,
 ) -> str | None:
     """钉死身份拉到的条目是否与本地证据**严重**矛盾（矛盾时返回条目描述）。
 
@@ -3845,7 +3944,10 @@ def _pinned_mismatch(
     - 标题：本地片名与条目主名/原名/别名归一后既不相等也无包含关系。
       包含判定要求**短边至少 2 个字符**——单字符标题（实测：短片《4》）
       几乎是任何片名的子串，包含关系在它身上零区分度；
-    - 年份：两边都有年份且相差超过 2 年（同一部作品的年份偏差不会这么大）；
+    - 年份：两边都有年份且相差超过 2 年（同一部作品的年份偏差不会这么大）。
+      剧集比的是**播出区间**（首播年 ~ 最后一季的首播年，``last_air_year``）：
+      剧集的本地年份常是季播年或资源发布年，《豪斯医生》(2004) 第 4 季目录上
+      写着 2007 是正常的，只拿首播年比会把正确的声明推翻（issue #497）；
     - 时长（调用方只对电影传入）：条目片长与实测时长相差 3 倍以上且绝对差
       超 30 分钟（实测：NFO 里 3 分钟短片《4》冒认 115 分钟的神奇4侠，
       年份恰好同为 2025，年份轴对这类错误天然失明）。
@@ -3864,10 +3966,14 @@ def _pinned_mismatch(
             return None
         if min(len(known), len(local)) >= 2 and (known in local or local in known):
             return None
+    latest = max(item.year, last_air_year or 0) if item.year is not None else None
     year_conflict = (
         evidence.year is not None
         and item.year is not None
-        and abs(item.year - evidence.year) > _PINNED_YEAR_TOLERANCE
+        and latest is not None
+        and not (
+            item.year - _PINNED_YEAR_TOLERANCE <= evidence.year <= latest + _PINNED_YEAR_TOLERANCE
+        )
     )
     runtime_note = ""
     if duration_seconds and runtime_minutes:
@@ -3984,8 +4090,12 @@ def guess_evidence(
     季集号：目录名与文件名两个来源合并取最大（季包目录带 SNN、文件名带
     SxxExx，各有一半信息）；S00 特别篇不计入季数证据。
     """
-    dir_names = [d.name for d in entry_dirs(root, file)]
+    dirs = entry_dirs(root, file)
+    dir_names = [d.name for d in dirs]
     own = unit_name(file, is_disc)
+    # 结构上确定的剧集目录：它与文件之间隔着季目录（或季包目录）。按 Emby 的
+    # 语义季目录的父目录就是剧集，它不可能是「欧美剧」这类分组目录
+    series_dir = dir_names[0] if kind is MediaKind.TV and dirs and dirs[0] != file.parent else None
     if kind is MediaKind.TV:
         sources = [*dir_names, own]
     else:
@@ -4026,6 +4136,20 @@ def guess_evidence(
         # 错挂。因此两者并存且不同形时，惯例名当主查询词、NER 结果降为
         # 备选（收敛失败后换词重跑，混排名拆分的价值仍在）
         plain_title, plain_year = conventional_title(text) or (None, None)
+        if text == series_dir and plain_title is None:
+            # 剧集目录名不带年份时，惯例名那一刀用不上，模型的漏抽/截断会直接
+            # 变成查询词（「人世间/Season 1/S01E01.mkv」按「世间」去搜）。整名
+            # 当主查询词、模型结果降为备选——收敛器主词失败会换备选重跑
+            clean = _clean_title(text, attrs)
+            if clean and (
+                title is None
+                or (
+                    normalize_title(title) != normalize_title(clean)
+                    and normalize_title(title) in normalize_title(clean)
+                )
+            ):
+                evidence = LocalEvidence(title=clean, year=attrs.year, alt_title=title)
+                break
         if plain_title and title and normalize_title(plain_title) != normalize_title(title):
             evidence = LocalEvidence(title=plain_title, year=plain_year, alt_title=title)
             break
@@ -4038,6 +4162,13 @@ def guess_evidence(
         if plain_title:
             evidence = LocalEvidence(title=plain_title, year=plain_year)
             break
+    if evidence is None and dir_names:
+        # 文件名与各级目录都抽不出片名（「人世间/S01E01.mkv」且模型漏抽目录名）：
+        # 条目目录的干净整名是唯一可能的片名，交给收敛器的标题门槛去验证
+        entry_attrs = parsed[sources.index(dir_names[0])]
+        clean = _clean_title(dir_names[0], entry_attrs)
+        if clean:
+            evidence = LocalEvidence(title=clean, year=entry_attrs.year)
     if evidence is None:
         return None
     if kind is MediaKind.TV:
@@ -4089,7 +4220,9 @@ def _stem_episode(stem: str) -> int | None:
     return attrs.episodes[0] if attrs.episodes else trailing_index_episode(stem)
 
 
-def _unit_for(kind: MediaKind, file: Path) -> tuple[int, int]:
+def _unit_for(
+    kind: MediaKind, file: Path, known_seasons: set[int] | None = None
+) -> tuple[int | None, int]:
     """期望单元：电影 (0,0)；剧集优先信分集 NFO，其次走确定性季集解析层。
 
     证据优先级：
@@ -4101,16 +4234,17 @@ def _unit_for(kind: MediaKind, file: Path) -> tuple[int, int]:
        S09 是显式标记、Season 9 是目录声明，模型的「第一季」根本进不了决赛。
 
     与监听导入的区别：这里逐文件走（库扫描按目录遍历，没有「包」的概念），
-    不传条目名与台账；季号求解失败时回落 0（特别季）——``library_file``
-    的季号列非空，扫描必须给出一个值。
+    不传条目名；``known_seasons`` 是已认出作品的季台账（见 ``_with_unit``），
+    作为推断季号的守卫与唯一季兜底。季号求解失败返回 None，由调用方决定
+    是改判待识别（认出了作品）还是落 0（本来就待识别）。
     """
     if kind is not MediaKind.TV:
         return 0, 0
     episode_nfo = read_episode_metadata(file.with_suffix(".nfo"))
     if episode_nfo and episode_nfo.season is not None and episode_nfo.episode is not None:
         return episode_nfo.season, episode_nfo.episode
-    unit = resolve_units([file])[file]
-    return unit.season if unit.season is not None else 0, unit.episode
+    unit = resolve_units([file], known_seasons=known_seasons)[file]
+    return unit.season, unit.episode
 
 
 # ---------------------------------------------------------------------------
@@ -4398,7 +4532,9 @@ async def _reidentify(
                 continue
             keep_failure = item is None or provisional
             season_number, episode_number = (
-                (row.season_number, row.episode_number) if is_disc else _unit_for(kind, file)
+                (row.season_number, row.episode_number)
+                if is_disc
+                else await _scan_unit(kind, file, identified)
             )
             # 改挂：观看状态随文件迁到新单元，旧条目收尾做孤儿清理
             if item is not None and row.media_item_id is not None and row.media_item_id != item.id:

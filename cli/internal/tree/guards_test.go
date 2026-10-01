@@ -59,6 +59,9 @@ var knownNonGenerated = []string{
 	"playback.session.master",
 	"playback.session.subtitle-playlist",
 	"playback.file.stream",
+	// 原盘目录直推（disc-direct-play.md）：目录清单与盘内文件的 Range 取流，只给播放引擎用
+	"playback.file.disc.list",
+	"playback.file.disc.file",
 	"playback.file.subtitle",
 	"playback.file.fonts",
 	"playback.file.font",
@@ -141,6 +144,11 @@ var knownNonGenerated = []string{
 	"share.playback.progress",
 	"share.playback.item",
 	"share.playback.item.episodes",
+	// 刷片（docs/design/reels.md）：App 沉浸页的信息流、筛选菜单与埋点事件，
+	// 边看边滑的交互在命令行没有对应形态
+	"reels.feed",
+	"reels.facets",
+	"reels.events",
 }
 
 // TestNonGeneratedEndpointsAreAllKnown 强制新端点显式表态：进命令树，或登记豁免。

@@ -10,4 +10,5 @@
 //     MC_BUNDLE_ID_PREFIX = com.example.movieclaw
 // CI 里也可以直接作为 xcodebuild 参数传入：MC_BUNDLE_ID_PREFIX=com.example.movieclaw
 MC_BUNDLE_ID_PREFIX = io.movieclaw
+
 #include? "Signing.local.xcconfig"

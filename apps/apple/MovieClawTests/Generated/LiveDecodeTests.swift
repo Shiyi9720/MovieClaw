@@ -12,6 +12,9 @@ struct LiveDecodeTests {
     @Test func appStorageUsage() async throws {
         try await LiveServer.check { try await $0.appStorageUsage() }
     }
+    @Test func appUpdateGithubTokenGet() async throws {
+        try await LiveServer.check { try await $0.appUpdateGithubTokenGet() }
+    }
     @Test func appUpdatePending() async throws {
         try await LiveServer.check { try await $0.appUpdatePending() }
     }
@@ -150,11 +153,20 @@ struct LiveDecodeTests {
     @Test func playbackStats() async throws {
         try await LiveServer.check { try await $0.playbackStats() }
     }
+    @Test func playbackStatsQoe() async throws {
+        try await LiveServer.check { try await $0.playbackStatsQoe() }
+    }
     @Test func playbackStatsWatch() async throws {
         try await LiveServer.check { try await $0.playbackStatsWatch() }
     }
     @Test func playbackUpNext() async throws {
         try await LiveServer.check { try await $0.playbackUpNext() }
+    }
+    @Test func reelsFeed() async throws {
+        try await LiveServer.check { try await $0.reelsFeed() }
+    }
+    @Test func reelsFacets() async throws {
+        try await LiveServer.check { try await $0.reelsFacets() }
     }
     @Test func rulesList() async throws {
         try await LiveServer.check { try await $0.rulesList() }

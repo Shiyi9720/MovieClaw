@@ -1,6 +1,6 @@
 # iOS 原生 App 设计
 
-> 状态：开发中（分支 `feat/ios-app`）。验收标准：浏览器与 iOS App 同时打开同一台服务器，
+> 状态：已合入 main（2026-09-29，#473；原开发分支 `feat/ios-app` 已删除，之后从 main 开分支）。验收标准：浏览器与 iOS App 同时打开同一台服务器，
 > `docs/design/ios-app/parity-inventory.md` 列出的全部功能两端一致。
 
 ## 1. 决策
@@ -93,7 +93,7 @@ PlayerScreen（控制层 UI、手势、字幕叠加、选轨、诊断）
             └─ AVPlayerEngine   服务端 HLS（转码 / 换封装）：只在自研引擎确定解不了时用；用户限了画质的服务端流也由自研引擎直连放
 ```
 - 引擎选择全自动，用户不选（2026-09-26 用户决定，同 Infuse；2026-09-28 起自研引擎是本机唯一的播放器，MPV 已移除）：只有「解不了」才沿
-  兜底阶梯换引擎；网络慢、断线都不换引擎、不自动降码率（反复卡顿时提示一次，换不换画质由用户定）；画质、音轨、字幕按片记，
+  兜底阶梯换引擎；网络慢、断线都不换引擎、不自动降码率（一次等满 8 秒或反复卡顿、且线路跟不上时提示一次，换不换画质由用户定）；画质、音轨、字幕按片记，
   非默认的在下次打开时提示几秒。规则见 [player-engine.md](player-engine.md) §3。
 - 字幕：自研引擎直出时，内封与外挂字幕都由引擎给出字幕数据、App 按画面矩形摆放（文字用系统字体）；系统播放器放服务端流时，
   文字字幕由 SwiftUI 叠加层画，图形字幕由服务端烧录。画中画两种播放器都在本机完成（自研引擎用它自带的画中画源）。
@@ -106,8 +106,8 @@ PlayerScreen（控制层 UI、手势、字幕叠加、选轨、诊断）
   会自己放慢读取，按平均算会被拖低，还会比加载速度小。算法与本机限速实测见 `PlayerEngine.swift` 的
   `LoadingSpeedMeter` / `BandwidthMeter`。
 - 起播链路与流畅度（2026-09-27 秒开优化）：后台一口气完成决策与开会话、自研引擎申报全解码拿档 0、HLS 列表带 EXT-X-START、AVPlayer 起播不等缓冲等，改法与实测数字见 [playback-startup.md](playback-startup.md)；起播慢先看 NAS 日志里的「起播分段」一行。
-- LGPL 合规：AetherEngine 与它自带的 FFmpeg 都以动态框架随包（`AetherCore.framework`、`AetherLib*`）；关于页列出
-  AetherEngine / FFmpeg 的许可与源码地址（上架前补）。
+- LGPL 合规：AetherEngine 与它自带的 FFmpeg 都以动态框架随包（`AetherCore.framework`、`AetherLib*`）；「我的 → 关于
+  MovieClaw」列出各组件的许可、源码地址与许可全文。打包与上架见 [ios-release.md](ios-release.md)。
 - 自研引擎（默认且唯一的播放器，`feat/ios-player-engine`）：`NativeEngine` 经 AetherCore 动态框架接入 AetherEngine，本机把原文件换封装成 HLS 交给 AVPlayer；本机解不了（硬解、引擎自己软解都不行）才改走服务端 HLS。方向、兜底阶梯与验证清单见 [player-engine.md](player-engine.md)。
 
 ## 5. 验收方法

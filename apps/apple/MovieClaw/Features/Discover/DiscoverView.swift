@@ -127,6 +127,14 @@ struct DiscoverView: View {
             .padding(.top, immersive || skeleton ? -topInset : 8)
             .padding(.bottom, 32)
         }
+        // 滚动视图铺到屏幕顶边，顶部内边距按顶栏高度手动给定，不交给系统按安全区自动让。
+        // iOS 26 上自动让的内边距会跟着导航栏高度走，而导航栏会在「大标题展开 / 收起」之间无限来回
+        // （约 1.8 秒一个来回，内边距在 122 与 174 之间变）：大图顶边随之在 0 与 52pt 之间跳，
+        // 又被下拉拉伸放大，看起来忽高忽低一直闪。触发条件是负顶部留白 + 下面的行用 LazyVStack
+        // （订阅首页没用懒加载，不受影响；iOS 27 只在启动时切一次）。内边距改成手动给定后循环断开；
+        // 不能只铺满不给内边距——那样下拉刷新的转圈会跑到状态栏正中、被灵动岛挡住
+        .contentMargins(.top, topInset, for: .scrollContent)
+        .ignoresSafeArea(.container, edges: .top)
         // 沉浸 Hero 从状态栏与顶栏底下穿过：关掉顶部滚动边缘雾化，由 Hero 自带的顶部压暗保证控件可读
         .scrollEdgeEffectHidden(immersive, for: .top)
         .onGeometryChange(for: CGFloat.self) { $0.safeAreaInsets.top } action: { topInset = $0 }
@@ -175,7 +183,7 @@ struct DiscoverView: View {
     /// 标题菜单：类型与数据源两组（切类型保留数据源、切数据源保留类型，都清空筛选，同 Web）
     @ViewBuilder
     private var titleMenu: some View {
-        Picker("类型", selection: Binding(get: { currentType }, set: { next in
+        Picker("类型", selection: Binding(mcGet: { currentType }, set: { next in
             guard next != currentType else { return }
             mediaType = next
             filters = .empty
@@ -185,7 +193,7 @@ struct DiscoverView: View {
         }
         .pickerStyle(.inline)
         .accessibilityIdentifier("discover-type")
-        Picker("数据源", selection: Binding(get: { source }, set: { next in
+        Picker("数据源", selection: Binding(mcGet: { source }, set: { next in
             guard next != source else { return }
             source = next
             filters = .empty
@@ -419,6 +427,8 @@ struct DiscoverHero: View {
     @Environment(\.api) private var api
     /// 指示器当前胶囊的填充进度 0...1
     @State private var fill: CGFloat = 0
+    /// 左右安全区：轮播铺满整屏宽（横屏不让出灵动岛那侧），文字与指示器要自己躲开
+    @State private var sideInsets = EdgeInsets()
 
     /// 预载下一张剧照：原图约 400KB～1MB，等轮到它才下载会闪一下空底；只预载下一张，蜂窝网络下不白烧流量
     private static let prefetcher = ImagePrefetcher()
@@ -430,18 +440,22 @@ struct DiscoverHero: View {
             // 按条目认页（同订阅首页）：先画快照、再换成新数据时，同一下标换了一张图，
             // 按下标认会把上一张没走完的推近状态带到新图上
             ForEach(Array(items.enumerated()), id: \.element.id) { i, item in
-                DiscoverHeroSlide(item: item, active: i == index, scrollOffset: scrollOffset, fade: fade)
+                DiscoverHeroSlide(item: item, active: i == index, isFirst: i == 0, isLast: i == items.count - 1,
+                                  scrollOffset: scrollOffset, fade: fade, sideInsets: sideInsets)
                     .tag(i)
             }
         }
         .tabViewStyle(.page(indexDisplayMode: .never))
+        // 横屏时剧照也铺满整屏宽：不铺的话两侧安全区（灵动岛、圆角那一截）露出页面底色
+        .ignoresSafeArea(.container, edges: .horizontal)
+        .onGeometryChange(for: EdgeInsets.self, of: \.safeAreaInsets) { sideInsets = $0 }
         // 向屏幕顶边之外多占一截给下拉拉伸用（分页 TabView 会裁掉页外内容，见 ImmersiveHeroBackdrop），布局高度仍是 height
         .frame(height: DiscoverHero.height + ImmersiveHeroBackdrop.pullReserve)
         .padding(.top, -ImmersiveHeroBackdrop.pullReserve)
         .overlay(alignment: .bottomTrailing) {
             if items.count > 1 {
                 ImmersiveHeroIndicator(count: items.count, index: $index, fill: fill) { "切换到《\(items[$0].title)》" }
-                    .padding(.trailing, 20)
+                    .padding(.trailing, 20 + sideInsets.trailing)
                     .padding(.bottom, 16)
                     .opacity(fade)
             }
@@ -481,8 +495,12 @@ private struct DiscoverAmbientHost: View {
 struct DiscoverHeroSlide: View {
     let item: DiscoverPosterItem
     let active: Bool
+    let isFirst: Bool
+    let isLast: Bool
     let scrollOffset: CGFloat
     let fade: Double
+    /// 左右安全区（轮播铺满整屏宽，文字自己躲开）
+    let sideInsets: EdgeInsets
     @Environment(\.api) private var api
     @Environment(\.permissions) private var permissions
     @Environment(Router.self) private var router
@@ -490,7 +508,8 @@ struct DiscoverHeroSlide: View {
     var body: some View {
         let sub = SubscriptionIndex.shared.subscription(for: item)
         ZStack(alignment: .bottomLeading) {
-            ImmersiveHeroBackdrop(url: Self.imageURL(item, api: api), active: active, scrollOffset: scrollOffset, height: DiscoverHero.height)
+            ImmersiveHeroBackdrop(url: Self.imageURL(item, api: api), active: active, scrollOffset: scrollOffset, height: DiscoverHero.height,
+                                  isFirst: isFirst, isLast: isLast)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("今日精选 · \(item.mediaType == "tv" ? "剧集" : "电影")")
@@ -530,6 +549,8 @@ struct DiscoverHeroSlide: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 28)
             .padding(.trailing, 60)
+            .padding(.leading, sideInsets.leading)
+            .padding(.trailing, sideInsets.trailing)
             .opacity(fade)
             .offset(y: max(0, scrollOffset) * 0.15)
         }
@@ -610,7 +631,11 @@ struct DiscoverErrorView: View {
     let failure: DiscoverFeed.Failure
     let retry: () async -> Void
     @Environment(Router.self) private var router
+    @Environment(\.permissions) private var permissions
     @State private var retrying = false
+
+    /// 网络设置是超管页面：成员不给跳转，重试键回到主按钮
+    private var showsNetworkSettings: Bool { failure.unreachable && permissions.isAdmin }
 
     var body: some View {
         ContentUnavailableView {
@@ -630,12 +655,12 @@ struct DiscoverErrorView: View {
                 }
             }
         } actions: {
-            if failure.unreachable {
+            if showsNetworkSettings {
                 Button("前往网络设置") { router.push(.settingsSection(.network)) }
                     .discoverProminentButton()
                     .accessibilityIdentifier("discover-network-settings")
             }
-            if failure.unreachable {
+            if showsNetworkSettings {
                 retryButton.buttonStyle(.glass)
             } else {
                 retryButton.discoverProminentButton()

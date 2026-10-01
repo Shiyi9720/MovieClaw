@@ -11,6 +11,7 @@ import type {
 } from "@/lib/api/libraries";
 import type { LibraryKind, MediaType } from "@/lib/media-types";
 import { readLocalProgress, writeLocalProgress } from "@/lib/player/local-progress";
+import type { PlaybackRecordPayload } from "@/lib/player/playback-record";
 
 /**
  * 播放接口的作用域（docs/design/media-share.md §5.3）。
@@ -656,6 +657,18 @@ export interface PlaybackChapterMark {
   title: string | null;
 }
 
+/**
+ * 可跳过的一段（docs/design/skip-intro.md）：服务端整季比对认出来的，客户端只管用。
+ * intro 片头（显示「跳过片头」）、outro 片尾（提前显示「即将播放」；to_end 为假时后面
+ * 还有内容，按钮是「跳过片尾」）、other 片头前的冠名广告 / 发行许可（显示「跳过」）。
+ */
+export interface PlaybackSegment {
+  type: "intro" | "outro" | "other";
+  start_ms: number;
+  end_ms: number;
+  to_end: boolean;
+}
+
 export interface PlaybackSession {
   decision: PlaybackDecision;
   /** 档 0 没有会话（原文件直出），此处为 null */
@@ -676,6 +689,8 @@ export interface PlaybackSession {
   hw_backend: string | null;
   /** 进度条上的章节刻度；没有内嵌章节的文件是空表（合成章节服务端不下发） */
   chapters?: PlaybackChapterMark[];
+  /** 片头 / 片尾 / 其他可跳过的段；剧集库开了「识别片头片尾」且这一季识别过才有 */
+  segments?: PlaybackSegment[];
   /** 本单元的观看状态快照（§6.10）。续播点已由服务端并入 start_ms，这里
    * 整份带回给前端预填时间轴、恢复字幕记忆——起播不再单独问 /resume */
   watch: PlaybackWatchState | null;
@@ -708,6 +723,14 @@ interface DecideBody extends PlaybackUnit {
    * 用它压码率、必要时降高度；手动选了画质上限时服务端忽略。样本不够时省略。
    */
   downlink_bps?: number;
+  /**
+   * 播放编号（docs/design/playback-qoe.md §2，lib/player/playback-record.ts）：进入这一集时生成，
+   * 断线重连、原位重开、降档、换画质 / 音轨都沿用同一个。服务端据此建「已开始」的记录、写进取流令牌，
+   * 取流统计按它归集。影片分享的访客不带（不上报遥测）。
+   */
+  attempt_id?: string;
+  /** 客户端类型，只用于播放记录分组 */
+  client?: "web";
 }
 
 /** 只问「该怎么放」，不起会话。用于播放前的档位预览与诊断。 */
@@ -964,8 +987,11 @@ export interface PlaybackProgressBody extends PlaybackUnit {
   event: "start" | "progress" | "stop";
   /** 播到文件的哪个位置。**不报（undefined）视同播到结尾**，与报 0 不同。 */
   position_ms?: number;
+  /** 只报用户亲手选的轨（见 lib/player/track-memory.ts）；不报 = 服务端记忆保持原值 */
   audio_track?: string;
   subtitle_track?: string;
+  /** 正在放的版本（decision.file_id）：多版本时服务端据此判断报的轨是不是默认挑选 */
+  file_id?: number;
   /** 暂停态；不报 = 实时会话保持原值 */
   paused?: boolean;
 }
@@ -1099,29 +1125,13 @@ export async function fetchTrickplay(subtitleOrStreamUrl: string): Promise<Trick
 }
 
 
-export interface PlaybackMetricPayload {
-  library_file_id: number | null;
-  tier: number;
-  degraded_from: number | null;
-  engine: string;
-  hw_backend: string;
-  ttff_ms: number | null;
-  rebuffer_ms: number;
-  rebuffer_count: number;
-  seek_count: number;
-  dropped_frames: number | null;
-  total_frames: number | null;
-  watched_ms: number;
-}
-
 /**
- * 上报一次播放的质量快照。
- *
- * 只落本地——写进自建实例自己的数据库，绝不外发。失败无所谓（指标是趋势
- * 数据），所以调用方一律吞掉；页面卸载路径用 sendBeacon 保证发得出去。
+ * 上报一次播放的完整记录（新口径，docs/design/playback-qoe.md；字段见 lib/player/playback-record.ts）。
+ * 服务端按播放编号合并进开会话时建好的那一行，统一判定跳转分位、中断与北极星。失败由调用方放进
+ * 本地队列补发（lib/player/report-queue.ts）。
  */
-export async function reportPlaybackMetric(
-  payload: PlaybackMetricPayload,
+export async function reportPlaybackRecord(
+  payload: PlaybackRecordPayload,
   scope: PlaybackApiScope = DEFAULT_PLAYBACK_SCOPE,
 ): Promise<void> {
   if (!scope.telemetry) return;
@@ -1131,18 +1141,21 @@ export async function reportPlaybackMetric(
   });
 }
 
-/** 卸载路径上的上报：普通 fetch 会被浏览器直接取消。 */
-export function reportPlaybackMetricOnUnload(
-  payload: PlaybackMetricPayload,
+/** 卸载路径上的新口径上报（sendBeacon）。返回浏览器有没有接下这次发送；没接下的由调用方入队。 */
+export function reportPlaybackRecordOnUnload(
+  payload: PlaybackRecordPayload,
   scope: PlaybackApiScope = DEFAULT_PLAYBACK_SCOPE,
-): void {
-  if (!scope.telemetry) return;
+): boolean {
+  if (!scope.telemetry) return true;
   try {
-    navigator.sendBeacon?.(
-      resolveRequestUrl("/playback/metrics"),
-      new Blob([JSON.stringify(payload)], { type: "application/json" }),
+    return (
+      navigator.sendBeacon?.(
+        resolveRequestUrl("/playback/metrics"),
+        new Blob([JSON.stringify(payload)], { type: "application/json" }),
+      ) ?? false
     );
   } catch {
-    // 卸载路径上无处呈现错误
+    return false;
   }
 }
+

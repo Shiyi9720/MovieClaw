@@ -1,6 +1,6 @@
 ---
 name: release
-description: 发布 movieclaw 新版本。当用户要求发版、发布新版本、打 tag、发布 NER 模型或发布 Docker 镜像时使用。涵盖版本号三处同步、应用/模型/镜像三种发布类型的完整流程与检查清单。
+description: 发布 movieclaw 新版本。当用户要求发版、发布新版本、打 tag、发布 NER 模型、发布 Docker 镜像，或打包上传 iOS App 到 TestFlight / App Store、补传发版附件（IPA、Mac 转码器）时使用。涵盖版本号三处同步、应用/模型/镜像/iOS 的完整流程、可选附件失败补救与检查清单。
 ---
 
 # movieclaw 发布规范
@@ -32,7 +32,8 @@ description: 发布 movieclaw 新版本。当用户要求发版、发布新版�
 1. bump 两处版本号 → 提交 PR 合入 main（changelog 可同 PR 一起写，见下）。
    基线 spec（`spec.json`）是构建产物不入 git，镜像、发版脚本、goreleaser
    都在构建期现场导出，不需要也不能手动提交它
-2. 以发版 PR 的 CI 全绿为准（CI 会跑 ruff / pytest / web lint / typecheck），
+2. 以发版 PR 的 CI 全绿为准（平时 CI 按改动路径只跑相关作业，发版 PR 改了
+   `__init__.py` 的版本号会触发全量：ruff / pytest / cli / web / Worker 加 iOS 编译），
    无需在本地重跑全量测试——本地跑 pytest 还需先下载 NER 模型，且沙箱
    代理环境会造成与代码无关的误报
 3. git tag vX.Y.Z && git push origin vX.Y.Z
@@ -46,13 +47,13 @@ description: 发布 movieclaw 新版本。当用户要求发版、发布新版�
 4. release.yml 两段式发布（draft → publish）：先以 draft 创建 Release，
    各作业往上传产物——应用三件套（app-web.tar.gz / app-backend.tar.gz /
    manifest.json，可选 manifest.json.sig）、mclaw 六平台归档 + checksums、
-   macOS Worker zip（可选附件）——同时发布多架构 Docker 镜像到 Docker Hub
+   macOS Worker zip 与 iOS 未签名 IPA（均为可选附件）——同时发布多架构 Docker 镜像到 Docker Hub
    （movieclaw/movieclaw，正式版打 vX.Y.Z + runtime-N + latest，
    预发布版只打 vX.Y.Z-… 不动 latest）。最后 publish 作业校验产物齐全、
    镜像发布成功后把 draft 转正；此前 Release 对应用内更新和
    install-cli.sh 都不可见。**任何作业失败时 Release 停在 draft，
    修复后到 Actions 重跑整个 release 工作流即可**（上传均带 --clobber，
-   安全重入）；仅 Worker 挂了不拦转正，重跑 worker-macos 作业补传即可。
+   安全重入）；仅 Worker / IPA 挂了不拦转正，重跑 worker-macos / ios-ipa 作业补传即可。
 5. changelog：写 docs/changelog/vX.Y.Z.md 合入 main。changelog 先于发版
    合入（推荐，可与发版 PR 同 PR）时，release.yml 建 Release 会直接用它
    当 body；后合入也没关系，release-notes.yml 会自动同步为 Release body
@@ -150,20 +151,57 @@ ffmpeg 版本，发版前按下表逐项过一遍。
 - [ ] **iOS**：同局域网 iPhone 打开播放页，确认走原生 HLS 且全屏可用
 - [ ] **Safari**：HEVC 直通不黑屏（`hvc1` 标签那条陷阱只有 Safari 能验）
 
-## 六、发版检查清单
+## 六、iOS App 发布（TestFlight / App Store）
+
+与服务器发版**相互独立**：App 版本号只看 `apps/apple/project.yml` 的 `MARKETING_VERSION`，
+不跟服务器 tag 走；只有一个发行版本，同一个构建既进内部 / 对外 TestFlight 也用于提审。
+完整说明见 `docs/design/ios-release.md`，账号持有人的一次性准备与对外测试步骤见
+`docs/design/ios-release-checklist.md`。
+
+1. 打包机准备（每台新 Mac 一次）：本机签名配置 `Signing.local.xcconfig` 写团队 ID；
+   App Store Connect API 密钥**必须「管理」角色**（「App 管理」用不了云端发布证书，
+   Xcode 27 的命令行又读不到 Xcode 里登录的账号）；密钥 ID / Issuer ID 放仓库外的本机 env 文件，
+   `.p8` 放 `~/.appstoreconnect/private_keys/`，全部不入库、不贴进聊天。
+   新证书首次打包前让账号持有人自己执行一次钥匙串分区授权
+   （`security set-key-partition-list …`，要输 Mac 登录密码），否则会弹出几十个授权框。
+2. 从 main 打包上传：`source <本机 env> && apps/apple/scripts/release.sh --upload`
+   （不带 `--upload` 只导出，用于先验证签名）。构建号取 UTC 时间自动递增。
+3. 上传后 5～30 分钟处理完；可用 ASC API 查 `processingState` / `buildAudienceType`。
+   开了自动分发的内部测试组会自动收到；对外测试组按 checklist §5 加构建、提审。
+4. 看 Apple 邮件：ITMS-91053 等警告按邮件补隐私清单。
+
+## 七、可选附件失败的补救（worker-macos / ios-ipa）
+
+publish 作业不等它们，Release 会照常转正——但 changelog 若写了这些附件就必须补上。
+GitHub 只允许整次运行结束后再单独重跑某个作业（`gh run rerun --job <id>`）。
+
+- **ios-ipa 编译失败**：多半是 CI 的 Xcode 比本机旧（见 ios-release.md §5）。先在本机
+  `git checkout vX.Y.Z` 后跑 `apps/apple/scripts/build-unsigned-ipa.sh`，再
+  `gh release upload vX.Y.Z apps/apple/build-ipa/MovieClaw-iOS-unsigned.ipa --clobber` 补传，
+  然后开 PR 修 CI 兼容（PR 上的 `ios` 检查能复现）。
+- **worker-macos 公证失败**，按报错对仓库密钥：
+  - `--issuer … must be a valid UUID` → `APPLE_API_ISSUER_ID` 值不对（常见多带空格 / 换行）
+  - `HTTP status code: 401` → `APPLE_API_KEY_ID` 与 `APPLE_API_KEY_P8` 不是同一把，或密钥已撤销
+  - 「没有 Developer ID Application 证书」→ `.p12` 导出的是别的证书
+  `.p8` / `.p12` 属于凭证，由账号持有人自己 `gh secret set`（从本机文件重定向输入，不经聊天）。
+  改好后单独重跑 worker-macos；可下载产物本机 `spctl -a -vv` 看到 `Notarized Developer ID` 即成功。
+
+## 八、发版检查清单
 
 - [ ] 版本号三处一致（应用发版）
 - [ ] bump 版本号后已跑 `scripts/export-spec.sh`（服务端与 Go CLI 两份 spec）
 - [ ] 本次改动是否触碰运行时依赖？触碰了 → `docker/runtime-version` +1（镜像随发版自动发布）
 - [ ] 改了 Worker 握手协议（`REMOTE_WORKER_PROTOCOL_VERSION` 与 macOS Worker
       的 `BuildInfo.protocolVersion` 同步 +1）→ 旧 Worker 会被服务端拒绝握手，
-      changelog 显著位置写明「需要更新 Mac Worker」
+      changelog 显著位置写明「需要更新 Mac Worker」；协议版本没变、但新能力只派给新版 Worker
+      （按 Worker 自报能力派发）时，同样要在提示框里写明「请下载新版转码器」
 - [ ] 数据库迁移向前兼容（alembic 迁移是单向的，用户回退靠自动备份）
 - [ ] Release 产物齐全：publish 作业已自动校验（应用三件套 + mclaw 六平台
       归档 `mclaw_{linux,darwin}_{amd64,arm64}.tar.gz`、
       `mclaw_windows_{amd64,arm64}.zip`、`checksums.txt`，启用签名时含
       `.sig`），人工只需确认 release 工作流全绿、Release 已从 draft 转正；
-      worker-macos 作业红了 → Worker zip 缺失，重跑该作业补传
+      worker-macos 作业红了 → Worker zip 缺失，重跑该作业补传；
+      ios-ipa 作业红了 → `MovieClaw-iOS-unsigned.ipa` 缺失，重跑该作业补传
 - [ ] changelog 已写入 `docs/changelog/vX.Y.Z.md` 并合入 main（release-notes.yml
       自动同步为 Release body，应用内更新界面会原文展示给用户），并按
       `changelog-guide.md` 自检过第一屏

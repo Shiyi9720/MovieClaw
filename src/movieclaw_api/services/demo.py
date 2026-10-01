@@ -70,6 +70,7 @@ ALLOWED_WRITE_OPERATIONS: frozenset[str] = frozenset(
         "playback.marks.set",  # 收藏 / 已看：只落当前账号自己的播放状态
         "playback.metric.report",
         "playback.client-log",
+        "reels.events",  # 刷片曝光与播放事件：只记行为，不修改媒体库
         # ---- AI 助手：对话走预设回复的演示模型，会话按设备隔离（services/demo_agent.py）----
         "session.start",
         "session.stop",
@@ -106,6 +107,9 @@ BLOCKED_READ_OPERATIONS: dict[str, str] = {
     "system.spec": "演示站不提供接口清单",
     # 转码诊断里有 ffmpeg 输出片段，带服务器上的文件路径
     "playback.session.diagnostics": "演示站不提供转码诊断信息",
+    # 新播放记录含访客自报的引擎日志、环境与错误文字；统计的小样本 / 最差记录也会回显。
+    "playback.attempt.get": "演示站不提供播放诊断记录（其中含有其他访客的日志）",
+    "playback.stats.qoe": "演示站不提供播放诊断统计（其中含有其他访客的记录）",
 }
 
 # 按 operation_id 前缀给出更具体的拒绝理由（先匹配先用）；都不匹配时用通用文案。

@@ -3,13 +3,19 @@ import SwiftUI
 /// 下载目标选择（对应 Web `components/download-target-dialog.tsx`）。
 ///
 /// 点搜索结果的「下载」先让用户看清文件会落到哪，而不是静默提交。候选三层：
-///   1. 智能入库：种子解析出可靠身份（类型 + 片名 + 年份）时，`POST /downloaders/resolve-target`
-///      预演「识别 → 库路由 → 监听投递目录」，展示真实归宿与配置警示；识别到多个条目时让用户确认；
+///   1. 智能入库：`POST /downloaders/resolve-target` 预演「识别 → 库路由 → 监听投递目录」，
+///      展示真实归宿与配置警示。种子自己的身份（类型 + 片名 + 年份）识别不出来时，后端按
+///      用户的搜索词给出 TMDB 候选，弹窗只问一句「这是哪部作品？」——点选即与自动识别同权，
+///      媒体库仍由收藏范围自动分配；
 ///   2. 下载器已配置的目录：默认保存目录 + 各路径映射的 movieclaw 侧目录（双视角展示）；
 ///   3. 下载器默认目录兜底。
 ///
 /// 保存位置记忆（按种子分类）：勾「记住本次选择」才写记忆（已有记忆时默认勾上——从确认条「更改」进来
 /// 就是要改它）；有记忆时点「下载」先弹 `DownloadConfirmSheet` 给用户确认落点。
+///
+/// 成员版（member-permissions-v2 §3.7 U7）：下载器配置、智能入库预检都是超管接口，成员提交也不许带
+/// 保存目录 / 下载器 / 智能入库。所以成员只在两种落点里选：「下载器默认目录」，或自己能看到的某个
+/// 媒体库（带 library_id，由后端按库推导目录并入库）；不读也不写本机记忆的保存位置偏好。
 
 /// 弹窗需要的种子身份切片（由 TorrentHit 提炼）
 struct DownloadTargetRequest: Identifiable, Hashable {
@@ -25,6 +31,8 @@ struct DownloadTargetRequest: Identifiable, Hashable {
     /// 三件套不全时为 nil（智能入库选项不出现）
     var identity: Identity?
     var subtitle: String?
+    /// 用户的搜索关键词：种子身份识别失败时后端拿它检索 TMDB 候选
+    var hint: String?
     /// 记忆的桶键：站点声明的一级分类（缺省 other）
     var category: String
     /// 记忆失效等原因（显示在弹窗顶部，静默回落最让人困惑）
@@ -34,7 +42,7 @@ struct DownloadTargetRequest: Identifiable, Hashable {
 
     var id: String { "\(siteId):\(downloadUrl)" }
 
-    init?(hit: API.TorrentHit) {
+    init?(hit: API.TorrentHit, keyword: String = "") {
         guard let url = hit.downloadUrl else { return nil }
         hitKey = hit.rowKey
         siteId = hit.siteId
@@ -46,6 +54,8 @@ struct DownloadTargetRequest: Identifiable, Hashable {
             identity = Identity(kind: kind, title: title, year: year)
         }
         subtitle = hit.subtitle.isEmpty ? nil : hit.subtitle
+        let trimmed = keyword.trimmingCharacters(in: .whitespaces)
+        hint = trimmed.isEmpty ? nil : trimmed
         category = hit.category ?? "other"
     }
 }
@@ -93,10 +103,12 @@ final class DownloadTargetPrefs {
 
 /// 一个可选的保存目标
 private struct TargetOption: Identifiable, Hashable {
-    enum Kind: Hashable { case smart, dir, fallback }
+    enum Kind: Hashable { case smart, dir, library, fallback }
     var id: String
     var kind: Kind
     var savePath: String?
+    /// 成员版「下载到某个媒体库」的库 id
+    var libraryId: Int?
     var label: String
     var detail: String?
 }
@@ -110,11 +122,21 @@ struct DownloadTargetSheet: View {
     @Environment(\.api) private var api
     @Environment(\.dismiss) private var dismiss
     @Environment(Router.self) private var router
+    @Environment(\.permissions) private var permissions
 
     @State private var downloaders: [API.DownloaderView] = []
+    /// 成员版：自己可见的媒体库（nil = 还在拉）
+    @State private var memberLibraries: [API.LibraryView]?
     @State private var downloaderId: Int?
     @State private var manualTarget: API.ManualDownloadTargetView?
-    @State private var selectedCandidateId: Int?
+    /// 「这是哪部作品？」：自动识别没收敛（或种子没身份）时进入确认模式，此后候选与搜索框常驻
+    @State private var picking = false
+    /// 候选单独留一份：点候选重跑预检期间不清空
+    @State private var candidates: [API.ManualDownloadCandidateView] = []
+    @State private var selectedCandidate: API.ManualDownloadCandidateView?
+    /// 当前生效的搜索词与输入框草稿
+    @State private var hint: String?
+    @State private var hintDraft = ""
     @State private var showOther = false
     @State private var downloadersLoaded = false
     @State private var loadingDownloaders = false
@@ -128,10 +150,12 @@ struct DownloadTargetSheet: View {
     @State private var initialized = false
 
     private var downloader: API.DownloaderView? { downloaders.first { $0.id == downloaderId } }
+    private var canResolve: Bool { request.identity != nil || request.hint != nil }
 
     private var options: [TargetOption] {
+        guard permissions.isAdmin else { return memberOptions }
         var result: [TargetOption] = []
-        if request.identity != nil, let t = manualTarget, t.status == "ready", t.tmdbId != nil, t.libraryId != nil, t.ok {
+        if let t = manualTarget, t.status == "ready", t.tmdbId != nil, t.libraryId != nil, t.ok {
             let entryDir = t.entryDir ?? t.path
             let reason = t.routeReason ?? ""
             let detail: String? = switch t.mode {
@@ -164,6 +188,23 @@ struct DownloadTargetSheet: View {
         return result
     }
 
+    /// 成员版候选：可见的影视库（种子类型对得上的排前面）+ 下载器默认目录。图片库不收种子
+    private var memberOptions: [TargetOption] {
+        guard let libraries = memberLibraries else { return [] }
+        let kind = request.identity?.kind
+        let fit = libraries.filter { $0.kind != "photo" }
+        let ordered = fit.filter { $0.kind == kind } + fit.filter { $0.kind != kind }
+        var result = ordered.map { library in
+            TargetOption(
+                id: "library:\(library.id)", kind: .library, libraryId: library.id,
+                label: "下载到「\(library.name)」",
+                detail: "\(LibraryKindMeta.label(library.kind))库；按库的设置决定保存目录，完成后自动入库"
+            )
+        }
+        result.append(TargetOption(id: "default", kind: .fallback, label: "下载器默认目录", detail: "由下载器按自身设置决定保存位置；不会自动整理入库"))
+        return result
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -174,8 +215,17 @@ struct DownloadTargetSheet: View {
                     if let error {
                         notice(error, tone: Theme.danger)
                     }
-                    smartSection
-                    if !showOther {
+                    if permissions.isAdmin {
+                        smartSection
+                    }
+                    if (showOther && loadingDownloaders) || (!permissions.isAdmin && memberLibraries == nil) {
+                        DiscoverSkeletonBlock(cornerRadius: 12).frame(height: 52)
+                    }
+                    ForEach(options) { option in
+                        optionRow(option)
+                    }
+                    // 收在自动入库选项之后：点完候选，视线从条目直接落到入库结论
+                    if permissions.isAdmin, !showOther {
                         Button {
                             showOther = true
                         } label: {
@@ -185,16 +235,10 @@ struct DownloadTargetSheet: View {
                         .buttonStyle(.glass)
                         .accessibilityIdentifier("download-other-targets")
                     }
-                    if showOther, loadingDownloaders {
-                        DiscoverSkeletonBlock(cornerRadius: 12).frame(height: 52)
-                    }
-                    ForEach(options) { option in
-                        optionRow(option)
-                    }
                     if showOther, downloaders.count >= 2 {
-                        Picker("下载器", selection: Binding(get: { downloaderId ?? -1 }, set: { id in
+                        Picker("下载器", selection: Binding(mcGet: { downloaderId ?? -1 }, set: { id in
                             downloaderId = id
-                            reloadManualTarget(downloaderId: id, tmdbId: selectedCandidateId)
+                            reloadManualTarget(downloaderId: id, candidate: selectedCandidate, hint: hint)
                         })) {
                             ForEach(downloaders, id: \.id) { d in
                                 Text(d.name + (d.isDefault ? "（默认）" : "")).tag(d.id)
@@ -202,22 +246,24 @@ struct DownloadTargetSheet: View {
                         }
                         .pickerStyle(.menu)
                     }
-                    Toggle(isOn: $remember) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("记住本次选择，作为「\(TorrentCategories.label(request.category))」的默认位置")
-                                .font(.subheadline)
-                                .foregroundStyle(Theme.text)
-                            Text(remember
-                                ? "之后点「下载」先给你确认一次落点，随时可以改，或在确认条上「不再记住」。"
-                                : "不勾选就只对这一次下载生效，不会留下默认位置。")
-                                .font(.caption)
-                                .foregroundStyle(Theme.textFaint)
+                    if permissions.isAdmin {
+                        Toggle(isOn: $remember) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("记住本次选择，作为「\(TorrentCategories.label(request.category))」的默认位置")
+                                    .font(.subheadline)
+                                    .foregroundStyle(Theme.text)
+                                Text(remember
+                                    ? "之后点「下载」先给你确认一次落点，随时可以改，或在确认条上「不再记住」。"
+                                    : "不勾选就只对这一次下载生效，不会留下默认位置。")
+                                    .font(.caption)
+                                    .foregroundStyle(Theme.textFaint)
+                            }
                         }
+                        .padding(12)
+                        .cardStyle(radius: 12)
+                        .accessibilityIdentifier("download-remember")
                     }
-                    .padding(12)
-                    .cardStyle(radius: 12)
-                    .accessibilityIdentifier("download-remember")
-                    if showOther {
+                    if permissions.isAdmin, showOther {
                         Button {
                             dismiss()
                             router.push(.settingsSection(.downloaders))
@@ -240,7 +286,7 @@ struct DownloadTargetSheet: View {
                     Button("取消") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(busy ? "提交中…" : "确认下载") { submit() }
+                    Button(busy ? "提交中…" : confirmTitle) { submit() }
                         .discoverProminentButton()
                         .disabled(busy || selected == nil)
                         .accessibilityIdentifier("download-confirm")
@@ -251,11 +297,22 @@ struct DownloadTargetSheet: View {
         .task {
             guard !initialized else { return }
             initialized = true
+            guard permissions.isAdmin else {
+                // 成员版：只拉自己可见的库，不碰下载器配置与智能入库预检
+                memberLibraries = (try? await api.libraryList(scope: "all")) ?? []
+                autoSelect()
+                return
+            }
             remember = remembered != nil
-            showOther = request.identity == nil || (remembered != nil && remembered?.kind != "smart")
+            hint = request.hint
+            hintDraft = request.hint ?? ""
+            picking = request.identity == nil
+            // 有线索时先问「这是哪部」，目录收在「其他保存位置」里：摊开的目录会被默认选中，
+            // 用户一点确认就下进了不会自动入库的目录
+            showOther = !canResolve || (remembered != nil && remembered?.kind != "smart")
             if remembered?.kind == "smart" { downloaderId = remembered?.downloaderId }
-            if let identity = request.identity {
-                await runPreflight(identity: identity, downloaderId: remembered?.kind == "smart" ? remembered?.downloaderId : nil, tmdbId: nil, initial: true)
+            if canResolve {
+                await runPreflight(downloaderId: remembered?.kind == "smart" ? remembered?.downloaderId : nil, candidate: nil, hint: request.hint, initial: true)
             }
             autoSelect()
         }
@@ -269,43 +326,86 @@ struct DownloadTargetSheet: View {
         }
     }
 
+    private var confirmTitle: String {
+        if selected == "smart", let name = manualTarget?.libraryName { return "下载到「\(name)」" }
+        return "确认下载"
+    }
+
     @ViewBuilder
     private var smartSection: some View {
-        if request.identity != nil {
-            if loadingTarget {
-                HStack(spacing: 10) {
-                    ProgressView()
-                    Text("正在识别影视条目并预演智能入库…").font(.caption).foregroundStyle(Theme.textFaint)
-                }
-                .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
-                .padding(.horizontal, 14)
-                .cardStyle(radius: 12)
-            } else if let t = manualTarget {
-                if t.status != "ready" {
-                    notice(t.status == "ambiguous"
-                        ? "识别到多个可能条目。请确认正确条目后，系统会继续预演自动入库目录。"
-                        : "未自动入库：无法可靠识别该资源；为避免投错库请手选保存目录。", tone: Theme.warning)
-                }
-                if t.status == "ambiguous" {
-                    DiscoverFlowLayout(spacing: 8, lineSpacing: 8) {
-                        ForEach(t.candidates, id: \.tmdbId) { c in
-                            DiscoverChip(
-                                label: c.title + (c.year.map { " (\($0))" } ?? "") + (c.episodeCount.map { " · \($0) 集" } ?? ""),
-                                active: selectedCandidateId == c.tmdbId
-                            ) {
-                                selectedCandidateId = c.tmdbId
-                                reloadManualTarget(downloaderId: downloaderId, tmdbId: c.tmdbId)
-                            }
+        if picking {
+            candidatePicker
+        }
+        if loadingTarget {
+            HStack(spacing: 10) {
+                ProgressView()
+                Text(selectedCandidate != nil ? "正在预演自动入库…" : "正在识别影视条目并预演智能入库…").font(.caption).foregroundStyle(Theme.textFaint)
+            }
+            .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+            .padding(.horizontal, 14)
+            .cardStyle(radius: 12)
+        } else if let t = manualTarget {
+            if t.status == "ready", !t.ok {
+                notice("已识别资源，但当前不能自动入库：\(t.warning ?? "请检查媒体库和自动入库配置。")", tone: Theme.warning)
+            }
+        } else if canResolve {
+            notice("自动识别暂不可用；为避免投错库请手选保存目录后再下载。", tone: Theme.warning)
+        }
+    }
+
+    /// 「这是哪部作品？」：候选来自种子标题的歧义结果 + 搜索词的 TMDB 检索；都不对就地换个词搜
+    private var candidatePicker: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("这是哪部作品？").font(.subheadline.weight(.medium)).foregroundStyle(Theme.text)
+                Text(pickerCaption).font(.caption).foregroundStyle(Theme.textFaint)
+            }
+            if !candidates.isEmpty {
+                DiscoverFlowLayout(spacing: 8, lineSpacing: 8) {
+                    ForEach(candidates, id: \.self) { c in
+                        DiscoverChip(
+                            label: c.title + (c.year.map { " (\($0))" } ?? "") + " · " + (c.kind == "tv" ? "剧集" : "电影")
+                                + (c.episodeCount.map { " · \($0) 集" } ?? ""),
+                            active: selectedCandidate?.kind == c.kind && selectedCandidate?.tmdbId == c.tmdbId
+                        ) {
+                            selectedCandidate = c
+                            reloadManualTarget(downloaderId: downloaderId, candidate: c, hint: hint)
                         }
                     }
                 }
-                if t.status == "ready", !t.ok {
-                    notice("已识别资源，但当前不能自动入库：\(t.warning ?? "请检查媒体库和自动入库配置。")", tone: Theme.warning)
-                }
-            } else {
-                notice("自动识别暂不可用；为避免投错库请手选保存目录后再下载。", tone: Theme.warning)
+            }
+            HStack(spacing: 8) {
+                TextField(candidates.isEmpty ? "输入片名" : "都不对？换个片名搜", text: $hintDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .submitLabel(.search)
+                    .onSubmit(searchHint)
+                    .accessibilityIdentifier("download-hint-field")
+                Button("搜索", action: searchHint)
+                    .buttonStyle(.glass)
+                    .disabled(hintDraft.trimmingCharacters(in: .whitespaces).isEmpty || loadingTarget)
             }
         }
+        .padding(12)
+        .background(Theme.warning.opacity(0.06), in: .rect(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.warning.opacity(0.2)))
+    }
+
+    private var pickerCaption: String {
+        if !loadingTarget, manualTarget?.status == "not_found" {
+            return hint.map { "没找到与「\($0)」匹配的作品，换个片名试试（中文名搜不到时可试英文/原名）。" }
+                ?? "输入片名搜索，确认后会自动分配媒体库。"
+        }
+        return candidates.isEmpty
+            ? "输入片名搜索，确认后会自动分配媒体库。"
+            : "没能自动认出这条资源。点选正确的作品，媒体库会按收藏范围自动分配。"
+    }
+
+    private func searchHint() {
+        let q = hintDraft.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return }
+        hint = q
+        selectedCandidate = nil
+        reloadManualTarget(downloaderId: downloaderId, candidate: nil, hint: q)
     }
 
     private func notice(_ text: String, tone: Color) -> some View {
@@ -347,24 +447,33 @@ struct DownloadTargetSheet: View {
 
     // MARK: 数据
 
-    private func runPreflight(identity: DownloadTargetRequest.Identity, downloaderId: Int?, tmdbId: Int?, initial: Bool = false) async {
+    private func runPreflight(downloaderId: Int?, candidate: API.ManualDownloadCandidateView?, hint: String?, initial: Bool = false) async {
         targetRequestId += 1
         let requestId = targetRequestId
         loadingTarget = true
         if !initial { manualTarget = nil }
+        let identity = request.identity
         let target = try? await api.dlResolveTarget(body: .init(
-            kind: identity.kind, title: identity.title, year: identity.year,
-            subtitle: request.subtitle, downloaderId: downloaderId, selectedTmdbId: tmdbId
+            kind: identity?.kind, title: identity?.title, year: identity?.year,
+            subtitle: request.subtitle, hint: hint, downloaderId: downloaderId,
+            selectedTmdbId: candidate?.tmdbId, selectedKind: candidate?.kind
         ))
         guard requestId == targetRequestId else { return }
         manualTarget = target
         loadingTarget = false
-        if initial, target == nil || target?.status != "ready" || target?.ok != true { showOther = true }
+        if let target { candidates = target.candidates }
+        if initial, let target, target.status != "ready" { picking = true }
+        // 有候选可点时目录继续收着；找不到/不能自动入库/识别不可用时才摊开目录兜底
+        if target == nil || target?.status == "not_found" || (target?.status == "ready" && target?.ok != true) {
+            showOther = true
+        }
+        // 用户刚点选了条目：直接选中随之出现的「自动入库」，不让选中项停在先前默认的目录上
+        if candidate != nil, target?.status == "ready", target?.ok == true { selected = "smart" }
     }
 
-    private func reloadManualTarget(downloaderId: Int?, tmdbId: Int?) {
-        guard let identity = request.identity else { return }
-        Task { await runPreflight(identity: identity, downloaderId: downloaderId, tmdbId: tmdbId) }
+    private func reloadManualTarget(downloaderId: Int?, candidate: API.ManualDownloadCandidateView?, hint: String?) {
+        guard request.identity != nil || hint != nil else { return }
+        Task { await runPreflight(downloaderId: downloaderId, candidate: candidate, hint: hint) }
     }
 
     /// 展开「其他保存位置」才读取下载器配置；最终选中的不是初始预检用的下载器时补一次预检
@@ -380,8 +489,8 @@ struct DownloadTargetSheet: View {
         downloaderId = chosen?.id
         downloadersLoaded = true
         loadingDownloaders = false
-        if request.identity != nil, preflightId != previous {
-            reloadManualTarget(downloaderId: preflightId, tmdbId: selectedCandidateId)
+        if canResolve, preflightId != previous {
+            reloadManualTarget(downloaderId: preflightId, candidate: selectedCandidate, hint: hint)
         }
         autoSelect()
     }
@@ -397,6 +506,14 @@ struct DownloadTargetSheet: View {
             }
             if let match { selected = match.id; return }
         }
+        if !permissions.isAdmin {
+            // 成员版：种子类型对得上的默认库 > 同类型第一个库 > 下载器默认目录
+            let kind = request.identity?.kind
+            let fit = (memberLibraries ?? []).filter { $0.kind == kind }
+            let library = fit.first { $0.isDefault } ?? fit.first
+            selected = library.map { "library:\($0.id)" } ?? "default"
+            return
+        }
         if loadingTarget || (showOther && !downloadersLoaded) { return }
         selected = (opts.first { $0.kind == .smart } ?? opts.first { $0.kind != .smart } ?? opts[0]).id
     }
@@ -405,22 +522,38 @@ struct DownloadTargetSheet: View {
         guard let option = options.first(where: { $0.id == selected }), !busy else { return }
         busy = true
         error = nil
-        // 只在非默认下载器时显式带 downloader_id：默认台走后端原有语义
-        let pickedDownloaderId = downloader.map { $0.isDefault ? nil : $0.id } ?? downloaderId
         var payload = API.DownloadSubmitPayload(siteId: request.siteId, downloadUrl: request.downloadUrl)
         payload.torrentId = request.torrentId
+        guard permissions.isAdmin else {
+            // 成员版只带 library_id（+ 推导条目子目录用的片名年份）；不带目录 / 下载器 / 智能入库 / 记忆分类
+            if option.kind == .library {
+                payload.libraryId = option.libraryId
+                payload.title = request.identity?.title
+                payload.year = request.identity?.year
+                payload.subtitle = request.subtitle
+            }
+            send(payload)
+            return
+        }
+        // 只在非默认下载器时显式带 downloader_id：默认台走后端原有语义
+        let pickedDownloaderId = downloader.map { $0.isDefault ? nil : $0.id } ?? downloaderId
         // 只有勾了「记住本次选择」才带分类：后端拿不到分类就不写记忆
         if remember { payload.category = request.category }
-        if option.kind == .smart, let identity = request.identity, let tmdbId = manualTarget?.tmdbId {
+        // 身份一律取预检确认的结论：类型可能与种子解析的不同，标题是 TMDB 标题（会进条目别名）
+        if option.kind == .smart, let t = manualTarget, let tmdbId = t.tmdbId, let kind = t.kind, let title = t.title {
             payload.autoRoute = true
-            payload.mediaKind = identity.kind
+            payload.mediaKind = kind
             payload.tmdbId = tmdbId
-            payload.title = identity.title
-            payload.year = identity.year
+            payload.title = title
+            payload.year = t.year
             payload.subtitle = request.subtitle
         }
         if option.kind == .dir { payload.savePath = option.savePath }
         if let pickedDownloaderId { payload.downloaderId = pickedDownloaderId }
+        send(payload)
+    }
+
+    private func send(_ payload: API.DownloadSubmitPayload) {
         Task {
             do {
                 let result = try await api.dlSubmit(body: payload)

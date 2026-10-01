@@ -223,7 +223,8 @@ def test_every_unlisted_write_is_rejected_in_demo_mode(client: TestClient, monke
     from tests.api.test_auth import fill_path_params
 
     admin_cookie, _ = _provision(client)
-    openapi = client.get("/api/v1/openapi.json").json()
+    # 生产环境刻意关闭 HTTP 接口清单；守护测试直接枚举应用，仍覆盖全部业务路由。
+    openapi = client.app.openapi()
     _enable_demo(monkeypatch)
     _use(client, admin_cookie)
 
@@ -249,7 +250,7 @@ def test_every_unlisted_write_is_rejected_in_demo_mode(client: TestClient, monke
 
 def test_demo_tables_reference_real_operations(client: TestClient) -> None:
     """白名单 / 黑名单里的 operation_id 都必须真实存在：接口改名后这里提醒同步。"""
-    openapi = client.get("/api/v1/openapi.json").json()
+    openapi = client.app.openapi()
     operations = {
         op["operationId"] for methods in openapi["paths"].values() for op in methods.values()
     }
@@ -257,6 +258,45 @@ def test_demo_tables_reference_real_operations(client: TestClient) -> None:
     missing_reads = set(demo_service.BLOCKED_READ_OPERATIONS) - operations
     assert not missing_writes, f"演示站写白名单里有不存在的接口：{sorted(missing_writes)}"
     assert not missing_reads, f"演示站读黑名单里有不存在的接口：{sorted(missing_reads)}"
+
+
+@pytest.mark.parametrize("account", [_ADMIN, _MEMBER])
+def test_demo_allows_reel_browsing_and_events(client: TestClient, monkeypatch, account) -> None:
+    """主干新增刷片：公开账号仍能浏览、上报曝光；媒体管理写操作继续默认拒绝。"""
+    _provision(client)
+    _enable_demo(monkeypatch)
+    _login(client, account)
+    assert client.get("/api/v1/reels").status_code == 200
+    assert client.get("/api/v1/reels/facets").status_code == 200
+    resp = client.post(
+        "/api/v1/reels/events", json={"events": [{"reel_id": "demo-reel", "kind": "impression"}]}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["accepted"] == 1
+
+
+def test_demo_accepts_qoe_reports_but_blocks_diagnostic_reads(
+    client: TestClient, monkeypatch
+) -> None:
+    """新播放记录允许收尾上报，但不能经编号明细或小样本统计看到其他访客的日志与文字。"""
+    _provision(client)
+    _enable_demo(monkeypatch)
+    resp = client.post(
+        "/api/v1/playback/metrics",
+        json={
+            "attempt_id": "demo-qoe",
+            "tier": 0,
+            "engine": "native",
+            "client": "web",
+            "outcome": "failed",
+            "log_tail": "访客的诊断日志",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    _assert_demo_denied(client.get("/api/v1/playback/attempts/demo-qoe"))
+    _assert_demo_denied(client.get("/api/v1/playback/stats/qoe"))
+    # 活动页现用的不含日志的档位汇总仍可读。
+    assert client.get("/api/v1/playback/stats").status_code == 200
 
 
 # ---------------------------------------------------------------------------

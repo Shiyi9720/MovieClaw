@@ -31,16 +31,26 @@ struct PlayerScreen: View {
         .onAppear {
             guard controller == nil else { return }
             // 同一次播放的视图被系统重建（旋转等）：接回原控制器，不重开会话
-            if let existing = router.activePlayback, existing.request.id == request.id {
+            if let existing = router.activePlayback, existing.request.id == request.id, existing.viewAttached {
                 controller = existing
                 #if DEBUG
                 FileHandle.standardError.write(Data("[PlayerDiag] 播放器视图重建，复用原控制器\n".utf8))
                 #endif
                 return
             }
-            let created = PlaybackController(request: request, api: api, requestedAt: router.playRequestedAt)
+            // 点播放时路由已提前建好控制器、发出起播请求（见 `Router.startPlaybackEarly`）：接过来，下面的 start() 不再重复
+            let created: PlaybackController
+            if let early = router.activePlayback, early.request.id == request.id {
+                created = early
+            } else {
+                created = PlaybackController(request: request, api: api, requestedAt: router.playRequestedAt)
+                router.activePlayback = created
+            }
+            created.viewAttached = true
+            created.noteViewAppeared()
             controller = created
-            router.activePlayback = created
+            // 片段模式就是刷片的「全屏观看」：只有横屏这一种样子
+            if request.clip != nil { PlayerOrientation.request(landscape: true) }
             #if DEBUG
             // 开发期：-mcPlayerDiagnostics YES 起播即打开诊断面板（截图核对用）
             if UserDefaults.standard.bool(forKey: "mcPlayerDiagnostics") { created.diagnosticsOpen = true }
@@ -105,6 +115,7 @@ struct PlayerScreen: View {
             #endif
             created.start()
             UIApplication.shared.isIdleTimerDisabled = true
+            created.startupDiag("播放器视图出现处理完")
             #if DEBUG
             // 真机排查用：-mcAutoHoldSpeed <秒> 起播后到点自动长按 2 倍速 15 秒（验证倍速时的掉帧判定）
             let autoHold = UserDefaults.standard.double(forKey: "mcAutoHoldSpeed")
@@ -170,8 +181,18 @@ struct PlayerScreen: View {
                         let relative = spec.hasPrefix("+") || spec.hasPrefix("-")
                         let targetMs = relative ? created.positionMs + Int(value * 1000) : Int(value * 1000)
                         Self.autoTestLog("跳转 → \(targetMs / 1000) 秒")
-                        created.seek(toFileMs: targetMs)
+                        created.seek(toFileMs: targetMs, source: .auto)
                     }
+                }
+            }
+            // -mcAutoCloseAfter <秒>：到点像用户点返回一样退出播放器，播放记录照常收尾上报（docs/design/playback-qoe.md）。
+            // 实验脚本随后再结束 App：直接杀掉 App 会留下「正在播放」标记，下次启动被补报成异常退出
+            let autoClose = UserDefaults.standard.double(forKey: "mcAutoCloseAfter")
+            if autoClose > 0 {
+                Task {
+                    try? await Task.sleep(for: .seconds(autoClose))
+                    Self.autoTestLog("自动退出播放器")
+                    exit()
                 }
             }
             // 真机排查用：-mcAutoLandscape <秒> 起播后自动切横屏；
@@ -206,6 +227,10 @@ struct PlayerScreen: View {
 
     /// 真正离开播放器：关会话、恢复亮度与常亮、解除方向锁
     private func finish() {
+        // 收尾会走两次（退出时一次、视图消失时再一次）：只在第一次记，免得刷片页取走后又被写回一条过期的
+        if let controller, !controller.isClosed, controller.clip != nil, let fileId = controller.request.fileId {
+            router.clipReturn = ClipReturn(fileId: fileId, positionMs: controller.positionMs)
+        }
         controller?.close()
         if router.activePlayback === controller { router.activePlayback = nil }
         UIApplication.shared.isIdleTimerDisabled = false
@@ -252,9 +277,15 @@ private struct PlayerContent: View {
     @State private var lockHint = false
     @State private var lockHintTask: Task<Void, Never>?
     @State private var adjust: AdjustState?
+    /// 亮度/音量胶囊的收起计时：松手或按侧键后 0.9 秒收起，期间再有动作就重新计时
+    @State private var adjustHideTask: Task<Void, Never>?
+    /// 手指正在竖滑：这期间的系统音量变化是自己拨出来的，不当成侧键
+    @State private var adjustingByGesture = false
     @State private var volumeUnsupported = false
     @State private var scrubMs: Int?
     @State private var scrubBase = 0
+    /// 片段模式正在退出全屏：等转回竖屏再关（见 `exitClip`）
+    @State private var exitingClip = false
     @State private var scrubbingByGesture = false
     @State private var lastTapChromeState = true
     @State private var trickplay = TrickplayImages()
@@ -355,11 +386,22 @@ private struct PlayerContent: View {
                     // 条目信息都拿不到（无权访问、已删除）：同 Web player-page 整页换成原因 +「返回」
                     PlayerInfoErrorView(message: infoError, exit: exit)
                 }
-                SystemVolumeHost().frame(width: 1, height: 1).allowsHitTesting(false)
+                // 放到屏幕左上角：ZStack 默认居中，不指定的话它正好压在画面正中
+                SystemVolumeHost().frame(width: 1, height: 1)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
             }
             .animation(.easeInOut(duration: 0.25), value: chromeVisible)
             .animation(.easeInOut(duration: 0.2), value: controller.notice)
             .animation(.easeInOut(duration: 0.25), value: controller.qualityOffer)
+            // 片段模式退出全屏：转回竖屏了再关（见 exitClip）
+            .onChange(of: landscape) { _, now in
+                if !now { finishExitClip() }
+            }
+        }
+        .onReceive(SystemVolume.shared.changes) { volume in
+            showVolumeFromKeys(Double(volume))
         }
         .task(id: autoHideKey) {
             // 控制条 4 秒无操作自动隐藏；必须常显的情况（暂停、菜单、拖动、等用户拍板）直接钉住（同 Web chromeMustStayVisible）
@@ -424,10 +466,11 @@ private struct PlayerContent: View {
 
     /// 控制条必须常显（对应 Web `lib/player/chrome.ts` chromeMustStayVisible）：
     /// 暂停时用户在找播放键；菜单是从控制条里长出来的；按着进度条就是在用它；报错/同意弹窗在等用户拍板。
-    /// 这些情况下既不自动收起，轻点画面也收不起来。起播/缓冲转圈时的「暂停」是程序性的，不算
+    /// 这些情况下既不自动收起，轻点画面也收不起来。起播/缓冲转圈时的「暂停」是程序性的，不算。
+    /// 「按着进度条」只算拖底栏进度条；在画面上横滑定位不算（见 `handleScrub`）
     private var chromeMustStayVisible: Bool {
         let userPaused = controller.paused && !controller.phase.isBusy && controller.session != nil
-        return userPaused || menu != .none || scrubMs != nil || isModal
+        return userPaused || menu != .none || (scrubMs != nil && !scrubbingByGesture) || isModal
     }
 
     /// 暂停遮罩只跟「用户意图」走：缓冲饥饿、换流时的程序性暂停不压暗
@@ -486,19 +529,51 @@ private struct PlayerContent: View {
                 }
                 Spacer(minLength: 0)
                 // 高度 ≤480 的横屏（手机横放）不显示片名大字，免得压住中央三键（同 Web）
-                if showPaused, menu == .none, !(landscape && height <= 480) {
+                if showPaused, !clipEnded, menu == .none, !(landscape && height <= 480) {
                     PausedOverlay(title: controller.title, episodeLabel: controller.episodeLabel(controller.currentEpisode))
                         .padding(.horizontal, PlayerLayout.edge)
                         .padding(.bottom, PlayerLayout.gap)
+                }
+                if clipEnded {
+                    HStack {
+                        Spacer()
+                        PlayerClipEndCard(replay: controller.togglePlay, watchFull: controller.leaveClip)
+                    }
+                    .padding(.horizontal, PlayerLayout.edge)
+                    .padding(.bottom, PlayerLayout.gap)
+                }
+                if let segment = controller.skipSegment {
+                    HStack {
+                        Spacer()
+                        PlayerSkipButton(segment: segment, action: controller.skipCurrentSegment)
+                    }
+                    .padding(.horizontal, PlayerLayout.edge)
+                    .padding(.bottom, PlayerLayout.gap)
                 }
                 if controller.showsUpNext, let next = controller.nextEpisode {
                     HStack {
                         Spacer()
                         PlayerUpNextCard(
-                            label: controller.episodeLabel(next) ?? "",
-                            dismiss: { controller.nextDismissed = true },
-                            play: controller.playNext
+                            code: "第 \(next.episodeNumber) 集",
+                            name: next.name.flatMap { $0.isEmpty ? nil : $0 },
+                            still: controller.scope.api.image(next.stillUrl, .landscapeCard),
+                            countdown: controller.autoNextArmed ? controller.autoNextProgress : nil,
+                            dismiss: {
+                                controller.noteUserActivity()
+                                controller.nextDismissed = true
+                            },
+                            play: {
+                                controller.noteUserActivity()
+                                controller.playNext()
+                            }
                         )
+                        // 倒计时的钟：卡片在才走，卡片收起循环随之取消
+                        .task {
+                            while !Task.isCancelled {
+                                try? await Task.sleep(for: .milliseconds(100))
+                                controller.advanceAutoNext(by: 0.1)
+                            }
+                        }
                     }
                     .padding(.horizontal, PlayerLayout.edge)
                     .padding(.bottom, PlayerLayout.gap)
@@ -506,7 +581,14 @@ private struct PlayerContent: View {
                 if chromeVisible {
                     PlayerBottomBar(
                         controller: controller, trickplay: trickplay, menu: $menu, scrubMs: $scrubMs,
-                        landscape: landscape, onToggleLandscape: { PlayerOrientation.request(landscape: !landscape) }
+                        landscape: landscape,
+                        onToggleLandscape: {
+                            if controller.clip != nil {
+                                exitClip(landscape: landscape)
+                            } else {
+                                PlayerOrientation.request(landscape: !landscape)
+                            }
+                        }
                     )
                     .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { bottomBarFrame = $0 }
                     // 菜单用 overlay 挂在底栏上：不参与布局（否则高菜单会把底栏挤扁），
@@ -602,9 +684,36 @@ private struct PlayerContent: View {
         }
     }
 
-    /// 横屏时左上角是「退出横屏」，竖屏时才是「退出播放」（同 Web 的后退语义）
+    /// 片段放完了（片段模式停在终点）
+    private var clipEnded: Bool { controller.clip != nil && controller.phase == .ended }
+
+    /// 片段模式的「退出全屏」：先转回竖屏、转好了再关播放器回到刷片（刷片页从这里接着放这一段）。
+    /// 直接关的话，转屏与收起两段动画叠在一起，中间会露出横着排的信息流
+    private func exitClip(landscape: Bool) {
+        guard landscape else {
+            exit()
+            return
+        }
+        exitingClip = true
+        PlayerOrientation.request(landscape: false)
+        // 兜底：系统没转过来也别卡在这里
+        Task {
+            try? await Task.sleep(for: .seconds(1))
+            finishExitClip()
+        }
+    }
+
+    private func finishExitClip() {
+        guard exitingClip else { return }
+        exitingClip = false
+        exit()
+    }
+
+    /// 横屏时左上角是「退出横屏」，竖屏时才是「退出播放」（同 Web 的后退语义）；片段模式是「退出全屏」
     private func back(landscape: Bool) {
-        if landscape {
+        if controller.clip != nil {
+            exitClip(landscape: landscape)
+        } else if landscape {
             PlayerOrientation.request(landscape: false)
         } else {
             exit()
@@ -641,7 +750,8 @@ private struct PlayerContent: View {
             // 与中央三键同一个中心（整屏正中），拖动时三键让位，读数正好接在播放键的位置
             PlayerHUD {
                 VStack(spacing: 4) {
-                    Text(Formatters.clock(Double(scrubMs) / 1000)).font(.title2.monospacedDigit().weight(.semibold))
+                    Text(Formatters.clock(Double(controller.timelineMs(fromFileMs: scrubMs)) / 1000))
+                        .font(.title2.monospacedDigit().weight(.semibold))
                     let delta = (scrubMs - scrubBase) / 1000
                     Text("\(delta >= 0 ? "+" : "-")\(Formatters.clock(Double(abs(delta))))")
                         .font(.caption.monospacedDigit())
@@ -656,6 +766,7 @@ private struct PlayerContent: View {
     // MARK: 手势
 
     private func handleTap(_ xRatio: CGFloat, _ isDouble: Bool) {
+        controller.noteUserActivity()
         if menu != .none {
             menu = .none
             return
@@ -674,10 +785,10 @@ private struct PlayerContent: View {
         // 双击左右三分之一 = ∓10 秒；第一下切换过的控制层恢复原状，净效果只剩跳转
         if xRatio < 1 / 3 {
             chromeVisible = lastTapChromeState
-            controller.seek(by: -10)
+            controller.seek(by: -10, source: .gesture)
         } else if xRatio > 2 / 3 {
             chromeVisible = lastTapChromeState
-            controller.seek(by: 10)
+            controller.seek(by: 10, source: .gesture)
         } else if !chromeMustStayVisible {
             chromeVisible.toggle()
         }
@@ -685,18 +796,23 @@ private struct PlayerContent: View {
 
     /// 横滑定位：满屏一划 = 90 秒（同 Web FULL_SWEEP_SEEK_S），松手才跳
     private func handleScrub(_ phase: PlayerGestureLayer.GesturePhase, _ delta: CGFloat) {
-        guard let duration = controller.durationMs else { return }
+        guard let duration = controller.timelineDurationMs else { return }
+        // 落点夹在时间轴内（片段模式就是这一段），scrubMs 仍是文件时间
+        let start = controller.timelineStartMs
         switch phase {
         case .began:
             scrubBase = controller.positionMs
             scrubMs = scrubBase
             scrubbingByGesture = true
+            // 横滑定位不唤出控制层、已开着的也收起（2026-09-30 用户要求：拖的时候只看画面、落点读数与加载转圈，
+            // 中央三键、顶栏底栏都不该冒出来，松手后也不出现）
+            chromeVisible = false
         case .changed:
-            let target = min(max(0, scrubBase + Int(delta * 90_000)), duration)
+            let target = min(max(start, scrubBase + Int(delta * 90_000)), start + duration)
             scrubMs = target
             controller.scrubFollow(toFileMs: target)
         case .ended:
-            if let scrubMs { controller.seek(toFileMs: scrubMs) }
+            if let scrubMs { controller.seek(toFileMs: scrubMs, source: .scrub) }
             scrubMs = nil
             scrubbingByGesture = false
         case .cancelled:
@@ -709,6 +825,9 @@ private struct PlayerContent: View {
     private func handleAdjust(_ phase: PlayerGestureLayer.GesturePhase, _ side: PlayerGestureLayer.AdjustSide, _ delta: CGFloat) {
         switch phase {
         case .began:
+            // 上一次的收起计时还没到点就开始新一滑：先掐掉，否则它会在滑动途中把胶囊和状态清掉
+            adjustHideTask?.cancel()
+            adjustingByGesture = true
             let base = side == .brightness ? ScreenBrightness.current : Double(SystemVolume.shared.value)
             volumeUnsupported = side == .volume && !SystemVolume.shared.isAdjustable
             adjust = AdjustState(side: side, value: base, base: base)
@@ -723,10 +842,25 @@ private struct PlayerContent: View {
             current.value = value
             adjust = current
         case .ended, .cancelled:
-            Task {
-                try? await Task.sleep(for: .milliseconds(900))
-                adjust = nil
-            }
+            adjustingByGesture = false
+            scheduleAdjustHide()
+        }
+    }
+
+    /// 侧键（或控制中心）改了音量：弹出与竖滑同一个音量胶囊。
+    /// 竖滑途中的变化是自己拨滑杆拨出来的，胶囊已经在跟手显示，这里不管
+    private func showVolumeFromKeys(_ value: Double) {
+        guard !adjustingByGesture else { return }
+        volumeUnsupported = false
+        adjust = AdjustState(side: .volume, value: value, base: value)
+        scheduleAdjustHide()
+    }
+
+    private func scheduleAdjustHide() {
+        adjustHideTask?.cancel()
+        adjustHideTask = Task {
+            try? await Task.sleep(for: .milliseconds(900))
+            if !Task.isCancelled { adjust = nil }
         }
     }
 

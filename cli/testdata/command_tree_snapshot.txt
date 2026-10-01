@@ -8,6 +8,8 @@ app tasks list
 app tasks update
 app update apply
 app update check
+app update github-token-get
+app update github-token-put
 app update last-exit-dismiss
 app update model-apply
 app update model-check
@@ -197,8 +199,10 @@ notices list
 people show
 playback activity
 playback activity end
+playback attempt get
 playback device revoke
 playback history
+playback stats qoe
 playback stats watch
 rules create
 rules default

@@ -1,10 +1,11 @@
 import SwiftUI
 
-/// 底部标签页。前四个与 Web 银玻璃主题手机底栏同序；最右是当前用户的头像（「我的」页，
-/// Instagram 式的个人页签）。搜索不占标签，在各标签根页右上角（见 MainTabView 的 AppTopBar）。
+/// 底部标签页，从左到右：媒体库（首页）、订阅、发现、活动，最右是当前用户的头像（「我的」页，
+/// Instagram 式的个人页签）。2026-09-30 用户调整：自己的片库是 App 的首页，排最左、冷启动落在这里；
+/// 发现（找新片）退到第三。搜索不占标签，在各标签根页右上角（见 MainTabView 的 AppTopBar）。
 /// 标签栏只显示图标，`title` 给读屏与 UI 测试用。
 enum MainTab: String, Hashable, CaseIterable {
-    case discover, library, subscriptions, activity, more
+    case library, subscriptions, discover, activity, more
 
     var title: String {
         switch self {
@@ -19,7 +20,9 @@ enum MainTab: String, Hashable, CaseIterable {
     /// 页签图标；「我的」平时显示头像，这个图标只在头像位图还没画好时顶一下
     var systemImage: String {
         switch self {
-        case .discover: "house"
+        // 闪光：推荐、新鲜内容（2026-09-30 用户定：指南针像 Safari，爆米花真机上看不清；原来的小房子读成「首页」，
+        // 首页现在是媒体库）
+        case .discover: "sparkles"
         case .library: "play.square.stack"
         case .subscriptions: "bookmark"
         case .activity: "waveform.path.ecg"
@@ -39,8 +42,31 @@ struct PlayRequest: Identifiable, Hashable {
     var shareSlug: String?
     /// 播放器内切换文件版本时指定
     var fileId: Int?
+    /// 片段模式（刷片的「全屏观看」）：只放这一段，见 `PlaybackClip`
+    var clip: PlaybackClip?
 
-    var id: String { "\(shareSlug ?? "")-\(mediaItemId)-\(season ?? -1)-\(episode ?? -1)" }
+    var id: String {
+        "\(shareSlug ?? "")-\(mediaItemId)-\(season ?? -1)-\(episode ?? -1)" + (clip.map { "-clip\($0.startMs)" } ?? "")
+    }
+}
+
+/// 播放器的片段模式（docs/design/reels.md §6）：刷片页点「全屏观看」时，这一段交给正片播放器放。
+/// 手势、控制条、换音轨字幕、画质、倍速与正片完全一样，区别只在时间轴：
+/// - 进度条、时间、锁屏进度都按片段算，**总时长是这一段的长度**，不是整部片的，免得以为在看整部；
+/// - 跳转夹在片段之内，放到终点停下（可重播，或点「看全片」原地转成正常播放）；
+/// - 不写观看记录：不报进度（不写续播点、不进「继续观看」、不上活动页），也不留播放质量记录。
+/// 起止都是文件时间（毫秒），与服务端刷片接口的 `segment` 同一口径
+struct PlaybackClip: Hashable {
+    var startMs: Int
+    var endMs: Int
+    /// 片段的画质（`ReelsQuality`，竖屏与全屏共用一份）：片段模式按它开、改了也记回它，不动正片的按片画质记忆
+    var maxHeight: Int?
+}
+
+/// 片段播放器关掉时的位置：哪个文件、停在文件的第几毫秒
+struct ClipReturn {
+    let fileId: Int
+    let positionMs: Int
 }
 
 extension PlayRequest {
@@ -113,7 +139,7 @@ struct SubscribeRequest: Hashable {
 /// `push` 压到当前标签，`open(_:)` 按路由归属切到对应标签再压栈。
 @Observable
 final class Router {
-    var selectedTab: MainTab = .discover {
+    var selectedTab: MainTab = .library {
         // 打点：切页签的那一刻是页面打开的起点（见 PerfTrace）
         didSet { if selectedTab != oldValue { PerfTrace.pageBegan(selectedTab.rawValue, trigger: "tab") } }
     }
@@ -124,6 +150,8 @@ final class Router {
     /// 连带全屏呈现的播放器视图被销毁重建；控制器挂在视图上会跟着重开会话、重载引擎，
     /// 横屏后画面错位、又被旧视图的收尾转回竖屏（真机《抓特务》实测）。
     var activePlayback: PlaybackController?
+    /// 片段模式的播放器关掉时停在哪：刷片页回来后从这里接着放这一段（见 `ReelsStore.resume`）
+    @ObservationIgnored var clipReturn: ClipReturn?
     /// 全局弹层
     var sheet: AppSheet?
     /// 结果页点顶部搜索词胶囊回到搜索首页时要回填的内容；搜索首页出现时取走（见 `SearchHomeView`）
@@ -143,7 +171,7 @@ final class Router {
 
     /// 路由守卫（同 Web `accessiblePathFor` 与设置页的越权回退）：
     /// - 成员打开仅管理员可见的设置分区 → 改去「个人信息」（Web settings-view 的 replace 到 /settings/profile）；
-    /// - 其余越权页面（AI 会话、无能力的订阅/搜索、活动、媒体库管理）→ 落到媒体库首页。
+    /// - 其余越权页面（AI 会话、无能力的订阅、活动、媒体库管理）→ 落到媒体库首页。
     /// 界面上本就不给这些入口，守卫兜的是通知、AI 卡片、深链等「从别处跳过来」的情况。
     func guarded(_ route: AppRoute) -> AppRoute {
         guard let permissions, !permissions.allows(route) else { return route }
@@ -232,10 +260,17 @@ final class Router {
     func play(_ request: PlayRequest) {
         playRequestedAt = .now
         player = request
+        startPlaybackEarly?(request)
     }
 
     /// 最近一次点播放的时刻：起播分段计时从这里算起（含播放器弹出与视图搭建，见 `StartupTrace`）
     @ObservationIgnored private(set) var playRequestedAt: ContinuousClock.Instant?
+
+    /// 点下播放就建好控制器、发出起播请求，不等全屏播放器弹出：冷启动后第一次弹出到视图出现约 100 毫秒（真机），
+    /// 起播协商用不着视图。会话回来时主线程常常还在搭播放器界面（第一次约 140 毫秒），所以省下多少取决于界面多重：
+    /// 界面热了（同一进程再次打开）请求一回来就能装载引擎。由持有 API 客户端的根视图设置；
+    /// 控制器登记在 `activePlayback`，播放器视图出现时接过去（见 `PlayerScreen`）
+    @ObservationIgnored var startPlaybackEarly: ((PlayRequest) -> Void)?
 
     /// 待起播的访客播放链接（`/s/{slug}/play/...`）：分享页读到影片（必要时先过密码）后取走并起播
     var pendingSharePlay: PlayRequest?

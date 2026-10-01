@@ -10,30 +10,39 @@ import { useSession } from "@/lib/session";
 export interface AppPermissions {
   isAdmin: boolean;
   canSubscribe: boolean;
-  /** 能用全局搜索框（影视 / 媒体库 / 站点资源三个垂直的总入口） */
+  /** PT 搜索能力快照；实际资源入口用 canSearchTorrents，全局入口用 useSearchAccess */
   canSearch: boolean;
   /** 能用站点资源（PT 种子）搜索：搜索页的资源垂直、详情页「搜索资源」、手动选种 */
   canSearchTorrents: boolean;
   canDirectDownload: boolean;
   canManageLibraries: boolean;
   canManageSubscriptions: boolean;
+  /**
+   * 订阅详情「手动选种」：先搜资源、再把选中的种子投给下载器，所以要同时具备
+   * 订阅、资源搜索与一键下载三项能力；后端投递接口另校验订阅归属（仅发起人）。
+   */
+  canGrabForSubscription: boolean;
 }
 
 export function permissionsFor(session: SessionView): AppPermissions {
   const isAdmin = session.role === "admin";
   // 公开演示站（docs/design/demo-site.md）不接 PT 站点：资源站搜索与一键下载对谁都
-  // 不开放，超管也一样；搜索框本身照常显示（影视与媒体库搜索后端是放行的）。
+  // 不开放，超管也一样；影视与媒体库搜索继续按 useSearchAccess 的分区授权显示。
   // 订阅入口照常显示，确认订阅时由后端说明演示站不会真的下载
   const demo = session.demo === true;
+  const canSubscribe = isAdmin || session.capabilities.allow_subscribe;
   const canSearch = isAdmin || session.capabilities.allow_search;
+  const canSearchTorrents = !demo && canSearch;
+  const canDirectDownload = !demo && (isAdmin || session.capabilities.allow_direct_download);
   return {
     isAdmin,
-    canSubscribe: isAdmin || session.capabilities.allow_subscribe,
+    canSubscribe,
     canSearch,
-    canSearchTorrents: !demo && canSearch,
-    canDirectDownload: !demo && (isAdmin || session.capabilities.allow_direct_download),
+    canSearchTorrents,
+    canDirectDownload,
     canManageLibraries: isAdmin,
     canManageSubscriptions: isAdmin,
+    canGrabForSubscription: canSubscribe && canSearchTorrents && canDirectDownload,
   };
 }
 
@@ -61,12 +70,16 @@ export function accessiblePathFor(session: SessionView, requestedPath: string): 
     ) {
       return "/library";
     }
+    // 观看活动与媒体库管理是超管页面，成员界面上没有入口，手输 URL 同样改道
+    if (requestedPath.startsWith("/activity") || requestedPath.startsWith("/library/manage")) {
+      return "/library";
+    }
     if (!session.capabilities.allow_subscribe && requestedPath.startsWith("/subscriptions")) {
       return "/library";
     }
-    if (!session.capabilities.allow_search && requestedPath.startsWith("/search")) {
-      return "/library";
-    }
+    // /search 不在这里拦：搜索按分区授权（影视 / 资源 / 媒体库，见 useSearchAccess），
+    // 「有没有可用分区」要查可见库才知道，这个同步守卫给不出结论；搜索页自己在
+    // 没有可用分区时渲染空状态，入口也已按同一口径隐藏
   }
   return requestedPath;
 }

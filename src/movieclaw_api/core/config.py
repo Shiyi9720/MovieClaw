@@ -36,7 +36,12 @@ def normalize_tmdb_base_url(value: str, suffix: str) -> str:
 
 class Settings(BaseSettings):
     app_name: str = Field(default="movieclaw", alias="APP_NAME")
-    app_env: str = Field(default="local", alias="APP_ENV")
+    # 默认值必须是 production：它决定 /docs、/redoc 与 openapi.json 是否对外
+    # 开放（app.py::create_app）。Docker 镜像与 entrypoint 都不设 APP_ENV，
+    # 之前默认 local 等于「所有容器部署都在开发模式下跑」，把完整接口面白送给
+    # 匿名访问者。安全开关的默认值应当是「忘了配也不会敞开」。
+    # 本地开发在 .env 里显式写 APP_ENV=local 打开文档（见 .env.example）。
+    app_env: str = Field(default="production", alias="APP_ENV")
     host: str = Field(default="0.0.0.0", alias="APP_HOST")
     port: int = Field(default=8000, alias="APP_PORT")
     reload: bool = Field(default=True, alias="APP_RELOAD")
@@ -59,6 +64,11 @@ class Settings(BaseSettings):
     # 容器重启 / 升级镜像日志不丢。超过保留天数的旧日志自动删除。
     log_dir: str = Field(default="./data/logs", alias="LOG_DIR")
     log_retention_days: int = Field(default=30, alias="LOG_RETENTION_DAYS")
+    # 播放体验记录（playback_metric）按时间保留：统计看的是近期体验，更早的记录只会拖慢
+    # data 卷上的 SQLite（docs/design/playback-qoe.md §5.1）
+    playback_metric_retention_days: int = Field(
+        default=90, alias="PLAYBACK_METRIC_RETENTION_DAYS"
+    )
     api_v1_prefix: str = "/api/v1"
 
     # ------------------------------------------------------------------
@@ -147,6 +157,19 @@ class Settings(BaseSettings):
     # 播放器内封字幕/字体的抽取产物（重建只需一次 ffmpeg 抽轨）。
     playback_subs_cache_dir: str = Field(
         default="./data/cache/playback-subs", alias="MOVIECLAW_PLAYBACK_SUBS_CACHE_DIR"
+    )
+    # 刷片挑点结果：每个文件一份 JSON（片段起止、预取范围），按 file_id 命名
+    # （重建只需再读一遍容器索引，一部片零点几秒）。
+    reels_cache_dir: str = Field(default="./data/cache/reels", alias="MOVIECLAW_REELS_CACHE_DIR")
+    # MKV 精简索引：只含视频轨索引点的 Cues，随播放会话下发，App 起播时不必再下原索引
+    # （docs/design/playback-qoe.md §9.12）。每个文件一份几 KB～几十 KB 的记录，按 file_id 命名。
+    playback_cues_cache_dir: str = Field(
+        default="./data/cache/playback_cues", alias="MOVIECLAW_PLAYBACK_CUES_CACHE_DIR"
+    )
+    # 片头片尾识别的音频指纹：每个剧集文件一份（片头窗 + 片尾窗，约 33 KB），按 file_id
+    # 命名（docs/design/skip-intro.md）。删了识别结果不丢，只是之后新集入库时要回头重读旧集。
+    audio_fingerprint_dir: str = Field(
+        default="./data/cache/audio-fingerprints", alias="MOVIECLAW_AUDIO_FINGERPRINT_DIR"
     )
     # AI 字幕生成的中间品：内封轨抽取、PGS 图片与翻译断点（断点删了任务从头翻）。
     subtitle_gen_cache_dir: str = Field(

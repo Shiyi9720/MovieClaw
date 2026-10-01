@@ -85,6 +85,53 @@ public final class AetherPlayback {
     /// 第一帧可以上屏
     public var onFirstFrame: (() -> Void)?
 
+    // MARK: 播放体验打点用的信号（docs/design/playback-qoe.md §3）
+
+    /// 起播检查点（引擎的 `startupProgress`，依次是 sourceOpened / containerOpened / streamsProbed /
+    /// displayPrepared / routed / sessionConstructed / ready / presenting）：宿主据此把「引擎里」
+    /// 那一段起播耗时拆开
+    public var onStartupStage: ((String) -> Void)?
+    /// 一次跳转的终局（引擎的 `seekEvents`）
+    public var onSeekOutcome: ((SeekOutcome) -> Void)?
+    public enum SeekOutcome: Sendable, Equatable {
+        /// 引擎这边落地了（主力通路：AVPlayer 的跳转完成；软件通路：解复用已重新定位，画面还在路上）
+        case landed
+        /// 超时没落地
+        case stalled
+        /// 被更新的跳转取代
+        case superseded
+        case rejected
+    }
+    /// 软件通路：新一代（每次跳转都会清空显示队列、开启新一代）的第一帧交到了显示层——跳转后「画面到了」
+    /// 的时刻。装载后的第一帧也会触发一次。主线程回调
+    public var onSoftwareFrameGeneration: (() -> Void)?
+
+    /// 规格事实：源是什么、实际送出的是什么（「对」的判定材料，服务端按规则表判损失）
+    public struct DeliveryFacts: Sendable, Equatable {
+        /// loopback / software / remoteBypass / audio / none
+        public let route: String
+        public let container: String?
+        public let videoCodec: String?
+        /// 源的画面格式与实际送出的画面格式：sdr / hdr10 / hdr10plus / dolbyvision / hlg
+        public let sourceFormat: String
+        public let outputFormat: String
+        public let dolbyVisionProfile: Int?
+        /// 杜比视界转换（profile7to81 = P7 转 P8.1，完整增强层会被丢掉）
+        public let dolbyVisionConversion: String?
+        /// 音频交付：streamCopy / bridged / decoded / playerManaged / noAudioInSource / droppedNoPipeline / none
+        public let audioDelivery: String
+        /// 音频解码 / 桥接的说明（如「truehd → EAC3 bridge」「Stream-copy (EAC3+JOC Atmos)」）
+        public let audioDecoder: String?
+        /// 正在放的音轨：编码、声道、名称（名称里常写着 Atmos / DTS-HD MA）
+        public let audioCodec: String?
+        public let audioChannels: Int?
+        public let audioName: String?
+    }
+
+    /// 软件通路交到显示层的帧数（冻帧检测用：时钟在走、这个数不涨就是画面冻住）。其余通路恒为 0
+    public var presentedSoftwareFrames: Int { frameCounter.count }
+    private let frameCounter = SoftwareFrameCounter()
+
     private let engine: AetherEngine
     private let playerView = AetherPlayerView()
     private let subtitleView = SubtitleLayerView()
@@ -108,20 +155,140 @@ public final class AetherPlayback {
         engine.backgroundPlaybackEnabled = true
         container.onLayout = { [weak self] in self?.refreshSubtitles() }
         observe()
+        // 软件通路逐帧回调在解码线程上、不能阻塞：只计数，换代时切回主线程通知一次
+        let counter = frameCounter
+        let box = WeakPlayback(self)
+        engine.setSoftwareVideoFrameTimeObserver { frame in
+            guard counter.record(generation: frame.generation) else { return }
+            DispatchQueue.main.async { MainActor.assumeIsolated { box.value?.onSoftwareFrameGeneration?() } }
+        }
     }
 
     /// 开发期：字幕列表变化时把文字字幕连同 ASS 定位打到控制台（排查字幕摆放用）
     nonisolated(unsafe) public static var logsCues = false
 
-    /// 开发期把引擎日志同步打到控制台（`EngineLog` 默认只进系统日志，模拟器排查时看不到）。
-    /// 每行前面带开机以来的秒数（与 App 侧 `[NativeEngine]` 行同一时钟），拆起播各段耗时用。
-    /// 回调可能来自任意线程，只做线程安全的写入
-    public static func mirrorEngineLog(_ enabled: Bool) {
-        EngineLog.handler = enabled ? { line in
+    /// 接管引擎日志：一律进环形缓冲（Release 包也开，播放失败时随播放记录上报最近的若干行，
+    /// 见 docs/design/playback-qoe.md §3.5）；`mirror` 时同步打到控制台（开发期，`EngineLog` 默认只进系统日志，
+    /// 模拟器排查时看不到）。每行前面带开机以来的秒数（与 App 侧 `[NativeEngine]` 行同一时钟），拆起播各段耗时用。
+    /// 回调可能来自任意线程，只做线程安全的写入。引擎本来就会拼好这些行并脱敏，这里只是多存一份
+    public static func installLogHandler(mirror: Bool) {
+        let ring = logRing
+        EngineLog.handler = { line in
             let stamp = String(format: "%.3f", ProcessInfo.processInfo.systemUptime)
-            FileHandle.standardError.write(Data("[Aether \(stamp)] \(line)\n".utf8))
-        } : nil
+            ring.append("[\(stamp)] \(line)")
+            if mirror { FileHandle.standardError.write(Data("[Aether \(stamp)] \(line)\n".utf8)) }
+        }
     }
+
+    /// 点播换封装的分片目标时长（秒，引擎补丁 P33，默认 2）。宿主按它把窗口段数折回同样的缓冲时长
+    public static var segmentTargetSeconds: Double {
+        get { AetherEngine.vodSegmentTargetSeconds }
+        set { AetherEngine.vodSegmentTargetSeconds = newValue }
+    }
+
+    /// 主力通路跳转吸附关键帧的逐帧解码预算（秒，引擎补丁 P36，默认 0.2；≤ 0 关闭，真机新旧对照用）
+    public static var seekSnapDecodeBudgetSeconds: Double {
+        get { AetherEngine.seekSnapDecodeBudgetSeconds }
+        set { AetherEngine.seekSnapDecodeBudgetSeconds = newValue }
+    }
+
+    /// 起播 / 跳转后看缓冲过没过开播线的间隔（秒，引擎补丁 P28，默认 0.025；真机新旧对照用）
+    public static var vodStartWitnessIntervalSeconds: Double {
+        get { AetherEngine.vodStartWitnessIntervalSeconds }
+        set { AetherEngine.vodStartWitnessIntervalSeconds = max(0.01, newValue) }
+    }
+
+    /// 起播落点吸附关键帧的逐帧解码预算（秒，引擎补丁 P39，默认 0.05；≤ 0 关闭，真机新旧对照用）
+    public static var startSnapDecodeBudgetSeconds: Double {
+        get { AetherEngine.startSnapDecodeBudgetSeconds }
+        set { AetherEngine.startSnapDecodeBudgetSeconds = newValue }
+    }
+
+    /// 预先和源站建好取源连接（引擎补丁 P43）：点播放时调，起播协商回来前把 TCP / TLS 握手做掉。
+    /// url 是同一源站上任何一个便宜的地址（MovieClaw 用健康检查），headers 同装载时的
+    public nonisolated static func preconnect(url: URL, headers: [String: String] = [:]) {
+        AetherEngine.preconnect(url: url, httpHeaders: headers)
+    }
+
+    /// MKV 文件头一到就按 SeekHead 把索引（Cues）先取回来（引擎补丁 P49，默认开；真机新旧对照时关掉）
+    public static func setPrefetchesMatroskaCues(_ on: Bool) {
+        AetherEngine.prefetchesMatroskaCues = on
+    }
+
+    /// 读到在途的提前取（尾部预读 / MKV 索引）时，只要还在往回送就一直等（引擎补丁 P53，默认开；对照时关掉）
+    public static func setWaitsOnProgressingPrefetch(_ on: Bool) {
+        AetherEngine.waitsOnProgressingPrefetch = on
+    }
+
+    /// MP4 的 moov 在文件尾时，文件头一到就并行取回来（引擎补丁 P54，默认开；对照时关掉）
+    public static func setPrefetchesMP4TailMoov(_ on: Bool) {
+        AetherEngine.prefetchesMP4TailMoov = on
+    }
+
+    /// 实测线路慢到 4 MB 整块补取在限时内到不齐时，回跳直接重连流式读（引擎补丁 P55，默认开；对照时关掉）
+    public static func setSkipsDetourOnSlowLink(_ on: Bool) {
+        AetherEngine.skipsDetourOnSlowLink = on
+    }
+
+    /// 点播分片边产出边送、分片内每 0.5 秒一个片段（引擎补丁 P57，默认开；对照时关掉）
+    public static func setServesSegmentsProgressively(_ on: Bool) {
+        AetherEngine.servesSegmentsProgressively = on
+    }
+
+    /// 点播媒体播放列表也声明分片各自独立，跳转时 AVPlayer 直接要目标段（引擎补丁 P59，默认开；对照时关掉）
+    public static func setDeclaresIndependentMediaSegments(_ on: Bool) {
+        AetherEngine.declaresIndependentMediaSegments = on
+    }
+
+    /// 服务端给了 MKV 精简索引就用它顶替原索引（引擎补丁 P58，默认开；对照时关掉）
+    public static func setUsesHostMatroskaCues(_ on: Bool) {
+        AetherEngine.usesHostMatroskaCues = on
+    }
+
+    /// 冷打开时文件头先只要 512 KB，索引提前取在途时文件头不超前预读（引擎补丁 P56，默认开；对照时关掉）
+    public static func setPrioritizesIndexPrefetch(_ on: Bool) {
+        AetherEngine.prioritizesIndexPrefetch = on
+    }
+
+    /// MKV 索引预热是否跳到起播点（引擎补丁 P45，默认开；关掉即上游的跳到片中间，真机新旧对照用）
+    public static func setCuePrewarmTargetsStart(_ on: Bool) {
+        AetherEngine.cuePrewarmTargetsStart = on
+    }
+
+    /// 宿主自己管音频会话的类别、策略与多声道支持（引擎补丁 P47）：设为 true 后引擎建实例时不再重设类别
+    public static var hostManagesAudioSessionCategory: Bool {
+        get { AetherEngine.hostManagesAudioSessionCategory }
+        set { AetherEngine.hostManagesAudioSessionCategory = newValue }
+    }
+
+    /// 探测流时是否跳过第二条起的 TrueHD（引擎补丁 P34，默认开；真机新旧对照时关掉）
+    public static func setParkSecondaryTrueHD(_ on: Bool) {
+        AetherEngine.parkSecondaryTrueHDDuringProbe = on
+    }
+
+    /// 片源字节缓存写盘是否放后台队列（引擎补丁 P32，默认开；真机新旧对照时关掉）
+    public static func setByteCacheWritesInBackground(_ on: Bool) {
+        AetherEngine.sourceByteCacheWritesInBackground = on
+    }
+
+    /// 引擎日志最近的若干行（最多 `maxBytes` 字节，从新往旧截），播放失败时随记录上报
+    public static func recentEngineLog(maxBytes: Int = 32 * 1024) -> String { logRing.snapshot(maxBytes: maxBytes) }
+
+    /// 刷片预取（内置引擎补丁 P39）：把一个片源的若干字节范围（文件头 / 索引 / 起点后几秒，服务端算好给出）
+    /// 先写进片源字节缓存。之后用同一个 `cacheKey` 装载时，打开与跳到起点都直接读本机。
+    /// 返回这次从源站拉下来的字节数；取消任务即停止，已写进缓存的保留
+    public nonisolated static func prefetchSource(url: URL, cacheKey: String,
+                                                  ranges: [(offset: Int64, length: Int64)],
+                                                  headers: [String: String] = [:]) async -> Int64 {
+        let report = await AetherEngine.prefetchSourceRanges(
+            url: url, cacheKey: cacheKey,
+            ranges: ranges.map { SourceByteRange(offset: $0.offset, length: $0.length) },
+            httpHeaders: headers
+        )
+        return report.fetchedBytes
+    }
+
+    private static let logRing = EngineLogRing()
 
     /// 日志里要打码的秘密（取流令牌）
     public static func redact(_ secret: String) {
@@ -179,9 +346,12 @@ public final class AetherPlayback {
     /// 换音轨、回前台的整场重建与往回跳都从本机拿已下过的字节。取流地址每次带新令牌，所以要给稳定的键
     /// forwardSegments / backwardSegments：分片缓存的前后窗口（段数，nil = 引擎默认 10 / 20）。存储紧张时由宿主
     /// 按剩余空间收小，自研引擎照样能放（内置引擎补丁 P25）
+    /// matroskaCues：服务端给的 MKV 精简索引（原 Cues 在文件里的位置 + 只含视频轨索引点的整个 Cues 元素，内置引擎
+    /// 补丁 P58）。主播放的解复用器读索引时直接用它，原索引不用下载；数据不完整或位置对不上时引擎当没给
     public func load(source: Source, start: Double?, autoplay: Bool, headers: [String: String] = [:],
                      audioOrdinal: Int? = nil, externalSubtitles: [ExternalSubtitle] = [],
-                     sourceCacheKey: String? = nil, forwardSegments: Int? = nil, backwardSegments: Int? = nil) {
+                     sourceCacheKey: String? = nil, forwardSegments: Int? = nil, backwardSegments: Int? = nil,
+                     matroskaCues: (offset: Int64, data: Data)? = nil) {
         loadTask?.cancel()
         lastPhase = nil
         subtitleView.cues = []
@@ -190,6 +360,7 @@ public final class AetherPlayback {
         options.sourceCacheKey = sourceCacheKey
         options.forwardBufferSegments = forwardSegments
         options.backwardBufferSegments = backwardSegments
+        options.matroskaCues = matroskaCues.flatMap { MatroskaHostCues(offset: $0.offset, data: $0.data) }
         options.autoplay = autoplay
         options.httpHeaders = headers
         // 点播起播时缓冲已够 1.5 秒就不再等 AVPlayer 的码率估计，一次性提前开播（内置引擎补丁 P2）
@@ -226,6 +397,8 @@ public final class AetherPlayback {
         }
         loadTask = Task { [weak self] in
             do {
+                // 宿主起播：续播点要逐帧解太久时从前一个关键帧开播（内置引擎补丁 P39）。引擎自己的重建不经这里，原位接上
+                engine.snapsNextStartToKeyframe = true
                 try await engine.load(source: mediaSource, startPosition: start, options: options)
             } catch is CancellationError {
                 // 被新的装载 / 停止取代：不是播放失败
@@ -252,9 +425,12 @@ public final class AetherPlayback {
     /// 回前台时调。引擎在后台暂停超过宽限期（上游 #127，15 秒）会拆掉整条视频管线省电，上游约定由宿主在原位置
     /// 重建——不重建的话点播放只会一直转圈，要等 App 的看门狗判「连接断了」整场重连（15 秒以上）。
     /// 重建后保持暂停，画面停在原处；片源字节缓存（引擎补丁 P22）还在，重建不用重下
-    public func rebuildAfterBackgroundTeardown() {
-        guard tornDownInBackground else { return }
+    /// 返回是否真的开始重建了（播放记录据此区分「回前台要等重建出画」与「画面一直都在」）
+    @discardableResult
+    public func rebuildAfterBackgroundTeardown() -> Bool {
+        guard tornDownInBackground else { return false }
         rebuild(autoplay: false)
+        return true
     }
 
     /// 管线已被后台拆除：引擎处于暂停、却没有任何通路（诊断里显示「未装载」）
@@ -371,6 +547,39 @@ public final class AetherPlayback {
         return readouts
     }
 
+    /// 规格事实快照（首帧时取一次、变了再取）
+    public func deliveryFacts() -> DeliveryFacts {
+        let active = engine.audioTracks.first { $0.id == engine.activeAudioTrackIndex }
+        let conversion: String? = switch engine.dolbyVisionConversion {
+        case .profile7ToProfile81?: "profile7to81"
+        case nil: nil
+        }
+        return DeliveryFacts(
+            route: engine.videoRoute.rawValue,
+            container: engine.sourceContainerFormat,
+            videoCodec: engine.sourceVideoCodecName,
+            sourceFormat: Self.formatKey(engine.sourceVideoFormat),
+            outputFormat: Self.formatKey(engine.videoFormat),
+            dolbyVisionProfile: engine.sourceDVProfile,
+            dolbyVisionConversion: conversion,
+            audioDelivery: engine.audioDelivery.rawValue,
+            audioDecoder: engine.activeAudioDecoder,
+            audioCodec: active?.codec,
+            audioChannels: active.map(\.channels),
+            audioName: active?.name
+        )
+    }
+
+    private static func formatKey(_ format: VideoFormat) -> String {
+        switch format {
+        case .sdr: "sdr"
+        case .hdr10: "hdr10"
+        case .hdr10Plus: "hdr10plus"
+        case .dolbyVision: "dolbyvision"
+        case .hlg: "hlg"
+        }
+    }
+
     private var formatLabel: String {
         var label = switch engine.videoFormat {
         case .sdr: "SDR"
@@ -434,13 +643,11 @@ public final class AetherPlayback {
     public struct TextStyle: Sendable, Equatable {
         public var fontScale: Double = 5.2
         public var bottomPercent: Double = 8
-        public var outline = true
         public var background = false
 
-        public init(fontScale: Double = 5.2, bottomPercent: Double = 8, outline: Bool = true, background: Bool = false) {
+        public init(fontScale: Double = 5.2, bottomPercent: Double = 8, background: Bool = false) {
             self.fontScale = fontScale
             self.bottomPercent = bottomPercent
-            self.outline = outline
             self.background = background
         }
     }
@@ -481,9 +688,40 @@ public final class AetherPlayback {
         public func skip(by seconds: Double) { source.skip(by: seconds) }
     }
 
-    /// 清掉被杀掉的播放会话留在临时目录里的分片与包缓存（每次 App 启动调一次即可，放后台线程）
+    /// 清掉被杀掉的播放会话留在临时目录里的分片与包缓存、整理跨启动保留的片源字节缓存
+    /// （每次 App 启动调一次即可，放后台线程）
     public nonisolated static func sweepStaleCaches() {
         AetherEngine.sweepStaleSessionCaches()
+    }
+
+    /// 临时目录所在卷「重要用途可用」的字节数（引擎补丁 P44：带 10 秒缓存，引擎的分片留存预算、片源缓存预算用的同一份）
+    public nonisolated static func temporaryFreeBytes() -> Int64? {
+        AetherEngine.temporaryVolumeAvailableBytes(importantUsage: true)
+    }
+
+    /// 片源字节缓存是否跨启动保留（引擎补丁 P42，默认开）。要在建第一个引擎之前设，真机新旧对照用
+    public nonisolated static func setPersistsSourceCache(_ on: Bool) {
+        AetherEngine.persistsSourceByteCache = on
+    }
+
+    /// 片源字节缓存每块另记一段暂存范围（引擎补丁 P50，默认开）。真机新旧对照用
+    public nonisolated static func setSourceCacheKeepsSpareRuns(_ on: Bool) {
+        AetherEngine.sourceByteCacheKeepsSpareRuns = on
+    }
+
+    /// 启动整理跨启动缓存超额时先缩到只剩文件头尾的元数据、缩完仍超才整条删（引擎补丁 P51，默认开）。真机新旧对照用
+    public nonisolated static func setSourceCacheTrimKeepsMetadata(_ on: Bool) {
+        AetherEngine.sourceByteCacheTrimKeepsMetadata = on
+    }
+
+    /// 删掉跨启动保留的片源字节缓存（引擎补丁 P50）：只能在建第一个引擎之前调，真机对照每次热身前清场用
+    public nonisolated static func removePersistedSourceCache() {
+        AetherEngine.removePersistedSourceByteCache()
+    }
+
+    /// 片源字节缓存的记账立刻落盘（引擎补丁 P42）：App 进后台时调，下次启动续播认得最后几秒下过的字节
+    public nonisolated static func flushSourceCacheIndexes() {
+        AetherEngine.flushSourceByteCacheIndexes()
     }
 
     /// 画中画进出要告诉引擎：画中画期间 App 进后台，引擎不能拆管线。
@@ -505,6 +743,10 @@ public final class AetherPlayback {
         onFailure = nil
         onTracksChanged = nil
         onFirstFrame = nil
+        onStartupStage = nil
+        onSeekOutcome = nil
+        onSoftwareFrameGeneration = nil
+        engine.setSoftwareVideoFrameTimeObserver(nil)
         loadTask?.cancel()
         cancellables.removeAll()
         engine.stop()
@@ -530,6 +772,28 @@ public final class AetherPlayback {
             .removeDuplicates()
             .filter { $0 }
             .sink { [weak self] _ in self?.onFirstFrame?() }
+            .store(in: &cancellables)
+        engine.$startupProgress
+            .compactMap { $0 }
+            .removeDuplicates()
+            .sink { [weak self] progress in self?.onStartupStage?(Self.stageName(progress.checkpoint)) }
+            .store(in: &cancellables)
+        engine.seekEvents
+            .sink { [weak self] event in
+                let outcome: SeekOutcome? = switch event.outcome {
+                case .began: nil
+                case .landed: .landed
+                case .stalled: .stalled
+                case .superseded: .superseded
+                case .rejected: .rejected
+                }
+                guard let outcome else { return }
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { self?.onSeekOutcome?(outcome) }
+                } else {
+                    DispatchQueue.main.async { MainActor.assumeIsolated { self?.onSeekOutcome?(outcome) } }
+                }
+            }
             .store(in: &cancellables)
         engine.$subtitleCues
             .sink { [weak self] cues in
@@ -683,6 +947,74 @@ public final class AetherPlayback {
 }
 
 /// 播放容器：底下是引擎的画面视图，上面叠字幕层，两者都铺满
+extension AetherPlayback {
+    /// 起播检查点的名字（与引擎 `StartupCheckpoint` 一一对应）
+    static func stageName(_ checkpoint: StartupCheckpoint) -> String {
+        switch checkpoint {
+        case .dispatched: "dispatched"
+        case .sourceOpened: "sourceOpened"
+        case .containerOpened: "containerOpened"
+        case .streamsProbed: "streamsProbed"
+        case .displayPrepared: "displayPrepared"
+        case .routed: "routed"
+        case .sessionConstructed: "sessionConstructed"
+        case .ready: "ready"
+        case .presenting: "presenting"
+        }
+    }
+}
+
+/// 软件通路逐帧回调里的计数（解码线程写、主线程读）：帧数，以及当前的显示代数
+nonisolated private final class SoftwareFrameCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var frames = 0
+    private var generation: UInt64?
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return frames }
+
+    /// 记一帧；这一帧开启了新的一代（跳转或装载后的第一帧）时返回 true
+    func record(generation new: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        frames += 1
+        guard new != generation else { return false }
+        generation = new
+        return true
+    }
+}
+
+/// 引擎日志的环形缓冲：最近 300 行，每行最多 400 字（任意线程写）
+nonisolated private final class EngineLogRing: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+    private let capacity = 300
+
+    func append(_ line: String) {
+        let trimmed = line.count > 400 ? String(line.prefix(400)) + "…" : line
+        lock.lock(); defer { lock.unlock() }
+        lines.append(trimmed)
+        if lines.count > capacity { lines.removeFirst(lines.count - capacity) }
+    }
+
+    /// 从最新往回取，直到 `maxBytes`，再按时间正序拼起来
+    func snapshot(maxBytes: Int) -> String {
+        lock.lock(); let copy = lines; lock.unlock()
+        var picked: [String] = []
+        var size = 0
+        for line in copy.reversed() {
+            size += line.utf8.count + 1
+            if size > maxBytes { break }
+            picked.append(line)
+        }
+        return picked.reversed().joined(separator: "\n")
+    }
+}
+
+/// 逐帧回调（@Sendable、跨线程）里要回到宿主时用的弱引用
+nonisolated private final class WeakPlayback: @unchecked Sendable {
+    weak var value: AetherPlayback?
+    init(_ value: AetherPlayback) { self.value = value }
+}
+
 private final class PlaybackContainerView: UIView {
     var onLayout: (() -> Void)?
 
@@ -706,7 +1038,7 @@ private final class PlaybackContainerView: UIView {
     }
 }
 
-/// 一条要画的字幕：图形字幕是位图 + 位置，文字字幕是纯文本（ASS 样式先按纯文本画，字号、位置、描边随用户设置）
+/// 一条要画的字幕：图形字幕是位图 + 位置，文字字幕是纯文本（ASS 样式先按纯文本画，字号、位置、背景随用户设置）
 struct OverlayCue {
     enum Content {
         /// 位图、在字幕画布里的位置（0～1）、画布像素尺寸（.zero = 与画面相同）
@@ -744,7 +1076,7 @@ struct OverlayCue {
 /// - 图形字幕：位置是相对字幕画布的 0～1 坐标；画布与画面宽度对齐、垂直居中——裁过黑边的片子画布比画面高，
 ///   这样字幕仍落在原盘作者放的位置（包括下黑边里）。
 /// - 文字字幕：与 App 的 SwiftUI 叠加层（SubtitleOverlay）同一口径——字号是画面高度的百分比、
-///   位置是距画面底边的百分比，白字加描边或半透明底框，横竖屏切换都不影响字幕相对画面的样子。
+///   位置是距画面底边的百分比，白字带柔和投影或半透明底框，横竖屏切换都不影响字幕相对画面的样子。
 ///   ASS 用 `\pos` 指定了位置的（招牌、注释、竖排说明这类特效字）画在它指定的位置，`\an7～9` 的画在顶部，
 ///   其余对白合成一块放在底部——不然特效字会叠进对白里（真机《如果历史是一群喵》实测）。
 final class SubtitleLayerView: UIView {
@@ -872,7 +1204,7 @@ final class SubtitleLayerView: UIView {
     }
 }
 
-/// 一块字幕文字：白字（描边或半透明底框），按 ASS 小键盘方位把自己对齐到锚点（5 = 锚点在中心）。
+/// 一块字幕文字：白字（柔和投影或半透明底框），按 ASS 小键盘方位把自己对齐到锚点（5 = 锚点在中心）。
 /// 文字、样式、位置都没变时不重排（字幕层约每秒刷新 10 次）
 final class TextBlockView: UIView {
     private let label = UILabel()
@@ -907,10 +1239,9 @@ final class TextBlockView: UIView {
             .foregroundColor: UIColor.white,
             .paragraphStyle: paragraph,
         ]
-        if style.outline, !style.background {
-            // 描边：负的描边宽度 = 描边同时保留填充；再加一层柔和阴影压住亮背景
-            attributes[.strokeColor] = UIColor.black
-            attributes[.strokeWidth] = -3.0
+        if !style.background {
+            // 不开背景时靠一层柔和投影压住亮画面。不用文字描边（strokeWidth）：中文字形由互相重叠的
+            // 笔画轮廓拼成，描边沿每个轮廓各描一圈，笔画交叉处全是黑缝（真机实测）
             let shadow = NSShadow()
             shadow.shadowColor = UIColor.black.withAlphaComponent(0.6)
             shadow.shadowBlurRadius = 3

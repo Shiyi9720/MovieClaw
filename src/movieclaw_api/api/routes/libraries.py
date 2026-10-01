@@ -90,6 +90,7 @@ from movieclaw_api.schemas.library import (
     SubtitleDeleteResultView,
     SubtitlePreviewView,
     SubtitleStreamView,
+    TrackDefaultsView,
     TransferMoveView,
     TransferPayload,
     TransferPreviewView,
@@ -106,6 +107,7 @@ from movieclaw_api.services import jobs, media_scrape
 from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.library import chapters as chapters_mod
 from movieclaw_api.services.library import claim as library_claim
+from movieclaw_api.services.library import skip_segments as skip_segments_mod
 from movieclaw_api.services.library import source_annotation
 from movieclaw_api.services.library.access import (
     assert_item_visible,
@@ -200,6 +202,8 @@ from movieclaw_api.services.media_discover import get_tmdb_client
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.media_server_notify import notify_media_server_refresh
 from movieclaw_api.services.playback import warmup as playback_warmup
+from movieclaw_api.services.playback.track_context import library_track_context
+from movieclaw_api.services.playback.track_defaults import FileTrackDefaults, file_track_defaults
 from movieclaw_api.services.scrape_config import resolve_scrape_library
 from movieclaw_api.services.subscription import SubscriptionService
 from movieclaw_api.services.title_discovery import parse_title_ref
@@ -224,6 +228,7 @@ from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_db.repositories.member_repo import MemberRepository
 from movieclaw_media.genres import COUNTRY_NAMES, MOVIE_GENRES, REGION_PRESETS, TV_GENRES
 from movieclaw_media.models import MediaKind, MediaSource
+from movieclaw_playback import state as playback_state
 
 router = APIRouter(prefix="/libraries", tags=["libraries"])
 search_router = APIRouter(prefix="/search", tags=["search"])
@@ -1100,6 +1105,7 @@ async def create_library(
         scrape_overrides=payload.scrape_overrides,
         generate_thumbnails=payload.generate_thumbnails,
         extract_chapter_images=payload.extract_chapter_images,
+        detect_media_segments=payload.detect_media_segments,
         exclude_from_home=payload.exclude_from_home,
         auto_series_collections=payload.auto_series_collections,
         access_mode=payload.access_mode,
@@ -1245,6 +1251,8 @@ async def update_library(
     # ``service.update`` 在同一 ORM 会话里原地修改实体；先取不可变快照，后台
     # 扫描才能知道这次编辑真正替换的是哪些根，而不是读到更新后的新根列表。
     previous_root_paths = list(before.root_paths)
+    chapters_were_enabled = before.extract_chapter_images
+    segments_were_enabled = before.detect_media_segments
     roots_changed = previous_root_paths != [p.strip() for p in payload.root_paths if p.strip()]
     # 扫描/整理依赖根路径，只有真的改路径才需要锁库；改展示名称、收藏规则
     # 或下轮扫描策略不触碰当前任务正在使用的路径与台账，允许即时保存。
@@ -1261,6 +1269,7 @@ async def update_library(
         scrape_overrides=payload.scrape_overrides,
         generate_thumbnails=payload.generate_thumbnails,
         extract_chapter_images=payload.extract_chapter_images,
+        detect_media_segments=payload.detect_media_segments,
         exclude_from_home=payload.exclude_from_home,
         auto_series_collections=payload.auto_series_collections,
         access_mode=payload.access_mode,
@@ -1272,6 +1281,23 @@ async def update_library(
         # **不重新联网、不重新刮削**——数据早就在 media_metadata 的列里了
         await ensure_series_collections_for_library(session, library_id)
         await session.commit()
+    # 「生成章节」开关切换：关掉就停掉进行中的整库生成，打开就立即排一份补缺
+    # （docs/design/video-chapters.md §4.5）；改了根路径的这次会重扫，由扫描收尾排
+    await chapters_mod.apply_library_switch(
+        session,
+        row,
+        was_enabled=chapters_were_enabled,
+        rescan_queued=roots_changed,
+        origin=_job_origin(client_name),
+    )
+    # 「识别片头片尾」开关切换（docs/design/skip-intro.md）：同章节的收放规则
+    await skip_segments_mod.apply_library_switch(
+        session,
+        row,
+        was_enabled=segments_were_enabled,
+        rescan_queued=roots_changed,
+        origin=_job_origin(client_name),
+    )
     member_ids = await MemberRepository(session).get_library_member_ids(library_id)
     # 根路径变了就自动补扫：新目录的存量立刻入账，移除目录下的文件标记 missing
     if roots_changed:
@@ -1789,7 +1815,7 @@ async def refresh_item_metadata(
 @router.get(
     "/{library_id}/items/{media_item_id}/artwork/candidates",
     response_model=ApiResponse[ArtworkCandidatesView],
-    summary="条目的候选海报/背景图列表（选图前先看这里）",
+    summary="条目的候选海报/背景图/徽标列表（选图前先看这里）",
     operation_id="library.artwork.list-candidates",
     dependencies=[Depends(require_admin)],
 )
@@ -1799,25 +1825,23 @@ async def list_artwork_candidates_route(
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[ArtworkCandidatesView]:
     """TMDB 全量候选图，按与自动选图一致的规则排序（背景无文字优先、
-    海报中文优先），首张即当前自动策略会选的那张。"""
+    海报中文优先、徽标与片名同语言优先），首张即当前自动策略会选的那张。"""
 
     await LibraryConfigService(session).get(library_id)  # 404 检查
     await _metadata_item(session, library_id, media_item_id)  # 404 检查（不要求文件）
-    (
-        posters,
-        backdrops,
-        current_poster,
-        current_backdrop,
-    ) = await media_scrape.list_artwork_candidates(media_item_id)
+    candidates = await media_scrape.list_artwork_candidates(media_item_id)
     meta = await MediaItemRepository(session).get_metadata(media_item_id)
     return ok(
         ArtworkCandidatesView(
-            posters=[ArtworkCandidateView(**p) for p in posters],
-            backdrops=[ArtworkCandidateView(**b) for b in backdrops],
-            current_poster=current_poster,
-            current_backdrop=current_backdrop,
+            posters=[ArtworkCandidateView(**p) for p in candidates.posters],
+            backdrops=[ArtworkCandidateView(**b) for b in candidates.backdrops],
+            logos=[ArtworkCandidateView(**logo) for logo in candidates.logos],
+            current_poster=candidates.current_poster,
+            current_backdrop=candidates.current_backdrop,
+            current_logo=candidates.current_logo,
             poster_locked=bool(meta and meta.poster_locked),
             backdrop_locked=bool(meta and meta.backdrop_locked),
+            logo_locked=bool(meta and meta.logo_locked),
         )
     )
 
@@ -1825,7 +1849,7 @@ async def list_artwork_candidates_route(
 @router.post(
     "/{library_id}/items/{media_item_id}/artwork/select",
     response_model=ApiResponse[dict],
-    summary="选定海报/背景（当场落盘并覆盖媒体目录；此后刷新不再覆盖）",
+    summary="选定海报/背景/徽标（当场落盘并覆盖媒体目录；此后刷新不再覆盖）",
     operation_id="library.artwork.select",
     dependencies=[Depends(require_admin)],
 )
@@ -1841,7 +1865,7 @@ async def select_artwork_route(
     await LibraryConfigService(session).get(library_id)  # 404 检查
     await _metadata_item(session, library_id, media_item_id)  # 404 检查（不要求文件）
     await media_scrape.select_artwork(media_item_id, kind=payload.kind, file_path=payload.file_path)
-    label = "海报" if payload.kind == "poster" else "背景图"
+    label = {"poster": "海报", "backdrop": "背景图", "logo": "徽标"}[payload.kind]
     message = (
         f"已恢复{label}的自动选图（下次刷新元数据时重新挑选）"
         if payload.file_path is None
@@ -2417,12 +2441,20 @@ def _chapter_views(row: LibraryFile) -> list[ChapterView] | None:
 
 
 def _file_view(
-    row: LibraryFile, external_subs: list[str], origins: dict[int, dict] | None = None
+    row: LibraryFile,
+    external_subs: list[str],
+    origins: dict[int, dict] | None = None,
+    *,
+    chapters_enabled: bool,
+    defaults: FileTrackDefaults | None = None,
 ) -> LibraryFileView:
     """台账行 → 详情页文件视图：内封字幕轨与外挂字幕文件合并成一份清单。
 
     ``origins`` 是旧行（origin 为空）的读时推导结果（``derive_origins``），
-    有落库快照的行不看它。"""
+    有落库快照的行不看它。``chapters_enabled`` 是所在库的「生成章节」开关：
+    关着时章节给 None——详情页与分享页（它投影的就是这份视图）都不出章节横排，
+    台账里探到的章节与已生成的图原样留着，重新打开开关即恢复。``defaults`` 是这个成员
+    起播时会放的音轨 / 字幕（``file_track_defaults``），给了才下发。"""
     subtitles = [
         SubtitleStreamView(
             codec=stream.get("codec"),
@@ -2491,7 +2523,19 @@ def _file_view(
             ]
         ),
         subtitle_streams=subtitles,
-        chapters=_chapter_views(row),
+        playback_defaults=(
+            TrackDefaultsView(
+                audio_track=defaults.audio.ref,
+                audio_reason=defaults.audio.reason,
+                audio_note=defaults.audio_note,
+                subtitle_track=defaults.subtitle_ref,
+                subtitle_reason=defaults.subtitle.reason,
+                subtitle_note=defaults.subtitle_note,
+            )
+            if defaults is not None
+            else None
+        ),
+        chapters=_chapter_views(row) if chapters_enabled else None,
         added_at=row.created_at,
     )
 
@@ -2522,22 +2566,32 @@ async def get_library_item(
     # 判定走 access 的收口，超出上限与"条目不存在"不可区分
     await assert_item_visible(session, principal, media_item_id)
     item, rows = await _item_rows(session, library_id, media_item_id)
+    meta_row = await MediaItemRepository(session).get_metadata(media_item_id)
+    # 默认轨策略的上下文（库语言、原始语言）：库行与条目元数据手里都有，直接拼，不另查库。
+    # 预热的「会不会走直通」预判与文件区的「默认会放哪条」都按它算，与起播同一口径
+    track_context = library_track_context(
+        library, meta_row.original_language if meta_row is not None else None
+    )
     # 起播预热：用户在详情页看简介的这几秒，正好把关键帧采样做掉——点播放
     # 时缓存直接命中，首播不再现场探测（§6.10）。只替上报过解码能力、且放这
     # 部片可能走直通的网页客户端做；内封字幕不在这里抽（整文件通读，详情接口
     # 会被批量调用）。见 warmup 模块说明。后台任务，失败无感；剧集（文件多）
     # 在 warmup 内部自动跳过。分享页内部调用时没有 User-Agent，不预热。
+    in_place_rows = [row for row in rows if row.state == FileState.IN_PLACE]
     playback_warmup.schedule(
         media_item_id,
-        [row for row in rows if row.state == FileState.IN_PLACE],
+        in_place_rows,
         identity=playback_warmup.identity_of(principal),
         user_agent=user_agent,
+        context=track_context,
     )
     # 章节场景图懒触发（docs/design/video-chapters.md §4.5）：有在位文件的图
     # 还没抓齐就后台抓这一个条目，前端按 chapters_pending 轮询几轮把图补上——
     # 升级后第一次打开旧条目不用等整库作业排到它。判据与整库作业同源
-    # （stills_complete）：半成品、图丢了的行在这里同样会被认出来
-    chapters_pending = chapters_mod.item_pending(media_item_id)
+    # （stills_complete）：半成品、图丢了的行在这里同样会被认出来。库关了「生成
+    # 章节」时一律不算在生成：章节不展示，前端没必要为它轮询（刚关开关时内存里
+    # 可能还挂着一个懒触发，它会在下一个文件前按开关自行收手）
+    chapters_pending = library.extract_chapter_images and chapters_mod.item_pending(media_item_id)
     if library.extract_chapter_images and not chapters_pending:
         # 条目菜单发起的重抓是持久化 Job（重启不丢），内存里的懒触发标记看不到它
         chapters_pending = await chapters_mod.item_job_active(session, media_item_id)
@@ -2579,7 +2633,6 @@ async def get_library_item(
     # 图片优先级与元数据同构：条目目录美术图 > 本地刮削资产 > TMDB 图床。
     # 本地两层的 URL 都带 ?v=<mtime> 版本戳：换图是**原地覆盖同一路径**，
     # 不带版本浏览器会拿缓存里的旧图，用户看到"换了没生效"（实测踩过）
-    meta_row = await MediaItemRepository(session).get_metadata(media_item_id)
     if bundle.has_local_poster:
         poster_url = f"{art_base}?kind=poster&v={bundle.local_poster_version}"
     elif meta_row is not None and meta_row.poster_file:
@@ -2596,6 +2649,12 @@ async def get_library_item(
         # w1280 而非 original：作为全站沉浸背景铺视口足够清晰，体积小一个
         # 数量级——首次访问的背景切换等待从"原图下载"变成秒级
         backdrop_url = f"{base}/w1280{item.backdrop_path}" if item.backdrop_path else None
+    # 片名 Logo：本地资产 > TMDB 图床；logo_path 为空串表示刮过、确实没有合适语言的 Logo
+    if meta_row is not None and meta_row.logo_file:
+        logo_version = media_scrape.asset_version(meta_row.logo_file)
+        logo_url = f"/images/assets/{meta_row.logo_file}?v={logo_version}"
+    else:
+        logo_url = f"{base}/w500{item.logo_path}" if item.logo_path else None
     local_meta = None
     if bundle.local_meta is not None:
         # Web 与 Jellyfin 共用 person 关系表：导演头像和人物链接不能再从
@@ -2654,8 +2713,25 @@ async def get_library_item(
 
     assert item.id is not None
     origins = await derive_origins(session, rows)
+    # 文件区标「默认」的是这个成员起播时真会放的那条（本集记着的 > 沿用上一集 > 默认轨策略），
+    # 不再是片源的默认旗标：观看状态一次查询取完整个条目，其余是内存计算
+    watch_states = await playback_state.get_states(session, [media_item_id], member_id=member_id)
+    unit_files: dict[tuple[int, int, int], LibraryFile] = {}
+    for row in in_place_rows:
+        unit_files.setdefault((media_item_id, row.season_number, row.episode_number), row)
     file_views = [
-        _file_view(row, bundle.external_subtitles.get(row.id or -1, []), origins) for row in rows
+        _file_view(
+            row,
+            bundle.external_subtitles.get(row.id or -1, []),
+            origins,
+            chapters_enabled=library.extract_chapter_images,
+            defaults=(
+                file_track_defaults(row, track_context, watch_states, unit_files)
+                if row.state == FileState.IN_PLACE
+                else None
+            ),
+        )
+        for row in rows
     ]
     entry_dirs = bundle.entry_dirs
     if not principal.is_admin:
@@ -2676,6 +2752,7 @@ async def get_library_item(
             year=item.year,
             poster_url=poster_url,
             backdrop_url=backdrop_url,
+            logo_url=logo_url,
             primary_aspect=primary_aspect(
                 item,
                 meta_row.poster_width if meta_row else None,
@@ -4040,7 +4117,8 @@ async def claim_files_batch(
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
     """一次认领一整组（通常是一部剧的几十集），与单个认领共用
-    services/library/claim.claim_files（季集号沿用文件名解析结果）。"""
+    services/library/claim.claim_files（季集号沿用文件名解析结果；带
+    ``season_number`` 时整组统一改用该季号）。"""
 
     target_kind, tmdb_id = _assignment_target(payload.title_ref)
     item, claimed, displaced = await library_claim.claim_files(
@@ -4048,6 +4126,7 @@ async def claim_files_batch(
         payload.file_ids,
         tmdb_id=tmdb_id,
         target_kind=target_kind,
+        season_override=payload.season_number,
     )
     # 一次入库刮削的资产补齐（图片 + 媒体目录镜像），后台执行
     background_tasks.add_task(media_scrape.ensure_assets, item.id)

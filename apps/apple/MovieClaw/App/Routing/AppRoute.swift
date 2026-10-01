@@ -36,6 +36,8 @@ enum AppRoute: Hashable {
     case libraryItem(libraryId: Int, itemId: Int, season: Int? = nil, episode: Int? = nil)
     /// /library/manage?create=1&tab=duplicates&item={mediaItemId}
     case libraryManage(create: Bool = false, tab: String? = nil, item: Int? = nil)
+    /// /library/reels：片段（上下滑动看片段，docs/design/reels.md）。App 独有，网页暂时没有
+    case reels
 
     // MARK: 搜索
     /// 搜索首页（输入框 + 模式 + 最近搜索，对应 Web 的搜索命令面板，没有网页地址）：
@@ -171,13 +173,21 @@ enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
     /// 成员能看到「个人信息」与「设备」（自己的设备），其余分区仅超级管理员可见
     var memberVisible: Bool { self == .profile || self == .devices }
 
+    /// App 不提供的分区：资源与下载的配置（订阅规则、资源站点、下载器、自动入库）只在网页端管理，
+    /// 降低审核按条款 5.2.3（便利文件共享）拒审的风险（2026-09-29 用户决定只维护这一个版本）。
+    /// 「概览」同理：它的主体是订阅链路体检（站点 / 下载器是否配齐），一并交给网页端。
+    /// 设置首页不列出；其他页面写死的跳转与深链照常解析，分区页显示「请在网页端管理」
+    var availableInApp: Bool {
+        ![.overview, .subscription, .sites, .downloaders, .importWatch].contains(self)
+    }
+
     /// 分组（空标题的组不渲染组头）。「个人信息」不列在设置目录里：「我的」页顶部的头像卡
     /// 就是它的入口（2026-09-27 用户要求去掉重复入口），分区本身与 /settings/profile 深链照旧可用
     static let groups: [(title: String, items: [SettingsSection])] = [
         ("", [.overview]),
-        // 「设备」人人可用（成员看自己的设备，docs/design/login-devices.md）；「个人信息」走「我的」页头像卡
-        ("账号", [.devices]),
-        ("成员", [.members]),
+        // 「设备」人人可用（成员看自己的设备，docs/design/login-devices.md）；「个人信息」走「我的」页头像卡。
+        // 「成员」并进这一组（原先各自单成一组、每组只有一行，2026-09-29 用户要求合并）；成员身份只看得到「设备」
+        ("账号", [.devices, .members]),
         ("资源与下载", [.subscription, .sites, .downloaders, .importWatch]),
         ("媒体库", [.scrape, .playback]),
         ("通知与集成", [.imPush, .webhook, .llm, .mcp, .ai]),
@@ -229,6 +239,7 @@ extension AppRoute {
             switch parts[1] {
             case "customize": self = .libraryCustomize
             case "favorites": self = .favorites
+            case "reels": self = .reels
             case "collections": self = .allCollections
             case "manage": self = .libraryManage(create: query["create"] == "1", tab: query["tab"], item: int(query["item"]))
             case "c":
@@ -291,7 +302,7 @@ extension AppRoute {
     var tab: MainTab? {
         switch self {
         case .discover, .discoverCollection, .mediaDetail, .person, .discoveredPerson: .discover
-        case .libraryHome, .libraryCustomize, .favorites, .allCollections, .collection, .library, .libraryItem, .libraryManage: .library
+        case .libraryHome, .libraryCustomize, .favorites, .allCollections, .collection, .library, .libraryItem, .libraryManage, .reels: .library
         case .subscriptions, .subscription, .subscriptionWall: .subscriptions
         case .activity, .activityPage: .activity
         case .my: .more

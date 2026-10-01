@@ -1,0 +1,66 @@
+# =============================================================================
+# iOS App 编译检查
+#
+# 改到 apps/apple 的 PR 在 GitHub 的 macOS runner（默认 Xcode 26.x）上把 App 按发版方式
+# 完整编一遍（与 release.yml 的 ios-ipa 作业同一个脚本，只编不传）。
+# 为什么要有：本机开发用的是更新的 Xcode，它能推断通过的写法（隔离一致性、长表达式），
+# Xcode 26 会编译失败——v0.28.0 发版时 ios-ipa 作业就因此没产出 IPA（2026-09-29）。
+# 在 PR 阶段拦下，发版时就不会再缺 IPA。
+# =============================================================================
+name: ios
+
+on:
+  pull_request:
+    paths:
+      - "apps/apple/**"
+      - ".github/workflows/ios.yml"
+      # 发版 PR（bump 版本号）也编一遍：发版的 ios-ipa 作业用同一个脚本，
+      # 在发版 PR 上先红，比 tag 推出去后才发现缺 IPA 好补救
+      - "src/movieclaw_api/__init__.py"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # 与 release.yml 的 ios-ipa 作业同一个 runner 镜像
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备工具链
+        run: |
+          brew install xcodegen
+          xcodebuild -version
+
+      # 缓存 Swift 包（远程包的检出与 FFmpegBuild 等二进制框架），省掉每次从头拉取。
+      # 仓库不提交 Package.resolved（工程由 XcodeGen 现场生成），键按两处包声明算；
+      # 版本范围内的新补丁版本仍会被解析拉取，缓存只是起点
+      - name: 恢复 Swift 包缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/workspace/.mc-ios-spm
+          key: ios-spm-${{ hashFiles('apps/apple/project.yml', 'apps/apple/Vendor/AetherEngine/Package.swift') }}
+          restore-keys: ios-spm-
+
+      - name: 编译（未签名 Release，与发版 IPA 同口径）
+        run: apps/apple/scripts/build-unsigned-ipa.sh
+
+      # 编译错误之外还有编译器崩溃（Stack dump）、链接失败、构建步骤失败（Command … failed），
+      # 格式各不相同：关键行 + 日志末尾都打出来，完整日志另存为附件
+      - name: 失败时输出编译错误
+        if: failure()
+        run: |
+          grep -nE "error:|Stack dump|failed with a nonzero exit code|ld: |The following build commands failed" \
+            apps/apple/build-ipa/build.log | head -80 || true
+          echo "----- 日志末尾 -----"
+          tail -60 apps/apple/build-ipa/build.log || true
+
+      - name: 失败时上传完整编译日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-log
+          path: apps/apple/build-ipa/build.log

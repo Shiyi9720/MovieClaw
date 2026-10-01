@@ -56,6 +56,8 @@ final class NativeEngine: NSObject, PlayerEngine {
     private var loadIssued = false
     /// 片源字节缓存的键（控制器装载前给，见 `PlaybackController.sourceCacheKey`）：同一个文件在 App 这次运行里每个字节只下一次
     var sourceCacheKey: String?
+    /// 服务端随会话下发的 MKV 精简索引（控制器装载前给；引擎补丁 P58）：起播时不必再下原索引
+    var matroskaCues: (offset: Int64, data: Data)?
     /// 落盘计划（控制器装载前按剩余空间给，见 `NativeStoragePlan`）：存储紧张时收小分片窗口、不开片源字节缓存
     var storagePlan = NativeStoragePlan.normal
     /// 装载时交给引擎的外挂字幕（按引用记顺序：引擎里 isExternal 的轨按 id 排序与之一一对应）
@@ -67,6 +69,14 @@ final class NativeEngine: NSObject, PlayerEngine {
     private var firstFrameShown = false
     /// 引擎报「在播」时首帧还没上屏（见 handle(_:)）
     private var playingBeforeFirstFrame = false
+    /// 播放体验打点：发出了跳转、还在等落点的画面（`EngineEvent.seekPresented`）
+    private var awaitingSeekPicture = false
+    /// 引擎那边这次跳转已落地（主力通路据此加上「恢复播放」判定画面到了）
+    private var seekLanded = false
+    /// 最近一次失败的引擎错误类型（`PlaybackErrorKind` 原值），播放记录用
+    private(set) var lastFailureKind: String?
+    /// 回前台时是否真的重建了管线（后台暂停超过 15 秒会被拆掉）：重建了要等首帧，没重建画面一直都在
+    private(set) var rebuiltOnForeground = false
 
     #if DEBUG
     /// 开发期：状态变化打到控制台并标上距装载的毫秒数（量起播、跳转、换轨耗时）
@@ -82,12 +92,7 @@ final class NativeEngine: NSObject, PlayerEngine {
 
     init(playsOriginalFile: Bool) throws {
         self.playsOriginalFile = playsOriginalFile
-        #if DEBUG
-        // 开发期：-mcAetherLog YES 把引擎日志打到控制台（模拟器排查用）
-        AetherPlayback.mirrorEngineLog(UserDefaults.standard.bool(forKey: "mcAetherLog"))
-        // -mcAetherCues YES：把文字字幕与 ASS 定位打到控制台
-        AetherPlayback.logsCues = UserDefaults.standard.bool(forKey: "mcAetherCues")
-        #endif
+        Self.prepareEngineEnvironment()
         core = try AetherPlayback()
         super.init()
         Self.sweepStaleCachesOnce()
@@ -95,17 +100,92 @@ final class NativeEngine: NSObject, PlayerEngine {
         core.onFailure = { [weak self] failure in self?.handle(failure) }
         core.onTracksChanged = { [weak self] in self?.tracksChanged() }
         core.onFirstFrame = { [weak self] in self?.firstFrameReady() }
+        core.onStartupStage = { [weak self] stage in self?.onEvent?(.startupStage(stage)) }
+        core.onSeekOutcome = { [weak self] outcome in self?.seekOutcome(outcome) }
+        core.onSoftwareFrameGeneration = { [weak self] in self?.softwareFrameGeneration() }
     }
 
     var view: UIView { core.view }
 
+    /// 建自研引擎前的全局准备：接管引擎日志、读开发期开关。刷片页（Features/Reels）自己管引擎实例，
+    /// 建之前也调它，与播放器页同一口径
+    static func prepareEngineEnvironment() {
+        // 引擎日志一律进环形缓冲，播放失败时随播放记录上报（docs/design/playback-qoe.md §3.5）；
+        // 开发期 -mcAetherLog YES 同时打到控制台（模拟器排查用）
+        #if DEBUG
+        AetherPlayback.installLogHandler(mirror: UserDefaults.standard.bool(forKey: "mcAetherLog"))
+        // -mcNoPersistentByteCache YES：片源字节缓存不跨启动保留（引擎补丁 P42 之前的行为，真机新旧对照用）。
+        // 必须在下面任何一个碰到片源字节缓存的设置之前（共享缓存第一次用到时就按这个开关建好了）
+        if UserDefaults.standard.bool(forKey: "mcNoPersistentByteCache") { AetherPlayback.setPersistsSourceCache(false) }
+        // -mcPurgeByteCache YES：先删掉跨启动保留的片源字节缓存（实验台每次热身前清场，免得对照两组互相沾光）
+        if UserDefaults.standard.bool(forKey: "mcPurgeByteCache") { AetherPlayback.removePersistedSourceCache() }
+        // -mcTrimDropsWhole YES：启动整理跨启动缓存超额时直接整条删（引擎补丁 P51 之前的行为，真机新旧对照用）
+        AetherPlayback.setSourceCacheTrimKeepsMetadata(!UserDefaults.standard.bool(forKey: "mcTrimDropsWhole"))
+        // -mcNoSpareRuns YES：片源字节缓存每块只记一段（引擎补丁 P50 之前的行为，真机新旧对照用）
+        AetherPlayback.setSourceCacheKeepsSpareRuns(!UserDefaults.standard.bool(forKey: "mcNoSpareRuns"))
+        // -mcAetherCues YES：把文字字幕与 ASS 定位打到控制台
+        AetherPlayback.logsCues = UserDefaults.standard.bool(forKey: "mcAetherCues")
+        // -mcSyncByteCache YES：片源字节缓存改回在取数线程上同步写盘（引擎补丁 P32 之前的行为，真机新旧对照用）
+        AetherPlayback.setByteCacheWritesInBackground(!UserDefaults.standard.bool(forKey: "mcSyncByteCache"))
+        // -mcProbeAllTrueHD YES：探测流时第二条起的 TrueHD 也照常探（引擎补丁 P34 之前的行为，真机新旧对照用）
+        AetherPlayback.setParkSecondaryTrueHD(!UserDefaults.standard.bool(forKey: "mcProbeAllTrueHD"))
+        // -mcSegmentSeconds <秒>：点播分片目标时长（引擎补丁 P33，默认 2；真机对照用），窗口段数在装载时按比例折算
+        let segmentSeconds = UserDefaults.standard.double(forKey: "mcSegmentSeconds")
+        if segmentSeconds > 0 { AetherPlayback.segmentTargetSeconds = segmentSeconds }
+        // -mcSeekSnapBudget <秒>：跳转吸附关键帧的逐帧解码预算（引擎补丁 P36，默认 0.2；0 = 关，真机对照用）
+        if UserDefaults.standard.object(forKey: "mcSeekSnapBudget") != nil {
+            AetherPlayback.seekSnapDecodeBudgetSeconds = UserDefaults.standard.double(forKey: "mcSeekSnapBudget")
+        }
+        // -mcCuePrewarmMiddle YES：MKV 索引预热照旧跳到片中间（引擎补丁 P45 之前的行为，真机新旧对照用）
+        AetherPlayback.setCuePrewarmTargetsStart(!UserDefaults.standard.bool(forKey: "mcCuePrewarmMiddle"))
+        // -mcNoCuesPrefetch YES：MKV 索引照旧由解复用器按需读（引擎补丁 P49 之前的行为，真机新旧对照用）
+        AetherPlayback.setPrefetchesMatroskaCues(!UserDefaults.standard.bool(forKey: "mcNoCuesPrefetch"))
+        // -mcNoPrefetchProgressWait YES：等在途提前取照旧按往返时长定上限（引擎补丁 P53 之前的行为，慢线路对照用）
+        AetherPlayback.setWaitsOnProgressingPrefetch(!UserDefaults.standard.bool(forKey: "mcNoPrefetchProgressWait"))
+        // -mcNoMoovPrefetch YES：MP4 尾部 moov 照旧由解复用器按需读（引擎补丁 P54 之前的行为，对照用）
+        AetherPlayback.setPrefetchesMP4TailMoov(!UserDefaults.standard.bool(forKey: "mcNoMoovPrefetch"))
+        // -mcNoDetourSkip YES：慢线路上回跳照旧先走 4 MB 整块补取（引擎补丁 P55 之前的行为，对照用）
+        AetherPlayback.setSkipsDetourOnSlowLink(!UserDefaults.standard.bool(forKey: "mcNoDetourSkip"))
+        // -mcNoIndexPriority YES：冷打开时文件头照旧一开始就要 32 MB、与索引提前取并行（引擎补丁 P56 之前的行为，对照用）
+        AetherPlayback.setPrioritizesIndexPrefetch(!UserDefaults.standard.bool(forKey: "mcNoIndexPriority"))
+        // -mcNoProgressiveSegments YES：分片照旧整段写完再交付给 AVPlayer（引擎补丁 P57 之前的行为，对照用）
+        AetherPlayback.setServesSegmentsProgressively(!UserDefaults.standard.bool(forKey: "mcNoProgressiveSegments"))
+        // -mcNoHostCues YES：不用服务端给的 MKV 精简索引，照旧下载原索引（引擎补丁 P58 之前的行为，对照用）
+        AetherPlayback.setUsesHostMatroskaCues(!UserDefaults.standard.bool(forKey: "mcNoHostCues"))
+        // -mcNoMediaIndependent YES：只在主播放列表声明分片独立（引擎补丁 P59 之前的行为，对照用）
+        AetherPlayback.setDeclaresIndependentMediaSegments(!UserDefaults.standard.bool(forKey: "mcNoMediaIndependent"))
+        // -mcWitnessInterval <秒>：起播 / 跳转后看缓冲过没过开播线的间隔（引擎补丁 P28，默认 0.025，原来 0.1；真机对照用）
+        let witness = UserDefaults.standard.double(forKey: "mcWitnessInterval")
+        if witness > 0 { AetherPlayback.vodStartWitnessIntervalSeconds = witness }
+        // -mcStartSnapBudget <秒>：起播落点吸附关键帧的逐帧解码预算（引擎补丁 P39，默认 0.05；0 = 关，真机对照用）
+        if UserDefaults.standard.object(forKey: "mcStartSnapBudget") != nil {
+            AetherPlayback.startSnapDecodeBudgetSeconds = UserDefaults.standard.double(forKey: "mcStartSnapBudget")
+        }
+        #else
+        AetherPlayback.installLogHandler(mirror: false)
+        #endif
+        // 音频会话由 App 自己管：点播放时就以「长视频」策略设好类别、声明多声道并激活（`PlaybackController.activateAudioSession`），
+        // 引擎建实例时不再用默认策略重设一遍（引擎补丁 P47）
+        var hostManagesAudio = true
+        #if DEBUG
+        // -mcEngineAudioSession YES：照旧由引擎在建实例时设类别（P47 之前的行为，真机新旧对照用）
+        if UserDefaults.standard.bool(forKey: "mcEngineAudioSession") { hostManagesAudio = false }
+        #endif
+        AetherPlayback.hostManagesAudioSessionCategory = hostManagesAudio
+    }
+
     /// 本次启动第一次建自研引擎时清一遍死会话的缓存（被杀掉的播放会话会在临时目录留下 GB 级分片，
     /// 真机一夜的测试攒到 15 GB、把手机写满）
     private static var sweptStaleCaches = false
-    private static func sweepStaleCachesOnce() {
+    /// App 进后台时让片源字节缓存的记账立刻落盘（引擎补丁 P42）：下次启动续播认得这一场最后几秒下过的字节
+    private static var backgroundObserver: NSObjectProtocol?
+    static func sweepStaleCachesOnce() {
         guard !sweptStaleCaches else { return }
         sweptStaleCaches = true
         DispatchQueue.global(qos: .utility).async { AetherPlayback.sweepStaleCaches() }
+        backgroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil
+        ) { _ in AetherPlayback.flushSourceCacheIndexes() }
     }
 
     // MARK: - 播放控制
@@ -145,12 +225,24 @@ final class NativeEngine: NSObject, PlayerEngine {
         #endif
         // 带上 App 的 User-Agent：服务端按它把这条流登记成「MovieClaw iOS」而不是浏览器
         loadIssued = true
+        // 窗口按段计、存储计划按 4 秒一段定的：分片更短（P33 默认 2 秒）时按比例放大段数，缓冲的时长不变
+        let scale = Self.segmentWindowScale
+        let forward = storagePlan.forwardSegments ?? (scale > 1 ? 10 : nil)
+        let backward = storagePlan.backwardSegments ?? (scale > 1 ? 20 : nil)
         core.load(source: source, start: start > 0.5 ? start : nil, autoplay: autoplay,
                   headers: ["User-Agent": APIClient.userAgent], audioOrdinal: loadAudioOrdinal,
                   externalSubtitles: pendingExternalSubtitles,
                   sourceCacheKey: storagePlan.sourceCache ? sourceCacheKey : nil,
-                  forwardSegments: storagePlan.forwardSegments, backwardSegments: storagePlan.backwardSegments)
+                  forwardSegments: forward.map { Int((Double($0) * scale).rounded()) },
+                  backwardSegments: backward.map { Int((Double($0) * scale).rounded()) },
+                  matroskaCues: matroskaCues)
         emit(.buffering)
+    }
+
+    /// 分片目标时长相对 4 秒的倍数（窗口段数按它放大）。后方窗口引擎最多 20 段，2 秒分片时即 40 秒
+    private static var segmentWindowScale: Double {
+        let seconds = AetherPlayback.segmentTargetSeconds
+        return seconds > 0 && seconds < 4 ? 4 / seconds : 1
     }
 
     /// 恢复播放一律解除「暂停下载」：忘了解除就会在没有前向缓冲的状态下播放
@@ -164,7 +256,11 @@ final class NativeEngine: NSObject, PlayerEngine {
     func pause() { core.pause() }
 
     /// 引擎的定位本身就是精确的（主力通路由 AVPlayer 按帧落点），exact 不区分
-    func seek(to seconds: Double, exact: Bool) { core.seek(to: seconds) }
+    func seek(to seconds: Double, exact: Bool) {
+        awaitingSeekPicture = true
+        seekLanded = false
+        core.seek(to: seconds)
+    }
 
     func setRate(_ rate: Float) { core.setRate(rate) }
 
@@ -236,6 +332,16 @@ final class NativeEngine: NSObject, PlayerEngine {
     /// 故障注入（开发期）：接下来这么多秒里写分片一律按「存储已满」失败，见 -mcStorageFullAfter
     static func simulateStorageFull(forSeconds seconds: Double) { AetherPlayback.simulateStorageFull(forSeconds: seconds) }
     #endif
+
+    /// 临时目录所在卷的可用字节（引擎补丁 P44：带 10 秒缓存，与引擎自己的预算同一份）
+    nonisolated static func temporaryFreeBytes() -> Int64? {
+        AetherPlayback.temporaryFreeBytes()
+    }
+
+    /// 预先和源站建好取源连接（引擎补丁 P43）：起播协商还在路上时调，会话回来时第一个取流请求不用再握手
+    nonisolated static func preconnect(url: URL) {
+        AetherPlayback.preconnect(url: url, headers: ["User-Agent": APIClient.userAgent])
+    }
 
     func growForwardBuffer() {
         // 存储紧张时窗口是按剩余空间收小的，不再放大
@@ -345,8 +451,7 @@ final class NativeEngine: NSObject, PlayerEngine {
     func applySubtitleStyle(_ style: SubtitleStyle) {
         core.setSubtitleDelay(style.offsetSeconds)
         core.setTextStyle(.init(
-            fontScale: style.fontScale, bottomPercent: style.bottomPercent,
-            outline: style.outline, background: style.background
+            fontScale: style.fontScale, bottomPercent: style.bottomPercent, background: style.background
         ))
     }
 
@@ -396,8 +501,28 @@ final class NativeEngine: NSObject, PlayerEngine {
     /// 前后台大多由引擎自己跟随 App 生命周期处理（后台只留声音、画中画时保持管线）。只有一件要宿主做：
     /// 暂停着在后台超过 15 秒，引擎会拆掉视频管线省电（上游 #127），回前台要在原位置重建，否则点播放只会一直转圈
     func setBackgrounded(_ background: Bool) {
-        if !background { core.rebuildAfterBackgroundTeardown() }
+        if !background { rebuiltOnForeground = core.rebuildAfterBackgroundTeardown() }
     }
+
+    // MARK: - 播放体验打点的读数（docs/design/playback-qoe.md §3）
+
+    /// 软件通路交到显示层的累计帧数（冻帧检测）；其余通路为 nil
+    var presentedFrameCount: Int? { core.readouts().route == "software" ? core.presentedSoftwareFrames : nil }
+
+    /// 规格事实（源是什么、实际送出的是什么）
+    func deliveryFacts() -> EngineDeliveryFacts {
+        let facts = core.deliveryFacts()
+        return EngineDeliveryFacts(
+            route: facts.route, container: facts.container, videoCodec: facts.videoCodec,
+            sourceFormat: facts.sourceFormat, outputFormat: facts.outputFormat,
+            dolbyVisionProfile: facts.dolbyVisionProfile, dolbyVisionConversion: facts.dolbyVisionConversion,
+            audioDelivery: facts.audioDelivery, audioDecoder: facts.audioDecoder, audioCodec: facts.audioCodec,
+            audioChannels: facts.audioChannels, audioName: facts.audioName
+        )
+    }
+
+    /// 引擎日志最近的若干行（播放失败时随记录上报）
+    static func recentEngineLog() -> String { AetherPlayback.recentEngineLog() }
 
     func destroy() {
         onEvent = nil
@@ -414,6 +539,8 @@ final class NativeEngine: NSObject, PlayerEngine {
         case .playing:
             // 软件通路上时钟先转、画面后到：首帧上屏之前一直报缓冲，转圈不提前收起、起播计时也按首帧算
             if firstFrameShown { emit(.playing) } else { playingBeforeFirstFrame = true }
+            // 主力通路：跳转落地之后恢复播放，落点的画面才真的动起来
+            if awaitingSeekPicture, seekLanded, core.readouts().route != "software" { seekPictureShown() }
         case .paused: emit(.paused)
         case .ended: emit(.ended)
         }
@@ -424,6 +551,7 @@ final class NativeEngine: NSObject, PlayerEngine {
         let message = failure.message.hasPrefix("Device storage is full")
             ? "手机存储空间不足，视频分片写不进缓存，请清理存储后重试"
             : failure.message
+        lastFailureKind = failure.kind
         let cause: EngineFailureCause = switch failure.category {
         case .network: .network
         case .sourceMissing: .sourceMissing
@@ -445,6 +573,8 @@ final class NativeEngine: NSObject, PlayerEngine {
 
     private func firstFrameReady() {
         firstFrameShown = true
+        // 每次出首帧都报（起播、换音轨重载、回前台重建）：不走 emit，不影响播放状态的去重
+        onEvent?(.milestone(.firstFrame))
         if playingBeforeFirstFrame {
             playingBeforeFirstFrame = false
             emit(.playing)
@@ -458,6 +588,40 @@ final class NativeEngine: NSObject, PlayerEngine {
                 selectAudio(embeddedIndex: pendingAudio)
             }
         }
+    }
+
+    /// 引擎那边的跳转终局。主力通路：暂停中落地即是画面到了，播放中要等恢复播放（见 handle(_:)）；
+    /// 软件通路等新一代的第一帧交到显示层（`softwareFrameGeneration`）
+    private func seekOutcome(_ outcome: AetherPlayback.SeekOutcome) {
+        guard awaitingSeekPicture else { return }
+        switch outcome {
+        case .landed:
+            seekLanded = true
+            guard core.readouts().route != "software" else { return }
+            if case .playing? = lastReported {
+                seekPictureShown()
+            } else if core.isPaused {
+                seekPictureShown()
+            }
+        case .stalled, .rejected:
+            awaitingSeekPicture = false
+            onEvent?(.seekFailed)
+        case .superseded:
+            // 更新的跳转接着来：继续等它的落点
+            break
+        }
+    }
+
+    /// 软件通路：新一代的第一帧交到了显示层（跳转后落点那一帧，或装载后的第一帧）
+    private func softwareFrameGeneration() {
+        guard awaitingSeekPicture else { return }
+        seekPictureShown()
+    }
+
+    private func seekPictureShown() {
+        awaitingSeekPicture = false
+        seekLanded = false
+        onEvent?(.seekPresented)
     }
 
     /// 服务端挑的第 N 条内封音轨与引擎正在放的轨语言是否不同（任一方没有语言标记时视为相同，信引擎的挑选）

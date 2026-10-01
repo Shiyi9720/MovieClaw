@@ -647,6 +647,11 @@ _MEMBER_ALLOWLIST = {
     # 图廊是同一份名单的另一种铺法（「全部收藏」页的图床浏览模式），同一口径
     ("GET", "/api/v1/playback/favorites"),
     ("GET", "/api/v1/playback/favorites/gallery"),
+    # 刷片（docs/design/reels.md）：只从本人可见的电影 / 剧集库、按本人分级上限抽片；
+    # 事件只记到本人名下，不写观看记录
+    ("GET", "/api/v1/reels"),
+    ("GET", "/api/v1/reels/facets"),
+    ("POST", "/api/v1/reels/events"),
     # 搜索历史：个人数据；统一结果端点再按记录类型检查对应能力。
     ("GET", "/api/v1/search/history"),
     ("GET", "/api/v1/search/history/{history_id}/results"),
@@ -663,6 +668,9 @@ _MEMBER_ALLOWLIST = {
     ("PATCH", "/api/v1/subscriptions/{subscription_id}"),
     ("DELETE", "/api/v1/subscriptions/{subscription_id}/following"),
     ("GET", "/api/v1/subscriptions/{subscription_id}/activities"),
+    # 在途下载进度：读是基线（自己发起或关注的订阅「下到哪了」），种子名、
+    # 下载器名与报错对成员置空（docs/design/member-permissions-v2.md §3.2）
+    ("GET", "/api/v1/subscriptions/{subscription_id}/active-downloads"),
     ("PATCH", "/api/v1/subscriptions/{subscription_id}/tracking-state"),
     ("PATCH", "/api/v1/subscriptions/{subscription_id}/follow-future"),
     ("POST", "/api/v1/subscriptions/{subscription_id}/missing-resource-searches"),
@@ -720,6 +728,8 @@ _PATH_DUMMIES = {
     "{username}": "family",
     # 缓存管理：登记目录 key（services/storage/registry.py）
     "{key}": "cache.images",
+    # 播放体验记录的播放编号
+    "{attempt_id}": "test-attempt",
 }
 
 
@@ -731,7 +741,8 @@ def test_every_route_denies_member_overreach(client: TestClient) -> None:
     可以 404/422，那证明已通过鉴权与授权进入业务逻辑）。
     """
     _admin_cookie, member_cookie, _ = _setup_admin_and_member(client)
-    openapi = client.get("/api/v1/openapi.json").json()
+    # 同 test_auth.py：spec 直接取自应用，不依赖 /openapi.json 是否对外开放。
+    openapi = client.app.openapi()
     _use(client, member_cookie)
 
     # 这几个接口会在服务端作废当前会话（退出登录即作废令牌，docs/design/login-devices.md），

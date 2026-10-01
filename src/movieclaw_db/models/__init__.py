@@ -38,6 +38,7 @@ from movieclaw_db.models.login_device import LoginDevice
 from movieclaw_db.models.manual_download_intent import ManualDownloadIntent
 from movieclaw_db.models.media_item import MediaItem, MediaSeason, MediaSource
 from movieclaw_db.models.media_metadata import MediaEpisode, MediaMetadata
+from movieclaw_db.models.media_segment import MediaSegmentState
 from movieclaw_db.models.media_share import MediaShare
 from movieclaw_db.models.member import Member, MemberLibraryAccess, MemberSiteAccess
 from movieclaw_db.models.member_scoped import (
@@ -52,6 +53,7 @@ from movieclaw_db.models.playback_state import PlaybackState
 from movieclaw_db.models.ratio_boost_stat import RatioBoostStat
 from movieclaw_db.models.ratio_boost_task import BoostTaskState, RatioBoostTask
 from movieclaw_db.models.ratio_boost_task_sample import RatioBoostTaskSample
+from movieclaw_db.models.reel_event import ReelEvent
 from movieclaw_db.models.rule_set import RuleSet
 from movieclaw_db.models.scheduled_task import (
     ScheduledTask,
@@ -145,6 +147,8 @@ __all__ = [
     "RatioBoostStat",
     "RatioBoostTask",
     "RatioBoostTaskSample",
+    "MediaSegmentState",
+    "ReelEvent",
     "RuleSet",
     "Subscription",
     "SubscriptionDownloadAttempt",

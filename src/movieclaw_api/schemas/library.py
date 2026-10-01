@@ -38,7 +38,19 @@ class LibraryPayload(BaseModel):
     extract_chapter_images: bool | None = Field(
         default=None,
         description=(
-            "是否为视频章节抓取场景图（后台低优先级作业，每个文件按章节数 seek 若干次）；"
+            "是否生成并展示视频章节：场景图在后台低优先级作业里抓（每个文件按章节数 seek"
+            " 若干次），详情页章节横排、图廊章节图与 Jellyfin 合成章节都随它开关；"
+            "关闭时文件自带的内嵌章节仍供播放器跳章，已生成的图保留。"
+            "从关改为开会立即在后台补齐库内已有视频的章节，从开改为关会停掉进行中的章节生成。"
+            "不传表示不改动，新建时默认关闭"
+        ),
+    )
+    detect_media_segments: bool | None = Field(
+        default=None,
+        description=(
+            "是否识别剧集的片头片尾（只对剧集库起作用）：每集入库时算一次音频指纹、整季比对，"
+            "播放时给「跳过片头」与提前的「下一集」。从关改为开会在后台补齐库内已有剧集，"
+            "从开改为关会停掉进行中的识别、播放时不再给按钮（已算的结果保留）。"
             "不传表示不改动，新建时默认开启"
         ),
     )
@@ -201,7 +213,7 @@ class LastOrganizeView(BaseModel):
     renamed: int = Field(description="改名归位的主文件数")
     sidecars_renamed: int = Field(description="跟随改名的附属文件数（字幕、分集剧照等）")
     entry_assets_moved: int = Field(
-        default=0, description="跟随条目目录改名的镜像资产数（海报/背景/季海报/条目 NFO）"
+        default=0, description="跟随条目目录改名的镜像资产数（海报/背景/Logo/季海报/条目 NFO）"
     )
     already_ok: int = Field(description="本就符合规范、无需动作的文件数")
     skipped: int = Field(description="计划阶段跳过的文件数（原因见预览）")
@@ -285,7 +297,12 @@ class LibraryView(BaseModel):
     generate_thumbnails: bool = Field(
         default=True, description="缺图时是否抓帧生成缩略图（本地内容封面、TMDB 无剧照的分集）"
     )
-    extract_chapter_images: bool = Field(default=True, description="是否为视频章节抓取场景图")
+    extract_chapter_images: bool = Field(
+        default=False, description="是否生成并展示视频章节（默认关，按库打开）"
+    )
+    detect_media_segments: bool = Field(
+        default=True, description="是否识别剧集的片头片尾（默认开，只对剧集库起作用）"
+    )
     exclude_from_home: bool = Field(default=False, description="是否从首页汇总里排除")
     auto_series_collections: bool = Field(
         default=True, description="是否按作品系列自动生成合集（展示偏好）"
@@ -383,6 +400,7 @@ class LibraryView(BaseModel):
             capabilities=LibraryCapabilitiesView(**capabilities_of(profile_of(row))),
             generate_thumbnails=row.generate_thumbnails,
             extract_chapter_images=row.extract_chapter_images,
+            detect_media_segments=row.detect_media_segments,
             exclude_from_home=row.exclude_from_home,
             auto_series_collections=row.auto_series_collections,
             access_mode=row.access_mode,  # type: ignore[arg-type]
@@ -493,7 +511,16 @@ class CollectionView(BaseModel):
     sort: str = Field(description="合集内默认排序")
     visibility: str = Field(description="household=全家可见 / private=只有我")
     builtin: str | None = Field(default=None, description="内置合集标识；null=用户创建")
-    editable: bool = Field(description="能不能改规则（builtin 为 null 才能）")
+    editable: bool = Field(
+        description="当前观看者能不能改规则与名单（用户创建的合集，且 manageable 为真）"
+    )
+    manageable: bool = Field(
+        default=True,
+        description=(
+            "当前观看者能不能管理这个合集（改名、排序、可见性、隐藏、删除）："
+            "超管恒为真；成员只能管理自己的私有合集与自己建的全家合集"
+        ),
+    )
     rule_driven: bool = Field(description="规则驱动（会自己长）还是名单驱动（固定）")
     item_count: int = Field(description="当前可见成员数")
     cover_item_id: int | None = Field(default=None, description="封面取哪部作品；null=取首个成员")
@@ -852,6 +879,30 @@ class FileOriginView(BaseModel):
     )
 
 
+class TrackDefaultsView(BaseModel):
+    """不经用户操作时会放的音轨 / 字幕（与起播同一口径：本集记着的 > 沿用同剧上一集 >
+    默认轨策略，见 services/playback/track_defaults）。详情页据此标「默认」并说明原因。"""
+
+    audio_track: str | None = Field(
+        default=None, description="将要放的音轨（中性引用 embedded:<k>）；没有音轨为 null"
+    )
+    audio_reason: str = Field(
+        description="remembered 上次换的 / series 沿用上一集 / original_language 影片原声 / "
+        "default_flag 片源标注的默认 / first 第一条 / none 没有音轨"
+    )
+    audio_note: str = Field(description="音轨原因的一句中文，界面直接展示")
+    subtitle_track: str | None = Field(
+        default=None,
+        description="将要开的字幕（embedded:<k> / external:<文件名>）；null = 不开字幕",
+    )
+    subtitle_reason: str = Field(
+        description="remembered / series / library_language 媒体库语言 / forced 强制字幕 / "
+        "same_language_off 原声就是库语言 / no_language_match 没有库语言字幕 / "
+        "external / default_flag / forced_only / none（后四个是没有库语言可比时的旧规则）"
+    )
+    subtitle_note: str = Field(description="字幕原因的一句中文，界面直接展示")
+
+
 class LibraryFileView(BaseModel):
     """条目详情页的一个物理文件（一个版本 / 一集）。"""
 
@@ -900,11 +951,17 @@ class LibraryFileView(BaseModel):
     subtitle_streams: list[SubtitleStreamView] = Field(
         default_factory=list, description="字幕列表：内封轨 + 外挂文件"
     )
+    playback_defaults: TrackDefaultsView | None = Field(
+        default=None,
+        description="当前成员起播时会放的音轨 / 字幕与原因；null = 原盘或尚未探测轨道"
+        "（界面退回按片源标注的默认旗标展示）",
+    )
     # 章节（docs/design/video-chapters.md）：内嵌章节优先，没有就按时长合成。
-    # null = 尚未探测章节（旧行未补探/ffprobe 缺失）；图未生成时 image_url 为 null，
-    # 章节本身仍可用（点击跳播）
+    # null = 所在库没开「生成章节」（默认关），或尚未探测章节（旧行未补探/ffprobe
+    # 缺失）；图未生成时 image_url 为 null，章节本身仍可用（点击跳播）
     chapters: list[ChapterView] | None = Field(
-        default=None, description="有效章节列表（内嵌或按时长合成）；null=尚未探测"
+        default=None,
+        description="有效章节列表（内嵌或按时长合成）；null=所在库未开启「生成章节」或尚未探测",
     )
     added_at: datetime
 
@@ -983,6 +1040,9 @@ class LibraryItemDetailView(BaseModel):
     year: int | None
     poster_url: str | None
     backdrop_url: str | None
+    logo_url: str | None = Field(
+        default=None, description="片名 Logo（透明底 PNG）；没有时前端显示文字片名"
+    )
     primary_aspect: float = Field(default=0.6667, description="主图宽高比（同海报墙）")
     local_meta: LocalMetaView | None = Field(
         default=None, description="NFO 本地刮削元数据；目录里没有可用 NFO 时为 null"
@@ -1002,7 +1062,8 @@ class LibraryItemDetailView(BaseModel):
     scraping: bool = Field(default=False, description="该条目正在后台刮削元数据")
     scraping_phase: str | None = Field(default=None, description="刮削当前阶段；没在刮为 null")
     # 章节场景图懒触发（docs/design/video-chapters.md §4.5）：打开详情页时发现
-    # 有文件没抓过图就后台抓，这里告诉前端"图还在生成"，前端据此轮询几轮
+    # 有文件没抓过图就后台抓，这里告诉前端"图还在生成"，前端据此轮询几轮。
+    # 库没开「生成章节」时恒为 false
     chapters_pending: bool = Field(default=False, description="章节场景图正在后台生成")
     # 所属系列：从影片页直接跳进那个系列合集（《哈利·波特》→ 整个系列）。
     # 只在这个库真的生成了那个合集时给 collection_id——给一个点了 404 的入口
@@ -1086,18 +1147,27 @@ class ArtworkCandidatesView(BaseModel):
 
     posters: list[ArtworkCandidateView] = Field(default_factory=list)
     backdrops: list[ArtworkCandidateView] = Field(default_factory=list)
+    logos: list[ArtworkCandidateView] = Field(
+        default_factory=list, description="片名徽标（透明底 PNG，镜像为 clearlogo.png）"
+    )
     current_poster: str | None = Field(default=None, description="当前在用的海报路径")
     current_backdrop: str | None = Field(default=None, description="当前在用的背景路径")
+    current_logo: str | None = Field(
+        default=None, description="当前在用的徽标路径；null=没有（TMDB 无合适徽标）"
+    )
     poster_locked: bool = Field(default=False, description="海报已手动选定，刷新不覆盖")
     backdrop_locked: bool = Field(default=False, description="背景已手动选定，刷新不覆盖")
+    logo_locked: bool = Field(default=False, description="徽标已手动选定，刷新不覆盖")
 
 
 class ArtworkSelectPayload(BaseModel):
-    """选图请求：kind 指海报还是背景；file_path 为 null 表示恢复自动选图。"""
+    """选图请求：kind 指哪种图；file_path 为 null 表示恢复自动选图。"""
 
-    kind: Literal["poster", "backdrop"] = Field(description="poster=海报 / backdrop=背景图")
+    kind: Literal["poster", "backdrop", "logo"] = Field(
+        description="poster=海报 / backdrop=背景图 / logo=片名徽标"
+    )
     file_path: str | None = Field(
-        default=None, description="TMDB 图片路径；null=解锁并恢复自动选图"
+        default=None, min_length=1, description="TMDB 图片路径；null=解锁并恢复自动选图"
     )
 
 
@@ -1378,7 +1448,10 @@ class UnidentifiedFileView(BaseModel):
     )
     code: str | None = Field(
         default=None,
-        description="失败分类：unparsable / tmdb_unreachable / ambiguous / no_match",
+        description=(
+            "失败分类：unparsable / tmdb_unreachable / ambiguous / no_match / "
+            "kind_mismatch / unit_unresolved"
+        ),
     )
     candidates: list[UnidentifiedCandidateView] = Field(default_factory=list)
 
@@ -1419,8 +1492,9 @@ class ClaimPayload(BaseModel):
 class ClaimBatchPayload(BaseModel):
     """整组认领：一次把多个待识别文件挂到同一个 TMDB 条目。
 
-    季集号不在这里指定——每个文件沿用扫描时已从文件名解析出的季集号，
-    这正是"一部剧几十集一次认领"能成立的前提。
+    季集号默认不在这里指定——每个文件沿用扫描时已从文件名解析出的季集号，
+    这正是"一部剧几十集一次认领"能成立的前提。季号解析不出的一组（待识别
+    分类 ``unit_unresolved``）用 ``season_number`` 统一指定季号，集号照旧沿用。
     """
 
     file_ids: list[int] = Field(
@@ -1430,6 +1504,12 @@ class ClaimBatchPayload(BaseModel):
         min_length=1,
         max_length=160,
         description="Discover 返回的 TMDB 影视条目稳定引用，如 tmdb:tv:1396",
+    )
+    season_number: int | None = Field(
+        default=None,
+        ge=0,
+        le=999,
+        description="整组统一指定的季号（剧集；0=特别篇）；缺省沿用各文件解析出的季号",
     )
 
 
@@ -1686,7 +1766,7 @@ class OrganizePreviewView(BaseModel):
     entry_assets: list[OrganizeSidecarView] = Field(
         default_factory=list,
         description=(
-            "条目目录改名时跟着搬的镜像资产（poster.jpg / fanart.jpg / "
+            "条目目录改名时跟着搬的镜像资产（poster.jpg / fanart.jpg / clearlogo.png / "
             "seasonNN-poster.jpg / movie.nfo / tvshow.nfo）——不搬走旧目录就清不掉"
         ),
     )

@@ -40,8 +40,10 @@ from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
     FileState,
+    Library,
     LibraryFile,
     MediaItem,
+    MediaMetadata,
     RuleSet,
     Subscription,
     WantedItem,
@@ -209,6 +211,7 @@ def test_file_view_parses_generated_subtitle_names() -> None:
     view = _file_view(
         row,
         ["Movie.ai-bilingual-chs-eng.chi.srt", "Movie.pgs-ocr.eng.srt"],
+        chapters_enabled=False,
     )
 
     bilingual, ocr = view.subtitle_streams
@@ -633,6 +636,41 @@ async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
     )
 
 
+async def test_item_detail_logo_url(db, tmp_path) -> None:
+    """详情页片名 Logo：本地资产 > TMDB 图床；logo_path 空串（刮过、没有合适语言
+    的 Logo）与从没刮过一样给 null，客户端回落文字片名。"""
+    root, _entry, _video = _make_movie_entry(tmp_path)
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+    await scan_library(library.id)
+
+    async def detail_logo(logo_path: str | None, logo_file: str | None) -> str | None:
+        async with db.session() as session:
+            item = (await session.execute(select(MediaItem))).scalars().one()
+            item.logo_path = logo_path
+            session.add(item)
+            meta = (
+                await session.execute(
+                    select(MediaMetadata).where(MediaMetadata.media_item_id == item.id)
+                )
+            ).scalar_one_or_none()
+            if meta is None:
+                meta = MediaMetadata(media_item_id=item.id)
+            meta.logo_file = logo_file
+            session.add(meta)
+            await session.commit()
+            return (await get_library_item(library.id, item.id, _ADMIN, session)).data.logo_url
+
+    base = get_settings().tmdb_image_base_url.rstrip("/")
+    assert await detail_logo("/logo.png", None) == f"{base}/w500/logo.png"
+    local = await detail_logo("/logo.png", "1/logo.png")
+    assert local is not None and local.startswith("/images/assets/1/logo.png?v=")
+    assert await detail_logo("", None) is None
+    assert await detail_logo(None, None) is None
+
+
 async def test_item_detail_fills_missing_actor_thumbs_from_archive(db, tmp_path) -> None:
     """NFO 只写了演员姓名（很多刮削器如此，本项目早期版本也是）时，头像按
     姓名从库内档案回填——否则详情页的演职员条是一排空占位。档案里也没有
@@ -911,15 +949,15 @@ async def test_artwork_candidates_mark_current_by_path(db, tmp_path) -> None:
         )
         item_id = item.id
 
-    _p, backdrops, _cp, current_backdrop = await list_artwork_candidates(item_id)
-    assert current_backdrop == "/backdrop.jpg"
-    assert [b["file_path"] for b in backdrops].count("/backdrop.jpg") == 1
+    candidates = await list_artwork_candidates(item_id)
+    assert candidates.current_backdrop == "/backdrop.jpg"
+    assert [b["file_path"] for b in candidates.backdrops].count("/backdrop.jpg") == 1
 
     # 在用的图不在 TMDB 候选里（旧策略选的 / 已下架）：补进首位，仍标得出「当前」
     await select_artwork_for_test(item_id, "/legacy-pick.jpg")
-    _p, backdrops, _cp, current_backdrop = await list_artwork_candidates(item_id)
-    assert current_backdrop == "/legacy-pick.jpg"
-    assert backdrops[0]["file_path"] == "/legacy-pick.jpg"
+    candidates = await list_artwork_candidates(item_id)
+    assert candidates.current_backdrop == "/legacy-pick.jpg"
+    assert candidates.backdrops[0]["file_path"] == "/legacy-pick.jpg"
 
 
 async def select_artwork_for_test(item_id: int, file_path: str) -> None:
@@ -1948,7 +1986,8 @@ async def test_library_refresh_targets_include_fileless_tracked_items(db, tmp_pa
 async def test_library_gallery_flattens_posters_stills_and_chapters(db, tmp_path) -> None:
     """图廊按条目分组铺平：海报 → 剧照 → 逐集（分集剧照 → 该集章节图），
     章节图带起播秒数与季集号；分页按条目数走，与海报墙同口径；每组还带
-    当前观看者的收藏态（瀑布流角标与灯箱的心）。"""
+    当前观看者的收藏态（瀑布流角标与灯箱的心）。章节图只出自开了「生成章节」
+    的库：关掉开关，图还在台账与盘上，图廊里就不再出现。"""
     from movieclaw_api.api.routes.libraries import list_library_gallery
     from movieclaw_api.services.playback import marks as playback_marks
     from movieclaw_playback import state as playback_state
@@ -1960,7 +1999,7 @@ async def test_library_gallery_flattens_posters_stills_and_chapters(db, tmp_path
     (show / "测试剧集.S01E02.1080p.mkv").write_bytes(b"e2")
     async with db.session() as session:
         library = await LibraryRepository(session).create(
-            name="剧集库", kind="tv", root_paths=[str(root)]
+            name="剧集库", kind="tv", root_paths=[str(root)], extract_chapter_images=True
         )
     summary = await scan_library(library.id)
     assert summary.identified == 2
@@ -2015,6 +2054,23 @@ async def test_library_gallery_flattens_posters_stills_and_chapters(db, tmp_path
         assert (
             await list_library_gallery(library.id, 1, 1, "title", session=session, principal=_ADMIN)
         ).data == []
+
+    # 关掉「生成章节」：章节图退出图廊，分集剧照照旧
+    async with db.session() as session:
+        row = await session.get(Library, library.id)
+        assert row is not None
+        row.extract_chapter_images = False
+        await session.commit()
+    async with db.session() as session:
+        off = (
+            await list_library_gallery(
+                library.id, None, 0, "title", session=session, principal=_ADMIN
+            )
+        ).data
+        assert [(i.kind, i.season, i.episode) for i in off[0].images] == [
+            ("still", 1, 1),
+            ("still", 1, 2),
+        ]
 
     async with db.session() as session:
         item_id = groups[0].media_item_id

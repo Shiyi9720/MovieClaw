@@ -103,8 +103,10 @@ async def _existing_ids(model_name: str) -> set[int]:
 
     model = getattr(models, model_name)
     async with get_database().session() as session:
-        rows = await session.exec(select(model.id))
-        return {int(i) for i in rows.all() if i is not None}
+        # get_database().session() 给的是 SQLAlchemy 的 AsyncSession，没有 SQLModel 才有的 .exec；
+        # 以前这里写 .exec，「清理孤儿」在真数据库上一律 500（测试把本函数整个替身了，没测到）
+        rows = await session.execute(select(model.id))
+        return {int(i) for i in rows.scalars().all() if i is not None}
 
 
 def _orphans_by_id(model_name: str) -> EntryProbe:
@@ -207,13 +209,63 @@ DATA_DIRS: tuple[DataDir, ...] = (
         busy=_fonts_with_staging,
     ),
     DataDir(
+        key="cache.audio_fingerprints",
+        title="片头片尾指纹",
+        summary="剧集每一集开头与结尾的声音指纹，用来认出片头片尾",
+        description=(
+            "识别片头片尾时，每集开头 10 分钟、结尾 7 分钟的声音会被算成一份很小的指纹"
+            "（一集约 33 KB），同一季的指纹互相比对就能认出片头片尾。清空后已经认出的片头片尾"
+            "不受影响，播放照常给「跳过片头」；但之后这一季再来新集时，要把旧集重新读一遍"
+            "（每集约 6 秒、几百 MB 的读取），所以只建议在磁盘紧张时清理。"
+        ),
+        default="data/cache/audio-fingerprints",
+        resolve=lambda s: Path(s.audio_fingerprint_dir),
+        group=Group.CACHE,
+        rebuild_cost=RebuildCost.EXPENSIVE,
+        clearable=True,
+        orphans=_orphans_by_id("LibraryFile"),
+        busy=_staging_dirs,
+    ),
+    DataDir(
+        key="cache.reels",
+        title="刷片挑点",
+        summary="刷片为每个文件挑出的片段位置",
+        description=(
+            "刷片（媒体库顶部的竖滑看片段）为每个文件挑出的片段起止位置与预取范围，"
+            "一个文件一份很小的记录。清空后下次刷到这部片会重新读一遍文件索引，"
+            "一部片零点几秒，几乎无感。片段封面图随条目图片存放，不在这里。"
+        ),
+        default="data/cache/reels",
+        resolve=lambda s: Path(s.reels_cache_dir),
+        group=Group.CACHE,
+        rebuild_cost=RebuildCost.CHEAP,
+        clearable=True,
+        orphans=_orphans_by_id("LibraryFile"),
+    ),
+    DataDir(
+        key="cache.playback_cues",
+        title="MKV 精简索引",
+        summary="MKV 片子只含视频关键帧的索引，让手机起播时少下一段数据",
+        description=(
+            "字幕轨多的 MKV 片子，文件尾的索引可能有一两 MB，外网慢时起播要先把它下完。"
+            "服务端从中挑出视频关键帧，存成几 KB 到几十 KB 的精简版，播放时随会话一起发给手机。"
+            "一个文件一份。清空后播放照常，只是再次播放这部片时会在后台重新生成一次（零点几秒）。"
+        ),
+        default="data/cache/playback_cues",
+        resolve=lambda s: Path(s.playback_cues_cache_dir),
+        group=Group.CACHE,
+        rebuild_cost=RebuildCost.CHEAP,
+        clearable=True,
+        orphans=_orphans_by_id("LibraryFile"),
+    ),
+    DataDir(
         key="cache.subtitle_gen",
         title="AI 字幕中间品",
-        summary="AI 字幕生成的 PGS 图片与翻译断点",
+        summary="AI 字幕生成的图片字幕识别结果与翻译断点",
         description=(
-            "AI 字幕生成过程中的 PGS 图片与翻译断点（内封轨的抽取产物在「内封字幕"
-            "缓存」里，与播放器共用）。正在运行的字幕任务所属文件会被跳过；"
-            "已完成任务的中间品可放心清理。"
+            "AI 字幕生成过程中的图片字幕（PGS）识别结果与翻译断点（内封轨的抽取产物，"
+            "包括 PGS 图片，都在「内封字幕缓存」里，与播放器共用）。正在运行的字幕任务"
+            "所属文件会被跳过；已完成任务的中间品可放心清理。"
         ),
         default="data/cache/subtitle_gen",
         resolve=lambda s: Path(s.subtitle_gen_cache_dir),
@@ -270,11 +322,11 @@ DATA_DIRS: tuple[DataDir, ...] = (
     DataDir(
         key="metadata.images",
         title="刮削图片资产",
-        summary="刮削下载的海报、背景，以及本地抽帧的章节图",
+        summary="刮削下载的海报、背景、片名 Logo，以及本地抽帧的章节图",
         description=(
-            "刮削下载的海报、背景与剧照，是媒体库展示的事实源；每个条目目录下的 "
-            "chapters/ 是本地抽帧生成的视频章节图（一部片 8～12 张，约 1MB，可在"
-            "媒体库设置里关掉「生成章节」）。整体重建等于整库刷新元数据（大量外网"
+            "刮削下载的海报、背景、片名 Logo 与剧照，是媒体库展示的事实源；每个条目目录下的 "
+            "chapters/ 是本地抽帧生成的视频章节图（一部片 8～12 张，约 1MB；「生成章节」"
+            "默认关闭，只有在编辑库里打开的库才会产生）。整体重建等于整库刷新元数据（大量外网"
             "流量并受 TMDB 限速），因此只提供清理孤儿条目。"
         ),
         default="data/metadata/images",
