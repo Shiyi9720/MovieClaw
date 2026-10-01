@@ -744,6 +744,12 @@ iOS Safari 是整件事最难的一块：MSE 只有 `ManagedMediaSource` 子集�
   之后本页都走 hls.js。网络层注入坏 init 段验证过：375 毫秒报错 → 改回 hls.js → 同档 tier 1 出画。
 - 只改 HEVC：H.264 在 MSE 上跳转本来就快，还有分片字节数可算码率。字幕走自绘（master 的字幕组用不上），
   与无 MSE 老设备的兜底同一套。模式矩阵与条件见 `lib/player/playback-mode.ts`。
+- **原生 HLS 上不读视频帧**（2026-10-02，用户反馈拖动进度条后黑屏、诊断面板掉帧高，App 与裸 `<video>`
+  都没事）：`drawImage(video)` 抓冻结帧、`requestVideoFrameCallback` 计时，任一样都会让 Safari 给 AVPlayer
+  挂上一路帧输出、挂上就不摘，此后每帧 4K HDR 画面多出一份，解码追不上就丢帧、画面黑到下一个关键帧，
+  声音字幕照走。模拟器真 Safari 录屏逐帧量：同样 8 次拖动，播放器黑 8 次，两样只关一样仍黑 6 次，
+  都不读黑 1 次（与裸 `<video>` 同一处）。于是这条路冻结只盖进度条缩略图（撑到播放头走过落点），
+  首帧以 `playing` 计、跳转落地以 `seeked` 计，判据统一在 `canReadVideoFrames`。
 - 复测：`scripts/perf/web_faultlab` 的 `--browser webkit`（Safari 内核 + 模拟 iPhone）跑 `seeks` 场景，
   结果看服务端播放记录（`rig:seeks`）。注意模拟器的能力探测会说不支持 HEVC / HDR（真机支持），
   服务端会改判转码；要测这条路得把开会话请求里的能力快照换成真机的。
@@ -1223,7 +1229,8 @@ ref——`setChromeVisible(true)` 是异步的，click 回调读到的可能已�
 
 - **TTFF 只能用 `video.requestVideoFrameCallback()`**。`canplay` / `playing` /
   `loadeddata` 全都早于真实出画（有时早几百 ms），用它们量会系统性偏乐观，
-  然后困惑「数据好看但用户说慢」。
+  然后困惑「数据好看但用户说慢」。例外是 iPhone / iPad 的原生 HLS：那里读帧会拖垮
+  4K HDR 播放（§6.4），以 `playing` 计——AVPlayer 的 `playing` 在首帧就绪之后才来，只偏保守。
 - 掉帧：`video.getVideoPlaybackQuality()` 定时采样算增量。
 - 卡顿：配对 `waiting` → `playing` 累计时长，**必须排除 seek 引起的 `waiting`**，
   否则用户拖一下进度条就被记成一次卡顿，数据全废。
