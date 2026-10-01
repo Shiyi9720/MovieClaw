@@ -146,9 +146,11 @@ enum CapabilityProbe {
         process.standardOutput = output
         process.standardError = output
         try process.run()
+        // 先读完再等退出：输出超过管道缓冲（64 KB）时 ffmpeg 会卡在写上，先等退出就是死锁
+        // （`-h full` 有 1 MB 多，实测内核启动时卡死在这里）
+        let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
-            ?? ""
+        let text = String(data: data, encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
             throw ConfigurationError.message("ffmpeg 能力探测失败：\(text.suffix(600))")
         }
