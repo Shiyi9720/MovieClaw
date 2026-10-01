@@ -617,6 +617,10 @@ actor WorkerClient {
                     // 实验开关 eager-prefetch：送出第二块就预取（初版行为，对照用）
                     prefetchAfterBlocks: configuration.labFlags.contains("eager-prefetch")
                         ? 1 : SourceReadProxy.defaultPrefetchAfterBlocks,
+                    // 实验开关 first-run-N：一个请求第一次取 N 块
+                    firstRunBlocks: configuration.labFlags.compactMap { flag in
+                        flag.hasPrefix("first-run-") ? Int(flag.dropFirst("first-run-".count)) : nil
+                    }.first ?? SourceReadProxy.defaultFirstRunBlocks,
                     logRequests: configuration.labFlags.contains("source-log")
                 )
                 let localBaseURL = try await proxy.start()

@@ -246,7 +246,7 @@ actor SourceBlockCache {
 /// 断线续读（`-reconnect`）照常接手；NAS 回的错误码原样转给它。
 final class SourceReadProxy: @unchecked Sendable {
     /// 第一次取几块、之后每次放大几倍、最多几块（8 MiB）。
-    static let firstRunBlocks = 1
+    static let defaultFirstRunBlocks = 1
     static let runGrowth = 4
     static let maxRunBlocks = 32
     /// 送出这么多块之后才开始预取。回环口两头的缓冲能吞下约两块（实测 512 KiB），「送出」不等于
@@ -295,6 +295,7 @@ final class SourceReadProxy: @unchecked Sendable {
     /// 逐请求记日志（实验开关 source-log）：起点、交给 ffmpeg 多少、等了网络多久
     let logRequests: Bool
     let prefetchAfterBlocks: Int
+    let firstRunBlocks: Int
     private let queue: DispatchQueue
     private let listener: NWListener
     private let lock = NSLock()
@@ -310,9 +311,11 @@ final class SourceReadProxy: @unchecked Sendable {
         cache: SourceBlockCache = .shared,
         transientAfterBytes: Int64 = SourceReadProxy.defaultTransientAfterBytes,
         prefetchAfterBlocks: Int = SourceReadProxy.defaultPrefetchAfterBlocks,
+        firstRunBlocks: Int = SourceReadProxy.defaultFirstRunBlocks,
         logRequests: Bool = false
     ) throws {
         self.prefetchAfterBlocks = prefetchAfterBlocks
+        self.firstRunBlocks = max(1, min(firstRunBlocks, SourceReadProxy.maxRunBlocks))
         self.jobID = jobID
         self.origin = origin
         self.cache = cache
@@ -709,7 +712,7 @@ private final class SourceConnection: @unchecked Sendable {
             proxy.record { $0.blocksFetched += (result.data.count + SourceBlockCache.blockSize - 1) / SourceBlockCache.blockSize }
             return result
         }
-        var run = SourceReadProxy.firstRunBlocks
+        var run = proxy.firstRunBlocks
         func grow() {
             run = min(run * SourceReadProxy.runGrowth, SourceReadProxy.maxRunBlocks)
         }
