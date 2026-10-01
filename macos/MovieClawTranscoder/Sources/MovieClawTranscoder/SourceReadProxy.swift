@@ -722,8 +722,8 @@ private final class SourceConnection: @unchecked Sendable {
         /// 取第 `index` 块：手里有、缓存有直接给；要等网络的才把下一次的取量放大
         func load(_ index: Int) async throws -> Data {
             held.removeAll { $0.first + $0.count <= index }
-            for run in held where run.covers(index) {
-                if let data = await run.block(index) {
+            for piece in held where piece.covers(index) {
+                if let data = await piece.block(index) {
                     trace.hits += 1
                     return data
                 }
@@ -732,16 +732,17 @@ private final class SourceConnection: @unchecked Sendable {
                 trace.hits += 1
                 return data
             }
-            guard let run = await cache.run(resource, index: index, count: run, transient: isTransient(index), fetch: fetch) else {
+            let transient = isTransient(index)
+            guard let piece = await cache.run(resource, index: index, count: run, transient: transient, fetch: fetch) else {
                 return try await load(index)
             }
-            held.append(run)
+            held.append(piece)
             grow()
             let waitStarted = Date()
-            _ = try await run.task.value
+            _ = try await piece.task.value
             trace.waits += 1
             trace.waitedMS += Int(Date().timeIntervalSince(waitStarted) * 1000)
-            guard let data = await run.block(index) else { throw URLError(.badServerResponse) }
+            guard let data = await piece.block(index) else { throw URLError(.badServerResponse) }
             return data
         }
 
