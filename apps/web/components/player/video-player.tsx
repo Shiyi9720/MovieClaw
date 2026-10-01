@@ -55,6 +55,7 @@ import {
 import { planAudioOptions } from "@/lib/player/audio-tracks";
 import { chromeMustStayVisible, shouldHideOnPointerLeave } from "@/lib/player/chrome";
 import { createFrameDropTracker } from "@/lib/player/framedrop";
+import { parseSegmentStarts, snapToKeyframe } from "@/lib/player/keyframe-snap";
 import {
   FREEZE_FRAME_MAX_MS,
   canReleaseFreeze,
@@ -559,6 +560,11 @@ export function VideoPlayer(props: VideoPlayerProps) {
    * 每次冻结先清空，只有跳转那条路在冻完之后再设上；null = 照通用判据撤。
    */
   const freezeHoldRef = useRef<number | null>(null);
+  /**
+   * 原生 HLS 的关键帧表（每个分片的起点，秒）：跳转吸附到关键帧用（keyframe-snap.ts）。
+   * 换会话时清空重读；没读到（还在路上 / 读失败）就照原目标跳。
+   */
+  const segmentStartsRef = useRef<number[] | null>(null);
   /**
    * 原生 HLS 跳转时冻结帧的现场（真机黑屏排查，2026-10-02）：抓到的帧亮度、缩略图多久盖上、
    * 多久撤掉。撤的时候作为 freeze-trace 客户端日志报上去；其它引擎不记。
@@ -2389,8 +2395,13 @@ export function VideoPlayer(props: VideoPlayerProps) {
    * 拉一条长连接不值当。没就绪就是没有预览，不影响播放，所以失败一律吞掉；
    * 试满十次（约两分钟）还拿不到就是这部片生成不了，别一直打服务端。
    */
+  // 缩略图接口认的是文件级取流凭证：直出档的视频地址就带着；服务端流（档 1 起）的视频地址是
+  // 会话地址，没有文件号，要改用字幕地址（同样是文件级凭证）。两者都没有就是没有预览
+  const trickplaySource = [state.session?.stream_url, ...(state.session?.subtitle_urls ?? [])].find(
+    (url) => url && /\/files\/\d+\//.test(url),
+  );
   useEffect(() => {
-    const source = state.session?.stream_url;
+    const source = trickplaySource;
     if (!source) return;
     let cancelled = false;
     let attempts = 0;
@@ -2414,7 +2425,25 @@ export function VideoPlayer(props: VideoPlayerProps) {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [state.session?.stream_url]);
+  }, [trickplaySource]);
+
+  /** 原生 HLS：读一遍媒体列表，拿到关键帧表（跳转吸附用，见 segmentStartsRef） */
+  useEffect(() => {
+    segmentStartsRef.current = null;
+    if (mode?.engine !== "native-hls" || !mode.streamUrl) return;
+    let cancelled = false;
+    void fetch(resolveStreamUrl(mode.streamUrl))
+      .then((response) => (response.ok ? response.text() : ""))
+      .then((text) => {
+        if (cancelled) return;
+        const starts = parseSegmentStarts(text);
+        segmentStartsRef.current = starts.length > 1 ? starts : null;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [mode?.engine, mode?.streamUrl]);
 
   /**
    * 会话续命 + 掉线自愈 + 离开时显式收尾。
@@ -2880,7 +2909,11 @@ export function VideoPlayer(props: VideoPlayerProps) {
       // 一次都不会 seek，元素事件永远不来——而会话拆除 + 重开 + ffmpeg
       // 起转正是用户等的那几秒（见 qoe.ts 的 seek-requested）。
       if (plan.kind === "native") {
-        const seconds = Math.max(0, plan.seconds);
+        const requested = Math.max(0, plan.seconds);
+        // 原生 HLS 落在关键帧上：AVPlayer 跳到非关键帧要从前一个关键帧追帧，声音走了画面还黑着
+        // （理由与真机实测见 keyframe-snap.ts）
+        const starts = mode?.engine === "native-hls" ? segmentStartsRef.current : null;
+        const seconds = starts ? snapToKeyframe(starts, requested, video.currentTime) : requested;
         const inFlight = seekAlreadyInFlight({
           currentTimeSeconds: video.currentTime,
           targetSeconds: seconds,
