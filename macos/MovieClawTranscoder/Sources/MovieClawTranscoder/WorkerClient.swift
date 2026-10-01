@@ -554,7 +554,8 @@ actor WorkerClient {
                 let proxy = try ArtifactUploadProxy(
                     jobID: jobID,
                     remoteBaseURL: remoteBaseURL,
-                    segmentSeconds: (message["segment_seconds"] as? NSNumber)?.doubleValue ?? 4
+                    segmentSeconds: (message["segment_seconds"] as? NSNumber)?.doubleValue ?? 4,
+                    startSegment: (message["start_segment"] as? NSNumber)?.intValue
                 ) { [weak self, execution, timeline] event in
                     switch event {
                     case .rejected:

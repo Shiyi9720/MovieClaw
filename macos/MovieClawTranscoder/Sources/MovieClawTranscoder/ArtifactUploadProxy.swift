@@ -243,18 +243,22 @@ final class ArtifactUploadProxy: @unchecked Sendable {
     /// 起播和 seek 这些最怕延迟的时刻。共用后连接可以 keep-alive 复用。
     private let uploadSession: URLSession
 
-    /// 边产出边送时一段多长（NAS 在 job.start 里给，与预生成播放列表同一个栅格）。
+    /// 边产出边送时一段多长、这一轮从第几段起转（NAS 在 job.start 里给，与预生成播放列表
+    /// 同一个栅格）。
     let segmentSeconds: Double
+    let startSegment: Int?
 
     init(
         jobID: String,
         remoteBaseURL: URL,
         segmentSeconds: Double = 4,
+        startSegment: Int? = nil,
         onEvent: (@Sendable (ArtifactEvent) -> Void)? = nil
     ) throws {
         self.jobID = jobID
         self.remoteBaseURL = remoteBaseURL
         self.segmentSeconds = segmentSeconds
+        self.startSegment = startSegment
         self.onEvent = onEvent
         self.queue = DispatchQueue(label: "com.movieclaw.transcoder.artifacts.\(jobID)")
 
@@ -1096,7 +1100,9 @@ final class ProgressiveUpload: @unchecked Sendable {
     private var worker: Task<Void, Never>?
 
     init(proxy: ArtifactUploadProxy, query: String?) {
-        segmenter = FragmentSegmenter(segmentSeconds: proxy.segmentSeconds)
+        segmenter = FragmentSegmenter(
+            segmentSeconds: proxy.segmentSeconds, startSegment: proxy.startSegment
+        )
         let (events, continuation) = AsyncStream<Event>.makeStream()
         self.continuation = continuation
         worker = Task { [weak proxy] in

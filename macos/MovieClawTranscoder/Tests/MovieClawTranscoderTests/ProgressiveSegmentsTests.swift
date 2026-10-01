@@ -7,7 +7,7 @@ final class ProgressiveSegmentsTests: XCTestCase {
     private let timescale: UInt32 = 12_288
 
     func testSplitsFragmentsOnTheSegmentGrid() {
-        var segmenter = FragmentSegmenter(segmentSeconds: 4)
+        var segmenter = FragmentSegmenter(segmentSeconds: 4, startSegment: 150)
         var outputs = segmenter.append(initSegment())
         XCTAssertEqual(outputs.count, 1)
         guard case let .initSegment(initData) = outputs[0] else { return XCTFail("应先产出 init") }
@@ -24,6 +24,22 @@ final class ProgressiveSegmentsTests: XCTestCase {
         // 604 秒的强制关键帧：第 151 段开头（23.976 帧率时会略晚于格点，照样归进这一段）
         outputs = segmenter.append(fragment(pts: 604.04, sync: true))
         XCTAssertEqual(outputs.first.map(segmentInfo), .some(Info(segment: 151, starts: true)))
+    }
+
+    func testFirstSegmentTakesTheNASNumberEvenWhenTheFirstFrameIsEarly() {
+        // 片源 start_time 不为零：-ss 1376 起转、-start_at_zero 平移后第一帧在 1375.993。
+        // 按时间除以 4 会算成第 343 段，播放器要的第 344 段就永远不来了（真机踩过）。
+        // 强制关键帧从第一帧起每 4 秒一个（1379.993……），切点同样从第一帧起算。
+        var segmenter = FragmentSegmenter(segmentSeconds: 4, startSegment: 344)
+        _ = segmenter.append(initSegment())
+        XCTAssertEqual(segmenter.append(fragment(pts: 1375.993, sync: true)).map(segmentInfo),
+                       [Info(segment: 344, starts: true)])
+        XCTAssertEqual(segmenter.append(fragment(pts: 1376.493, sync: false)).map(segmentInfo),
+                       [Info(segment: 344, starts: false)])
+        XCTAssertEqual(segmenter.append(fragment(pts: 1379.993, sync: true)).map(segmentInfo),
+                       [Info(segment: 345, starts: true)])
+        XCTAssertEqual(segmenter.append(fragment(pts: 1383.993, sync: true)).map(segmentInfo),
+                       [Info(segment: 346, starts: true)])
     }
 
     func testHandlesArbitraryByteBoundaries() {

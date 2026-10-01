@@ -31,6 +31,7 @@ from movieclaw_api.exceptions import (
 from movieclaw_api.schemas.base import utc_isoformat
 from movieclaw_api.schemas.library import LibraryGalleryGroupView, SeasonEpisodesView
 from movieclaw_api.schemas.playback import (
+    ClientCapabilityIn,
     FavoritesView,
     HwBackendStatusView,
     HwProbeView,
@@ -1359,6 +1360,18 @@ async def start_playback_session(
         prep=prep_ms,
         spawn=spawn_ms,
     )
+    response_start_ms = resolved_start_ms if segment_plan is not None else start_ms
+    if (
+        segment_plan is not None
+        and transcode.progressive
+        and resolved_start_ms
+        and _capability_consumes_partial_segments(payload.capability)
+    ):
+        # 边产出边送时起播点吸附到所在分片的起点，与播放列表的 EXT-X-START 一致（§5）：
+        # App 挂引擎时会显式 seek 到这个位置，不吸附的话它要等转到续播点那一片
+        response_start_ms = int(
+            segment_plan.boundaries[segment_plan.segment_for(resolved_start_ms / 1000)] * 1000
+        )
     return ok(
         PlaybackSessionView(
             decision=view,
@@ -1372,8 +1385,8 @@ async def start_playback_session(
                 else None
             ),
             # VOD：时间轴是文件绝对时间，start_ms 只是建议起播位置（解析后
-            # 的原值，不必对齐边界——播放器 seek 到毫秒都行）
-            start_ms=resolved_start_ms if segment_plan is not None else start_ms,
+            # 的原值，不必对齐边界——播放器 seek 到毫秒都行；边产出边送时见上）
+            start_ms=response_start_ms,
             timeline="file" if segment_plan is not None else "session",
             subtitle_urls=subtitle_urls,
             hw_backend=hw_used,
@@ -1636,6 +1649,14 @@ async def get_session_diagnostics(
         raise NotFoundException("会话不存在或已结束")
     session.touch()
     return ok(_build_playback_diagnostics(session))
+
+
+def _capability_consumes_partial_segments(capability: ClientCapabilityIn) -> bool:
+    """按开会话时申报的能力判断播放器是不是 AVFoundation（系统 HLS、不走 MSE）。
+
+    开会话的请求是 App 自己的 URLSession 发的，看不出 AVPlayer 的 UA；能力里「原生 HLS、没有 MSE」
+    的只有 iOS App 放服务端流与没有 MSE 的 Safari——都能边收边解（见下面的 UA 判定）。"""
+    return capability.native_hls and capability.mse == "none"
 
 
 def _consumes_partial_segments(request: Request) -> bool:

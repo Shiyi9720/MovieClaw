@@ -2005,3 +2005,38 @@ async def test_partial_segment_response_aborts_without_final_chunk(tmp_path):
     await asyncio.wait_for(task, 2)
     bodies = [m for m in sent if m["type"] == "http.response.body"]
     assert bodies and all(m["more_body"] for m in bodies), "作废的分片不能正常收尾"
+
+
+def test_whole_segment_upload_supersedes_a_half_written_partial(client, tmp_path):
+    """Worker 分块传不下去改成整段重传：写到一半的作废，正式分片是整段的内容。"""
+    grants, endpoint = _progressive_session(client, tmp_path)
+    token = grants["artifact"]
+    assert client.put(f"{endpoint}?token={token}&part=0", content=b"AAA").status_code == 201
+    session = get_session_manager().get(grants["session_id"])
+    assert session is not None
+    half = session.partials[3]
+    assert client.put(f"{endpoint}?token={token}", content=b"WHOLE-SEGMENT").status_code == 201
+    directory = Path(get_settings().transcode_dir) / grants["session_id"]
+    assert (directory / "seg00003.m4s").read_bytes() == b"WHOLE-SEGMENT"
+    assert half.failed and 3 not in session.partials
+    assert not (directory / ".seg00003.m4s.partial").exists()
+
+
+def test_only_avfoundation_clients_get_partial_segments():
+    """边产出边送的半截分片只给 AVFoundation（原生 HLS、没有 MSE）；hls.js 照旧等整段。"""
+    from movieclaw_api.schemas.playback import ClientCapabilityIn
+
+    ios = ClientCapabilityIn(native_hls=True, mse="none")
+    web = ClientCapabilityIn(native_hls=False, mse="full")
+    safari_mse = ClientCapabilityIn(native_hls=True, mse="managed")
+    assert routes_playback._capability_consumes_partial_segments(ios)
+    assert not routes_playback._capability_consumes_partial_segments(web)
+    assert not routes_playback._capability_consumes_partial_segments(safari_mse)
+
+    def request(user_agent: str) -> Request:
+        return Request({"type": "http", "headers": [(b"user-agent", user_agent.encode())]})
+
+    avplayer = "AppleCoreMedia/1.0.0.23A341 (iPhone; U; CPU OS 26_0 like Mac OS X; zh_cn)"
+    chrome = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140.0"
+    assert routes_playback._consumes_partial_segments(request(avplayer))
+    assert not routes_playback._consumes_partial_segments(request(chrome))

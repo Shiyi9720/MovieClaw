@@ -233,8 +233,10 @@ def _job_payload(
         "poster_url": poster_url,
     }
     if session.progressive:
-        # Worker 按这个栅格把片段归到第几段（与预生成播放列表、强制关键帧同一个栅格）
+        # Worker 按这个栅格把片段归到第几段（与预生成播放列表、强制关键帧同一个栅格）：
+        # 第一段就是这一轮的起转分片，之后与 HLS muxer 同样从第一帧起每满一格切一段
         payload["segment_seconds"] = SEGMENT_SECONDS
+        payload["start_segment"] = session.head_segment
     return payload
 
 
@@ -526,6 +528,14 @@ class TranscodeSession:
         )
         if 200 <= status < 300:
             self.mark("landed", name=name, kb=received_bytes // 1024)
+            segment = _segment_index_from_name(name)
+            superseded = self.partials.pop(segment, None) if segment is not None else None
+            if superseded is not None and not superseded.done:
+                # Worker 分块传不下去、改成整段重传了：写到一半的那份作废，跟着它下发的
+                # 连接随之中断，客户端重新请求就拿到这份完整的
+                superseded.failed = True
+                superseded.notify()
+                superseded.path.unlink(missing_ok=True)
         else:
             self.mark("put_fail", name=name, status=status, kb=received_bytes // 1024)
         index = _segment_index_from_name(name)

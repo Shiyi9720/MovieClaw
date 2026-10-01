@@ -875,6 +875,8 @@ class WorkerBlocker:
     def start(self) -> None:
         for _ in range(3):
             wait_idle(self.api, self.worker_id)
+            # 上一次占位转出的分片还在缓存里的话，会话直接读文件、根本不派任务，占不住
+            purge_cache([self.file["file_id"]])
             response = self.api.call(
                 "POST",
                 "/api/v1/playback/sessions",
@@ -916,6 +918,71 @@ class WorkerBlocker:
         if self.session_id:
             self.api.call("DELETE", f"/api/v1/playback/sessions/{self.session_id}")
             self.session_id = None
+
+
+class LocalWorker:
+    """本机的开发版 Worker（无界面模式）：对照实验时按组切换启动参数（``--lab-flags``）。
+
+    两组在同一台 Mac、同一个 ffmpeg 上交替跑，差别只在开关——绝对数字与生产 Worker
+    （Mac mini）不同，但两组之间的差值成立（docs/design/transcode-latency.md §3）。"""
+
+    def __init__(self, args: argparse.Namespace, api: Api) -> None:
+        self.args = args
+        self.api = api
+        self.process: subprocess.Popen | None = None
+        self.flags: str | None = None
+
+    def ensure(self, flags: str) -> None:
+        if self.process is not None and self.process.poll() is None and self.flags == flags:
+            return
+        self.stop()
+        token = Path(self.args.worker_token_file).read_text().strip()
+        command = [
+            self.args.worker_bin,
+            "--headless",
+            "--nas-url",
+            SERVER,
+            "--token",
+            token,
+            "--worker-id",
+            self.args.expect_worker,
+            "--ffmpeg",
+            self.args.worker_ffmpeg,
+            "--max-jobs",
+            "1",
+        ]
+        if flags:
+            command += ["--lab-flags", flags]
+        self.process = subprocess.Popen(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        self.flags = flags
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            worker = worker_status(self.api).get(self.args.expect_worker)
+            # 刚重连的连接 last_seen 很小；旧连接断开前可能还挂着「在线」
+            if worker and worker["online"] and worker["last_seen_seconds"] < 2:
+                time.sleep(0.5)
+                return
+        raise RuntimeError("本机 Worker 30 秒内没有连上 NAS")
+
+    def stop(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self.process.wait(5)
+        self.process = None
+
+
+def parse_arms(text: str) -> list[tuple[str, str]]:
+    """「名字=开关,名字=开关」→ [(名字, 开关)]；开关为空即默认行为（多个开关用 + 连）。"""
+    arms = []
+    for item in text.split(","):
+        name, _, flags = item.partition("=")
+        if name:
+            arms.append((name.strip(), flags.strip().replace("+", ",")))
+    return arms
 
 
 def run_batch(args: argparse.Namespace) -> None:
@@ -977,6 +1044,8 @@ def run_batch(args: argparse.Namespace) -> None:
     proxy.start()
     base = f"http://127.0.0.1:{args.proxy_port}"
     probe = Probe(build_probe())
+    arms = parse_arms(args.arms) if args.arms else [(args.tag, "")]
+    local_worker = LocalWorker(args, api) if args.worker_bin else None
     blocker = None
     if args.block_worker:
         blocker = WorkerBlocker(api, args.block_worker, [e["file_id"] for e in load_corpus("all")])
@@ -992,13 +1061,18 @@ def run_batch(args: argparse.Namespace) -> None:
         for round_index in range(args.rounds):
             order = list(entries)
             random.Random(f"{args.seed}-{round_index}").shuffle(order)
-            for entry in order:
-                for scenario in scenarios:
+            for entry_index, entry in enumerate(order):
+                # 每部片各组都跑一遍，先后轮换（AB / BA），抵消 NAS 页缓存的冷热差
+                turn = arms if (round_index + entry_index) % 2 == 0 else arms[::-1]
+                for (arm, flags), scenario in [(a, sc) for a in turn for sc in scenarios]:
+                    if local_worker is not None:
+                        local_worker.ensure(flags)
                     for _attempt in range(3):
                         try:
                             record = run_one(
                                 api, probe, proxy, entry, scenario, args, base, round_index
                             )
+                            record["arm"] = arm
                         except (TimeoutError, queue.Empty) as error:
                             log(f"  {entry['name'][:40]} {scenario}: 超时（{error}），重启探针")
                             probe.close()
@@ -1018,6 +1092,8 @@ def run_batch(args: argparse.Namespace) -> None:
         probe.close()
         if blocker:
             blocker.stop()
+        if local_worker is not None:
+            local_worker.stop()
         if netem:
             netem.terminate()
         logs = nas_logs(meta["started"] - 5)
@@ -1034,6 +1110,7 @@ def print_line(record: dict) -> None:
     m = record["metrics"]
     parts = [
         f"r{record['round']}",
+        record.get("arm", ""),
         record["scenario"],
         f"{record['category']:<15}",
         record["name"][:28],
@@ -1104,6 +1181,18 @@ def summarize(rows: list[dict]) -> dict[str, dict[str, float]]:
 def report(args: argparse.Namespace) -> None:
     directories = [Path(d) for d in args.dirs]
     batches = [(d.name, load_results(d)) for d in directories]
+    if len(batches) == 1:
+        # 一批里有多个对照组：按组拆开，当成几批来对照（顺序按首次出现）
+        name, rows = batches[0]
+        arms: list[str] = []
+        for row in rows:
+            if row.get("arm", row["tag"]) not in arms:
+                arms.append(row.get("arm", row["tag"]))
+        if len(arms) > 1:
+            batches = [
+                (f"{name}:{arm}", [r for r in rows if r.get("arm", r["tag"]) == arm])
+                for arm in arms
+            ]
     for name, rows in batches:
         print(f"\n== {name}（有效 {len(rows)} 次）")
         for key, value in summarize(rows).items():
@@ -1126,8 +1215,8 @@ def report(args: argparse.Namespace) -> None:
                             f"{statistics.median(values):.0f}"
                         )
                 print(f"    {category:<16} " + " ".join(cells))
-    if len(batches) == 2:
-        (name_a, rows_a), (name_b, rows_b) = batches
+    if len(batches) >= 2:
+        (name_a, rows_a), (name_b, rows_b) = batches[0], batches[1]
         print(f"\n== 对照 {name_a} → {name_b}（按 文件×场景×轮 配对）")
         index_a = {(r["file_id"], r["scenario"], r["round"]): r for r in rows_a}
         for key, label in REPORT_METRICS[:4]:
@@ -1181,6 +1270,12 @@ def main() -> None:
     run.add_argument(
         "--block-worker", default="", help="实验期间占住这台 Worker，让任务落到另一台上"
     )
+    run.add_argument(
+        "--arms", default="", help="对照组：名字=开关,名字=开关（开关传给本机 Worker）"
+    )
+    run.add_argument("--worker-bin", default="", help="本机开发版 Worker 可执行文件（按组重启）")
+    run.add_argument("--worker-token-file", default="")
+    run.add_argument("--worker-ffmpeg", default="")
     rep = sub.add_parser("report", help="汇总 / 对照")
     rep.add_argument("dirs", nargs="+")
     rep.add_argument("--by-category", action="store_true")

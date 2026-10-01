@@ -8,10 +8,13 @@ import Foundation
 /// 每 0.5 秒吐出一个片段（moof + mdat），在这里按 NAS 预生成播放列表的同一个栅格归到第几段，
 /// 一个片段一个片段地回传。AVPlayer 收到一个完整片段就能解码。
 ///
-/// 切段规则：视频轨第一个样本是同步帧、且它的显示时间落进了新的一格，就是新一段的开头。
-/// 分片边界上 NAS 下了强制关键帧（`-force_key_frames expr:gte(t,n_forced*4)`），`frag_keyframe`
-/// 又让每个关键帧另起一个片段，所以分片边界一定是片段边界，不会把一段切在半个片段里。
-/// 编码器自己插的关键帧（场景切换）落在格子中间，不会被当成新的一段。
+/// 切段规则与 ffmpeg 的 HLS muxer 一模一样（这是播放列表与分片对得上的前提）：第一段的编号
+/// 是 NAS 给的起转分片号；之后从这一轮第一帧起算，满一格（4 秒）后的第一个同步帧开新的一段，
+/// 编号顺延。不能拿时间戳直接除以 4 取整：`-force_key_frames expr:gte(t,n_forced*4)` 的 t 是
+/// 从这一轮第一帧起算的（实测从 41 秒起转，关键帧在 41、45、49……），片源 start_time 不为零时
+/// 第一帧也会比格点早一点点——除法会把第一段算成前一个编号，播放器要的那一段永远不来。
+/// `frag_keyframe` 让每个关键帧另起一个片段，所以分片边界一定是片段边界；编码器自己插的关键帧
+/// （场景切换）不满一格，不会被当成新的一段。
 struct FragmentSegmenter {
     enum Output: Equatable {
         /// ftyp + moov：HLS 的 init.mp4
@@ -21,6 +24,8 @@ struct FragmentSegmenter {
     }
 
     let segmentSeconds: Double
+    /// 这一轮从第几段起转（NAS 在 job.start 里给）；没给时按第一帧的时间四舍五入
+    let startSegment: Int?
     /// 单个顶层盒子的上限：防止坏数据让缓冲无限长（正常片段远小于此）
     static let maxBoxBytes = 256 * 1024 * 1024
 
@@ -33,9 +38,12 @@ struct FragmentSegmenter {
     private var leadingFragments = Data()
     private(set) var currentSegment: Int?
     private(set) var failure: String?
+    /// 这一轮第一帧的显示时间，与第一段的编号：之后的切点都从它起算
+    private var runStart: (pts: Double, segment: Int)?
 
-    init(segmentSeconds: Double) {
+    init(segmentSeconds: Double, startSegment: Int? = nil) {
         self.segmentSeconds = segmentSeconds
+        self.startSegment = startSegment
     }
 
     /// 喂进一段字节，返回这一段里凑齐的产出（init 或片段）。
@@ -90,20 +98,27 @@ struct FragmentSegmenter {
     /// 片段归到第几段；还没见到视频（只有音频的开头片段）时先攒着，返回 nil。
     private mutating func place(moof: Data, fragment: Data) -> Output? {
         let video = videoTiming(in: moof)
-        if let video, video.isSync || currentSegment == nil {
-            let index = Int((video.pts / segmentSeconds + 1e-6).rounded(.down))
-            if index != currentSegment {
-                currentSegment = index
-                // 第一段把视频之前攒下的片段一起带上（第一个视频片段若不是同步帧——
-                // 不该发生——也按时间归段，照样当作这一段的开头）
-                let data = leadingFragments + fragment
-                leadingFragments = Data()
-                return .fragment(segment: index, data: data, startsSegment: true)
+        guard let start = runStart else {
+            guard let video else {
+                leadingFragments.append(fragment)
+                return nil
             }
+            // 这一轮的第一个视频片段：第一段的开头，视频之前攒下的片段一起带上
+            let index = startSegment ?? Int((video.pts / segmentSeconds).rounded())
+            runStart = (video.pts, index)
+            currentSegment = index
+            let data = leadingFragments + fragment
+            leadingFragments = Data()
+            return .fragment(segment: index, data: data, startsSegment: true)
         }
-        guard let current = currentSegment else {
-            leadingFragments.append(fragment)
-            return nil
+        guard let current = currentSegment else { return nil }
+        if let video, video.isSync {
+            // 与 HLS muxer 同一条：从这一轮第一帧起，满 n 格后的第一个同步帧开第 n 段
+            let due = start.pts + Double(current - start.segment + 1) * segmentSeconds - 0.001
+            if video.pts >= due {
+                currentSegment = current + 1
+                return .fragment(segment: current + 1, data: fragment, startsSegment: true)
+            }
         }
         return .fragment(segment: current, data: fragment, startsSegment: false)
     }
