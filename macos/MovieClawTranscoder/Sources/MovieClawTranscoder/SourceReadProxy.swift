@@ -245,14 +245,16 @@ actor SourceBlockCache {
 /// ffmpeg 看到的是一个普通的、支持 Range 的 HTTP 源。中途出错就断开这条连接，ffmpeg 自己的
 /// 断线续读（`-reconnect`）照常接手；NAS 回的错误码原样转给它。
 final class SourceReadProxy: @unchecked Sendable {
-    /// 第一次取几块、之后每次放大几倍、最多几块（8 MiB）。
-    static let defaultFirstRunBlocks = 1
+    /// 第一次取几块、之后每次放大几倍、最多几块（8 MiB）。第一次只取 1 块：取数整段到齐才交出，
+    /// 首次取 1 MiB 时从头起播稳定慢 80 毫秒；原盘二分查找每步省下的那次等待，并行多取后几块
+    /// 也拿不稳（冷读两路并发互相拖慢，p90 反而变差），实验台对照见设计文档 §6.4。
+    static let firstRunBlocks = 1
     static let runGrowth = 4
     static let maxRunBlocks = 32
     /// 送出这么多块之后才开始预取。回环口两头的缓冲能吞下约两块（实测 512 KiB），「送出」不等于
     /// ffmpeg 读了；二分查找每一步要读 0.5～1 MB（凑够一帧视频），读完就跳走，过早预取的
     /// 4 + 8 MB 全白取，还跟下一步抢带宽。送出 6 块时 ffmpeg 至少读走了 1 MB，是真在顺序读。
-    static let defaultPrefetchAfterBlocks = 6
+    static let prefetchAfterBlocks = 6
     /// 一个请求顺序读过这么多之后取的块算「过路」（转码主读），记进过路块的份额
     static let defaultTransientAfterBytes: Int64 = 16 * 1024 * 1024
 
@@ -294,8 +296,6 @@ final class SourceReadProxy: @unchecked Sendable {
     let transientAfterBytes: Int64
     /// 逐请求记日志（实验开关 source-log）：起点、交给 ffmpeg 多少、等了网络多久
     let logRequests: Bool
-    let prefetchAfterBlocks: Int
-    let firstRunBlocks: Int
     private let queue: DispatchQueue
     private let listener: NWListener
     private let lock = NSLock()
@@ -310,12 +310,8 @@ final class SourceReadProxy: @unchecked Sendable {
         origin: URL,
         cache: SourceBlockCache = .shared,
         transientAfterBytes: Int64 = SourceReadProxy.defaultTransientAfterBytes,
-        prefetchAfterBlocks: Int = SourceReadProxy.defaultPrefetchAfterBlocks,
-        firstRunBlocks: Int = SourceReadProxy.defaultFirstRunBlocks,
         logRequests: Bool = false
     ) throws {
-        self.prefetchAfterBlocks = prefetchAfterBlocks
-        self.firstRunBlocks = max(1, min(firstRunBlocks, SourceReadProxy.maxRunBlocks))
         self.jobID = jobID
         self.origin = origin
         self.cache = cache
@@ -712,7 +708,7 @@ private final class SourceConnection: @unchecked Sendable {
             proxy.record { $0.blocksFetched += (result.data.count + SourceBlockCache.blockSize - 1) / SourceBlockCache.blockSize }
             return result
         }
-        var run = proxy.firstRunBlocks
+        var run = SourceReadProxy.firstRunBlocks
         func grow() {
             run = min(run * SourceReadProxy.runGrowth, SourceReadProxy.maxRunBlocks)
         }
@@ -789,8 +785,8 @@ private final class SourceConnection: @unchecked Sendable {
         var index = firstIndex
         while true {
             try Task.checkCancellation()
-            // 预取：ffmpeg 确实在顺序往下读（见 defaultPrefetchAfterBlocks），下一个缺的块在这一段之内就提前去取
-            if index >= firstIndex + proxy.prefetchAfterBlocks,
+            // 预取：ffmpeg 确实在顺序往下读（见 prefetchAfterBlocks），下一个缺的块在这一段之内就提前去取
+            if index >= firstIndex + SourceReadProxy.prefetchAfterBlocks,
                let next = await nextMissing(from: index + 1, limit: min(lastBlock + 1, index + 1 + run))
             {
                 if let ahead = await cache.run(resource, index: next, count: run, transient: isTransient(next), fetch: fetch) {
