@@ -15,12 +15,16 @@
    放在**独立子进程**里跑（``python -m movieclaw_playback.skip_segments``）——放在服务
    进程里会抢 GIL、拖慢同时在跑的接口与取流（2026-09-30 实测：同进程纯 Python 计算让
    查库慢几百倍，独立进程零影响）。
-3. **什么时候做**：
-   - 入库（``enqueue_ingested_item``）：新集落位后排一份条目作业，读的是刚下载完的文件；
-   - 扫描收尾 / 打开开关（``enqueue_library_job``）：整库补缺，低优先级、可让路；
-   - 开播（``schedule_playback_bump``）：播到的这一季还没算过 → 排一份优先的条目作业，
-     这一集多半赶不上，下一集就有了。**不做边播边算**：ffmpeg 的 chromaprint 要读完
-     整段才出结果，分块办法实测边界偏 2.6 秒、短段会丢（设计文档 §2.5）。
+3. **什么时候做**（每个入口都先查「有没有待办」，没有就什么都不排）：
+   - 入库（``enqueue_ingested_item``）：新集落位后排一份条目作业，读的是刚下载完的本地文件。
+     不让路，但一次最多读 ``PRIORITY_BATCH`` 个文件，整季积压留给整库回填；
+   - 扫描作业收尾、监听触发的增量扫描、暂缓文件的补扫、打开开关
+     （都走 ``enqueue_after_library_change``）：整库补缺，低优先级，**有人在看片就暂停**
+     （``playback_active``）——它连续读片库所在的磁盘，和正在播的片子抢同一份 IO；
+   - 开播（``schedule_playback_bump``）：播到的这一集没有片段 → 20 秒后排一份条目作业，
+     先算离正在看的这一集最近的几集。这一集多半赶不上，下一集就有了。**不做边播边算**：
+     ffmpeg 的 chromaprint 要读完整段才出结果，分块办法实测边界偏 2.6 秒、短段会丢
+     （设计文档 §2.5）。
 
 不在范围内的：电影、「其他」库、第 0 季（特别篇）、原盘与 strm（没有可读的本地字节）。
 """
@@ -49,7 +53,7 @@ from movieclaw_api.services import foreground, jobs
 from movieclaw_api.services.library.layout import STRM_EXT
 from movieclaw_api.services.playback.session import get_session_manager
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import Library, LibraryFile, MediaSegmentState, utcnow
+from movieclaw_db.models import Library, LibraryFile, MediaItem, MediaSegmentState, utcnow
 from movieclaw_db.models.library_file import DISC_CONTAINERS
 from movieclaw_db.models.playback_state import PlaybackState
 from movieclaw_playback import activity
@@ -316,6 +320,8 @@ async def _chromaprint_window(path: str, start: float, length: float) -> bytes:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         raise
+    if proc.returncode == 0 and not out:
+        raise FingerprintError("音轨太短，算不出指纹")
     if proc.returncode != 0 or not out:
         text = err.decode("utf-8", "replace").strip()
         if "matches no streams" in text or "does not contain any stream" in text:
@@ -330,14 +336,16 @@ async def _chromaprint_window(path: str, start: float, length: float) -> bytes:
 
 
 async def compute_fingerprint(file: LibraryFile) -> None:
-    """算一个文件的片头窗 + 片尾窗指纹，原子写入缓存文件。失败抛 ``FingerprintError``。"""
+    """算一个文件的片头窗 + 片尾窗指纹，原子写入缓存文件。失败抛 ``FingerprintError``。
+
+    **调用方要持有 ffmpeg 槽**（``_slot("ffmpeg")``）：全进程一次只读一个文件，护住 NAS 的读盘。
+    """
     assert file.id is not None
     duration = float(file.duration_seconds or 0)
     bounds = window_bounds(duration)
     windows: dict[str, bytes] = {}
-    async with _slot("ffmpeg"):
-        for name, (start, length) in bounds.items():
-            windows[name] = await _chromaprint_window(file.file_path, start, length)
+    for name, (start, length) in bounds.items():
+        windows[name] = await _chromaprint_window(file.file_path, start, length)
     meta = {
         "file_id": file.id,
         "size": file.size_bytes,
@@ -449,6 +457,41 @@ async def _run_detection(episodes: list[dict[str, Any]]) -> dict[str, Any]:
     return json.loads(out)
 
 
+async def _fingerprint_one(file: LibraryFile) -> str:
+    """算一个文件的指纹并把状态写进台账，返回 ``ok`` / ``failed`` / ``skipped``。
+
+    排到 ffmpeg 槽之后**先复查还要不要算**，复查和写状态都在槽里做：同一季有两个作业并行时
+    （入库的条目作业 + 整库回填），前一个可能刚把这个文件算完，后一个手里的清单已经过时了。
+    """
+    assert file.id is not None
+    db = get_database()
+    async with _slot("ffmpeg"):
+        async with db.session() as session:
+            fresh = await session.get(MediaSegmentState, file.id)
+        if not _fingerprint_due(file, fresh):
+            return "skipped"
+        error: str | None = None
+        try:
+            await compute_fingerprint(file)
+        except FingerprintError as exc:
+            error = str(exc)
+            logger.warning("文件 #%s 算不了片头片尾指纹：%s（%s）", file.id, error, file.file_path)
+        async with db.session() as session:
+            row = await session.get(MediaSegmentState, file.id)
+            if row is None:
+                row = MediaSegmentState(library_file_id=file.id)
+            row.fingerprint_status = "failed" if error else "ok"
+            row.error = error
+            row.source_size = file.size_bytes
+            row.fingerprinted_at = None if error else utcnow()
+            # 新指纹进来，这一季要整季重比：先把自己的识别时间清掉
+            row.analyzed_at = None
+            row.updated_at = utcnow()
+            session.add(row)
+            await session.commit()
+    return "failed" if error else "ok"
+
+
 async def analyze_season(
     media_item_id: int,
     season_number: int,
@@ -485,29 +528,10 @@ async def analyze_season(
                 await _wait_until_quiet(context)
         # 前台有请求在等响应就让一步（services/foreground.py）：页面加载的那一两秒里别抢数据库
         await foreground.yield_to_foreground()
-        assert file.id is not None
-        error: str | None = None
-        try:
-            await compute_fingerprint(file)
-        except FingerprintError as exc:
-            error = str(exc)
-            logger.warning("文件 #%s 算不了片头片尾指纹：%s（%s）", file.id, error, file.file_path)
-        async with db.session() as session:
-            row = await session.get(MediaSegmentState, file.id)
-            if row is None:
-                row = MediaSegmentState(library_file_id=file.id)
-            row.fingerprint_status = "failed" if error else "ok"
-            row.error = error
-            row.source_size = file.size_bytes
-            row.fingerprinted_at = None if error else utcnow()
-            # 新指纹进来，这一季要整季重比：先把自己的识别时间清掉
-            row.analyzed_at = None
-            row.updated_at = utcnow()
-            session.add(row)
-            await session.commit()
-        if error:
+        result = await _fingerprint_one(file)
+        if result == "failed":
             outcome.failed += 1
-        else:
+        elif result == "ok":
             outcome.fingerprinted += 1
 
     async with db.session() as session:
@@ -540,16 +564,15 @@ async def analyze_season(
             if row is None:
                 continue
             if int(f.id or 0) in unreadable:
-                # 指纹文件在比对前被清掉了：退回待算，下一轮补上
-                row.fingerprint_status = "pending"
-                row.analyzed_at = None
-            else:
-                segments = results.get(str(f.id), [])
-                row.segments = segments
-                row.algo_version = int(response.get("algo_version") or ALGO_VERSION)
-                row.analyzed_at = now
-                outcome.with_intro += any(s.get("type") == "intro" for s in segments)
-                outcome.with_outro += any(s.get("type") == "outro" for s in segments)
+                # 指纹文件在比对前被清掉 / 读不了（缓存管理里清空过，本次又没轮到重算它）：
+                # 不动它现有的结果——播放照常给原来的片头；它在下次这一季重算指纹时补回
+                continue
+            segments = results.get(str(f.id), [])
+            row.segments = segments
+            row.algo_version = int(response.get("algo_version") or ALGO_VERSION)
+            row.analyzed_at = now
+            outcome.with_intro += any(s.get("type") == "intro" for s in segments)
+            outcome.with_outro += any(s.get("type") == "outro" for s in segments)
             row.updated_at = now
             session.add(row)
         await session.commit()
@@ -618,8 +641,6 @@ async def _bump(media_item_id: int, season_number: int, episode_number: int) -> 
             )
             if not seasons:
                 return
-            from movieclaw_db.models import MediaItem
-
             item = await session.get(MediaItem, media_item_id)
             title = item.title if item is not None else f"条目 #{media_item_id}"
             await enqueue_item_job(
@@ -721,6 +742,19 @@ async def enqueue_after_library_change(library_id: int, *, origin: str = "system
             return False
         await enqueue_library_job(session, library_id, library.name, origin=origin)
     return True
+
+
+async def enqueue_after_scan(library_id: int, summary: object) -> bool:
+    """直接调 ``scan_library`` 的两条路径（监听触发的增量扫描、暂缓文件的补扫）扫完之后调用。
+
+    这一轮真有新文件入账（或待识别的行这轮认出来了）才去查有没有待办：没入账任何东西的扫描
+    （事件抖动、只是某个文件被改过）不该为此多一次数据库查询——监听去抖之后每批都会走到这里。
+    原地换掉片源这类不增加文件的变动，由下一次扫描作业收尾的挂钩接住。
+    ``summary`` 不是真正的扫描结果（测试替身返回 None）时按「没入账」处理，安全。
+    """
+    if not (getattr(summary, "scanned", 0) or getattr(summary, "retried", 0)):
+        return False
+    return await enqueue_after_library_change(library_id)
 
 
 async def enqueue_ingested_item(

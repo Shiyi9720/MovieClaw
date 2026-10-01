@@ -661,3 +661,83 @@ def test_detection_subprocess_inherits_parents_module_search_path(
     assert response["results"] == {} and response["unreadable"] == []
     assert captured["env"] is not None
     assert overlay in captured["env"]["PYTHONPATH"].split(os.pathsep)
+
+
+def test_concurrent_analyses_never_fingerprint_the_same_file_twice(
+    client: TestClient, tmp_path: Path, monkeypatch
+) -> None:
+    """同一季有两个作业并行（入库的条目作业 + 整库回填）：排到 ffmpeg 槽之后要复查还需不需要算，
+    不然前一个刚算完的文件后一个手里过时的清单会让它再读一遍盘。"""
+    ids = call(client, _seed, tmp_path, 4)
+    reads: list[tuple[str, float]] = []
+    real = skip_segments._chromaprint_window
+
+    async def counting(path: str, start: float, length: float) -> bytes:
+        reads.append((path, start))
+        await asyncio.sleep(0.05)
+        return await real(path, start, length)
+
+    monkeypatch.setattr(skip_segments, "_chromaprint_window", counting)
+
+    async def both():
+        return await asyncio.gather(
+            skip_segments.analyze_season(ids["show"], 1),
+            skip_segments.analyze_season(ids["show"], 1),
+        )
+
+    first, second = call(client, both)
+    assert len(reads) == 8, f"4 个文件 × 片头 / 片尾两个窗口，每个只读一次：{len(reads)}"
+    assert first.fingerprinted + second.fingerprinted == 4
+    assert all(s.analyzed_at is not None for s in call(client, _states).values())
+
+
+def test_unreadable_fingerprint_keeps_the_episodes_existing_result(
+    client: TestClient, tmp_path: Path, monkeypatch
+) -> None:
+    """比对时某集的指纹读不了（缓存刚被清、又没轮到重算它）：不能把它已经在用的片段抹掉。"""
+    ids = call(client, _seed, tmp_path)
+    call(client, skip_segments.analyze_season, ids["show"], 1)
+    victim = ids["files"][1]
+    before = start_session(client, victim)["segments"]
+    assert len(before) == 2
+    real = skip_segments._run_detection
+
+    async def detection_that_cannot_read_one(episodes):
+        response = await real(episodes)
+        response["unreadable"] = [victim]
+        response["results"].pop(str(victim), None)
+        return response
+
+    monkeypatch.setattr(skip_segments, "_run_detection", detection_that_cannot_read_one)
+
+    async def force_reanalysis() -> None:
+        async with get_database().session() as session:
+            for file_id in ids["files"]:
+                row = await session.get(MediaSegmentState, file_id)
+                row.analyzed_at = None
+                session.add(row)
+            await session.commit()
+
+    call(client, force_reanalysis)
+    call(client, skip_segments.analyze_season, ids["show"], 1)
+    assert start_session(client, victim)["segments"] == before, "读不了的那一集仍给原来的片头片尾"
+    assert len(start_session(client, ids["files"][0])["segments"]) == 2
+
+
+def test_enqueue_after_scan_only_acts_when_files_were_imported(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """监听触发的增量扫描 / 暂缓补扫直接调 scan_library：只有这一轮真有新文件入账才去看有没有待办。
+    没入账任何东西（事件抖动）、结果不是扫描摘要（测试替身返回 None）都不碰数据库、不排作业。"""
+    ids = call(client, _seed, tmp_path)
+
+    class Summary:
+        scanned = 0
+        retried = 0
+
+    assert call(client, skip_segments.enqueue_after_scan, ids["tv"], None) is False
+    assert call(client, skip_segments.enqueue_after_scan, ids["tv"], Summary()) is False
+    Summary.scanned = 2
+    assert call(client, skip_segments.enqueue_after_scan, ids["tv"], Summary()) is True
+    Summary.scanned, Summary.retried = 0, 1
+    assert call(client, skip_segments.enqueue_after_scan, ids["tv"], Summary()) is True
