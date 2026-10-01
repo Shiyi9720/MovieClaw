@@ -893,19 +893,29 @@ def _progressive_args() -> list[str]:
     - ``frag_keyframe``：每个关键帧另起一个片段——分片边界（强制关键帧）因此总是片段
       边界，Worker 按片段切段不会把一段切在半个片段里；
     - ``frag_duration``：片段最长 0.5 秒（见 ``PROGRESSIVE_FRAGMENT_US``）；
-    - ``empty_moov``：先写只有轨道描述的 moov，它就是 HLS 的 init.mp4；
+    - ``delay_moov``：只有轨道描述的 moov（就是 HLS 的 init.mp4）推迟到第一个片段时才写——
+      不能用 ``empty_moov`` 一开始就写：音轨直通 E-AC-3 / AC-3 时 moov 里的 dec3 / dac3 要从第一
+      个包里解析，提前写 ffmpeg 直接报「Cannot write moov atom before EAC3 packets parsed」退出
+      （实测）。
+      HLS muxer 内部也是这么配的。init 与第一个片段一起到，客户端本来就要两个都拿到才能出画；
     - ``default_base_moof``：片段内偏移相对 moof，单独拿出一个片段也能解析；
     - ``frag_discont``：每个 moof 的 tfdt 写真实时间（与 HLS 那边 Jellyfin 同款的修正）——
       不写的话片段时间从 0 起算，Worker 无从知道它属于第几段；
     - ``skip_sidx``：HLS 用不到 sidx。
 
     ``-method PUT``：与 HLS 产物同一种回传方式，请求体按分块传输边写边送。
+
+    ``-map_chapters -1``：片源带章节（原盘 Remux 常见）时，mp4 muxer 会往 init 里加一条
+    章节文本轨，AVPlayer 拿到就报 -11801「Cannot Complete Action」、一帧不出（对照实验里
+    一部 4K Remux 两个场景全挂，本机复现后确认）。HLS muxer 不把章节交给内部的 mp4 muxer，
+    所以老路从没撞上；章节由播放接口另行下发，用不着它。
     """
     return [
         # 与 HLS 产物同一个单次读写超时：Worker 那头卡住时 ffmpeg 不至于永久阻塞
         "-rw_timeout", str(REMOTE_IO_TIMEOUT_US),
+        "-map_chapters", "-1",
         "-f", "mp4",
-        "-movflags", "+frag_keyframe+empty_moov+default_base_moof+frag_discont+skip_sidx",
+        "-movflags", "+frag_keyframe+delay_moov+default_base_moof+frag_discont+skip_sidx",
         "-frag_duration", str(PROGRESSIVE_FRAGMENT_US),
         "-method", "PUT",
         "-y",

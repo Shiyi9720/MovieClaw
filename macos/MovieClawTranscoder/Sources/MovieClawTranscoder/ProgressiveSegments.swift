@@ -4,7 +4,7 @@ import Foundation
 ///
 /// 为什么不用 ffmpeg 自己的 HLS muxer：它把一整段（4 秒）攒在内存里，转完才写出，播放器
 /// 最早也要等一整段才能出画——转码起播与跳转首帧里最大的一块。改让 ffmpeg 输出分片化 MP4
-/// （`-movflags frag_keyframe+empty_moov+default_base_moof+frag_discont -frag_duration 0.5s`）：
+/// （`-movflags frag_keyframe+delay_moov+default_base_moof+frag_discont -frag_duration 0.5s`）：
 /// 每 0.5 秒吐出一个片段（moof + mdat），在这里按 NAS 预生成播放列表的同一个栅格归到第几段，
 /// 一个片段一个片段地回传。AVPlayer 收到一个完整片段就能解码。
 ///

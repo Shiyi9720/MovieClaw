@@ -736,11 +736,13 @@ def test_progressive_command_streams_fragmented_mp4_to_the_worker():
     assert argv[-1] == "http://10.1.1.5:3000/api/artifacts/stream.mp4?token=artifact"
     assert argv[argv.index("-f", argv.index("-c:v")) + 1] == "mp4"
     movflags = argv[argv.index("-movflags") + 1]
-    for flag in ("frag_keyframe", "empty_moov", "default_base_moof", "frag_discont"):
+    for flag in ("frag_keyframe", "delay_moov", "default_base_moof", "frag_discont"):
         assert flag in movflags
     assert argv[argv.index("-frag_duration") + 1] == "500000"
     assert argv[argv.index("-method") + 1] == "PUT"
     assert "-hls_time" not in argv
+    # 片源章节会变成 init 里的一条文本轨，AVPlayer 拿到就不出画
+    assert argv[argv.index("-map_chapters") + 1] == "-1"
     # 强制关键帧与绝对时间戳照旧：Worker 按同一个 4 秒栅格切段
     assert "expr:gte(t,n_forced*4)" in argv
     assert "-copyts" in argv

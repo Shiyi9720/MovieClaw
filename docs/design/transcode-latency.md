@@ -156,7 +156,7 @@ iOS 引擎的 P57 证实了另一半：AVPlayer 能边收边解一个还没写�
 **做法**：
 
 - **命令**（`ffmpeg_args._progressive_args`）：Worker 申报了 `progressive_segments` 的远程 fMP4 点播任务，不用 HLS muxer，
-  输出一整条分片化 MP4 PUT 给 Worker 的上传代理：`-f mp4 -movflags +frag_keyframe+empty_moov+default_base_moof+frag_discont
+  输出一整条分片化 MP4 PUT 给 Worker 的上传代理：`-f mp4 -movflags +frag_keyframe+delay_moov+default_base_moof+frag_discont
   +skip_sidx -frag_duration 500000`。`frag_discont` 让每个 moof 写真实时间（不写的话片段时间从 0 起算）。
 - **Worker 切段**（`FragmentSegmenter`）：ftyp + moov 就是 init.mp4；片段按与 HLS muxer 一模一样的规则归段——第一段是 NAS 给的
   起转分片号（`start_segment`），之后从这一轮第一帧起每满一格（4 秒）后的第一个同步帧开新的一段。**不能**用时间戳除以 4：

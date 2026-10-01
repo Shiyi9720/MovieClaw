@@ -1,7 +1,7 @@
 import XCTest
 @testable import MovieClawTranscoder
 
-/// 用手搭的 MP4 盒子验证切段：与 ffmpeg `-f mp4 -movflags frag_keyframe+empty_moov+default_base_moof
+/// 用手搭的 MP4 盒子验证切段：与 ffmpeg `-f mp4 -movflags frag_keyframe+delay_moov+default_base_moof
 /// +frag_discont` 的输出同一种结构（ftyp + moov，之后一个个 moof + mdat）。
 final class ProgressiveSegmentsTests: XCTestCase {
     private let timescale: UInt32 = 12_288
