@@ -32,6 +32,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,12 +43,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
 
 from movieclaw_api.core.config import get_settings
-from movieclaw_api.services import jobs
+from movieclaw_api.services import foreground, jobs
 from movieclaw_api.services.library.layout import STRM_EXT
+from movieclaw_api.services.playback.session import get_session_manager
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import Library, LibraryFile, MediaSegmentState, utcnow
 from movieclaw_db.models.library_file import DISC_CONTAINERS
 from movieclaw_db.models.playback_state import PlaybackState
+from movieclaw_playback import activity
 from movieclaw_playback.skip_segments import (
     ALGO_VERSION,
     FINGERPRINT_VERSION,
@@ -64,10 +67,13 @@ ITEM_JOB_TYPE = "media.skip_segments"
 MIN_DURATION_S = 120
 #: 单个窗口的 ffmpeg 超时：600 秒的 4K 片源经 NFS 读要二三十秒，留足余量
 _FFMPEG_TIMEOUT_S = 600.0
-#: 一季识别子进程的超时（78 集的长剧本机两三秒，NAS 慢几倍）
-_DETECT_TIMEOUT_S = 300.0
+#: 一季识别子进程的超时 = 基础 + 每集（78 集的长剧本机约 10 秒，NAS 慢几倍；365 集的日更剧约 70 秒）
+_DETECT_BASE_TIMEOUT_S = 120.0
+_DETECT_TIMEOUT_PER_EPISODE_S = 6.0
 #: 开播后等多久再排作业：让开起播的关键窗口
 _BUMP_DELAY_S = 20.0
+#: 整库回填遇到有人在看片时，每隔多久再看一眼人走了没有
+_QUIET_POLL_S = 10.0
 
 # ---------------------------------------------------------------------------
 # 能力探测与并发槽
@@ -123,10 +129,50 @@ def _slot(name: str) -> asyncio.Semaphore:
     return current[1]
 
 
-def _lower_priority() -> None:
-    """子进程里调低优先级（只在 POSIX 上有意义）。"""
-    with contextlib.suppress(OSError, AttributeError):
-        os.nice(10)
+def _niced(args: list[str]) -> list[str]:
+    """给命令加上 ``nice -n 10`` 前缀：指纹读盘与解码不该抢播放与转码的 CPU / IO。
+
+    不用 ``preexec_fn``：多线程进程里 fork 之后在子进程跑 Python 代码有死锁风险；
+    没有 nice 命令的平台（Windows）原样运行。
+    """
+    nice = shutil.which("nice")
+    return [nice, "-n", "10", *args] if nice else args
+
+
+def playback_active() -> bool:
+    """现在有没有人在看片：有未暂停的播放会话、有仍在服务的取流、或有转码会话在跑。
+
+    数据来自进程内的播放活动注册表（播放器进度上报 + 取流字节计量，Web / iOS / Jellyfin
+    客户端都汇到这里）。整库回填据此让路——它连续几个小时顺序读片库所在的磁盘 / 网络，
+    和正在播的片子抢的是同一份 IO，而「播放不被打扰」比「识别早一小时完成」重要得多。
+    """
+    sessions, meters = activity.snapshot()
+    if any(m.kind == activity.STREAM_KIND_PLAY for m in meters):
+        return True
+    if any(not session.paused for session in sessions):
+        return True
+    return bool(get_session_manager().active())
+
+
+async def _wait_until_quiet(context: jobs.JobContext) -> None:
+    """整库回填专用：有人在看片就暂停，片放完（或暂停播放）后自动继续。
+
+    在处理器里直接等是安全的：调度器的心跳会一直续租约，取消也随时能打断（每轮都查）。
+    入库时的条目作业与开播提队的作业**不等**——前者只读一集刚下载好的本地文件，
+    后者本来就是因为有人开播才排的。
+    """
+    announced = False
+    while playback_active():
+        await context.raise_if_cancelled()
+        if not announced:
+            announced = True
+            logger.info("有人正在看片，片头片尾识别先暂停，看完后自动继续")
+            await context.update_progress(
+                mode="indeterminate",
+                phase="analyzing",
+                message="有人正在看片，片头片尾识别先暂停，看完后自动继续",
+            )
+        await asyncio.sleep(_QUIET_POLL_S)
 
 
 # ---------------------------------------------------------------------------
@@ -246,11 +292,8 @@ async def _chromaprint_window(path: str, start: float, length: float) -> bytes:
         args += ["-ss", f"{start:.3f}"]
     args += ["-i", path, "-t", f"{length:.3f}", "-map", "0:a:0", "-ac", "2"]
     args += ["-f", "chromaprint", "-fp_format", "raw", "-"]
-    kwargs: dict[str, Any] = {}
-    if os.name == "posix":
-        kwargs["preexec_fn"] = _lower_priority
     proc = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs
+        *_niced(args), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=_FFMPEG_TIMEOUT_S)
@@ -269,6 +312,8 @@ async def _chromaprint_window(path: str, start: float, length: float) -> bytes:
             raise FingerprintError("文件没有音轨")
         if "No such file" in text:
             raise FingerprintError("文件读不到（可能已被移走）")
+        if "Invalid data found" in text or "moov atom not found" in text:
+            raise FingerprintError("文件已损坏或不是可识别的视频")
         tail = text.splitlines()[-1] if text else f"ffmpeg 退出码 {proc.returncode}"
         raise FingerprintError(f"音频解码失败：{tail[:200]}")
     return out
@@ -358,10 +403,12 @@ def _fingerprint_due(file: LibraryFile, state: MediaSegmentState | None) -> bool
 
 
 async def _run_detection(episodes: list[dict[str, Any]]) -> dict[str, Any]:
-    """在独立子进程里跑整季比对（见模块说明：不在服务进程里抢 GIL）。"""
-    kwargs: dict[str, Any] = {}
-    if os.name == "posix":
-        kwargs["preexec_fn"] = _lower_priority
+    """在独立子进程里跑整季比对（见模块说明：不在服务进程里抢 GIL）。
+
+    子进程入口自己调低优先级（``movieclaw_playback.skip_segments._main``）。超时随季的
+    集数放大：两两比对的次数与集数成正比，几百集的日更剧在 NAS 上要几分钟。
+    """
+    timeout = _DETECT_BASE_TIMEOUT_S + _DETECT_TIMEOUT_PER_EPISODE_S * len(episodes)
     async with _slot("detect"):
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -370,12 +417,11 @@ async def _run_detection(episodes: list[dict[str, Any]]) -> dict[str, Any]:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **kwargs,
         )
         try:
             out, err = await asyncio.wait_for(
                 proc.communicate(json.dumps({"episodes": episodes}).encode()),
-                timeout=_DETECT_TIMEOUT_S,
+                timeout=timeout,
             )
         except (TimeoutError, asyncio.CancelledError):
             with contextlib.suppress(ProcessLookupError):
@@ -393,10 +439,12 @@ async def analyze_season(
     season_number: int,
     *,
     context: jobs.JobContext | None = None,
+    polite: bool = False,
 ) -> SeasonOutcome:
     """把一季做完：补齐缺的指纹，再整季识别一遍（有新指纹或结果过期时）。
 
     每个文件的指纹单独提交——作业中途被取消、服务重启，已经算好的不会白算。
+    ``polite``：每个文件开读前，有人在看片就先等（整库回填用，见 ``_wait_until_quiet``）。
     """
     db = get_database()
     outcome = SeasonOutcome()
@@ -408,6 +456,10 @@ async def analyze_season(
             continue
         if context is not None:
             await context.raise_if_cancelled()
+            if polite:
+                await _wait_until_quiet(context)
+        # 前台有请求在等响应就让一步（services/foreground.py）：页面加载的那一两秒里别抢数据库
+        await foreground.yield_to_foreground()
         assert file.id is not None
         error: str | None = None
         try:
@@ -622,6 +674,8 @@ async def enqueue_ingested_item(
     """入库落账后给这一部排识别（库关了开关、不是剧集库就什么都不做）。"""
     if library is None or library.kind != "tv" or not library.detect_media_segments:
         return False
+    if not await fingerprint_supported():
+        return False
     await enqueue_item_job(session, media_item_id, title, priority=-5)
     return True
 
@@ -657,13 +711,17 @@ async def apply_library_switch(
                 reason=f"「{library.name}」已关闭「识别片头片尾」，未完成的识别随之取消",
             )
         return
-    if rescan_queued:
+    if rescan_queued or not await fingerprint_supported():
         return
     await enqueue_library_job(session, library.id, library.name, origin=origin)
 
 
 async def _run_seasons(
-    context: jobs.JobContext, seasons: list[tuple[int, int]], *, subject: str
+    context: jobs.JobContext,
+    seasons: list[tuple[int, int]],
+    *,
+    subject: str,
+    polite: bool = False,
 ) -> dict[str, Any]:
     """逐季处理的公共循环（整库与条目作业共用）。断点天然：做完的季不再是「有活要干」。"""
     total = len(seasons)
@@ -671,7 +729,7 @@ async def _run_seasons(
     for index, (item_id, season) in enumerate(seasons, start=1):
         await context.raise_if_cancelled()
         try:
-            outcome = await analyze_season(item_id, season, context=context)
+            outcome = await analyze_season(item_id, season, context=context, polite=polite)
         except (jobs.JobCancelled, asyncio.CancelledError):
             raise
         except Exception:  # noqa: BLE001 —— 一季出错不打断整批
@@ -728,7 +786,7 @@ async def _run_library_job(context: jobs.JobContext, input_data: dict[str, Any])
         if not await fingerprint_supported():
             return {"message": _UNSUPPORTED}
         seasons = await seasons_needing_work(session, library_id=library_id)
-    stats = await _run_seasons(context, seasons, subject=f"媒体库 #{library_id}")
+    stats = await _run_seasons(context, seasons, subject=f"媒体库 #{library_id}", polite=True)
     return {"message": _summary(stats), **stats}
 
 

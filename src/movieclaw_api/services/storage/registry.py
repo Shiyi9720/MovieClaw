@@ -222,6 +222,7 @@ DATA_DIRS: tuple[DataDir, ...] = (
         rebuild_cost=RebuildCost.EXPENSIVE,
         clearable=True,
         orphans=_orphans_by_id("LibraryFile"),
+        busy=_staging_dirs,
     ),
     DataDir(
         key="cache.reels",

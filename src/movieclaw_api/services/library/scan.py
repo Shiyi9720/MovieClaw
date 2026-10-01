@@ -898,10 +898,14 @@ async def _run_scan_job(
     # 片头片尾识别（docs/design/skip-intro.md）：同章节一样走独立的低优先级整库作业，
     # 覆盖扫描新发现的剧集与存量回填；同库已有一份在跑则复用
     if library.kind == "tv" and library.detect_media_segments:
-        from movieclaw_api.services.library.skip_segments import enqueue_library_job
+        from movieclaw_api.services.library.skip_segments import (
+            enqueue_library_job,
+            fingerprint_supported,
+        )
 
-        async with db.session() as session:
-            await enqueue_library_job(session, library_id, library.name)
+        if await fingerprint_supported():
+            async with db.session() as session:
+                await enqueue_library_job(session, library_id, library.name)
     # 扫描改动了台账，上一轮的重复结论可能已经不作数：排一轮重复扫描
     # （docs/design/library-duplicate-files.md §9）。用户打开重复文件页时通常
     # 就已经有新鲜结果，而不必自己先按一次「开始扫描」

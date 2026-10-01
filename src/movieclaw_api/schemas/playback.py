@@ -668,8 +668,11 @@ class PlaybackSessionView(BaseModel):
     #: 场景图用的，画到进度条上就是一排没有信息量的竖条。没有内嵌章节的
     #: 文件这里是空表，进度条照旧干净。
     chapters: list[PlaybackChapterMarkView] = Field(default_factory=list)
-    #: 片头 / 片尾 / 其他可跳过的段（剧集库开了「识别片头片尾」且这一季识别过才有）
-    segments: list[PlaybackSegmentView] = Field(default_factory=list)
+    #: 片头 / 片尾 / 其他可跳过的段（剧集库开了「识别片头片尾」且这一季识别过才有）。
+    #: 新服务端恒为数组（没有就是空表，不会是 null）；声明成可空只为让 App 的生成模型
+    #: 对旧服务端宽容——旧服务端没有这个字段，非可选的字段缺失会让新 App 的整个会话解码失败、
+    #: 连带起不了播
+    segments: list[PlaybackSegmentView] | None = Field(default_factory=list)
     #: 档 0 直出的 MKV：服务端缓存里有精简索引时随会话下发（没有就在后台生成，给下次用）
     matroska_cues: MatroskaCuesView | None = None
 

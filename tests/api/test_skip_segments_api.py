@@ -30,6 +30,8 @@ from movieclaw_db.engine import get_database
 from movieclaw_db.models import FileSource, FileState, LibraryFile, MediaItem, MediaSegmentState
 from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_jellyfin.ids import episode_guid
+from movieclaw_playback import activity
+from movieclaw_playback.events import ClientInfo
 from movieclaw_playback.skip_segments import HASH_SECONDS
 
 _PB = "/api/v1/playback"
@@ -65,9 +67,7 @@ async def fake_window(path: str, start: float, length: float) -> bytes:
     match = re.search(r"E(\d+)", Path(path).name)
     episode = int(match.group(1)) if match else 0
     rng = np.random.default_rng(abs(hash((path, round(start)))) % (2**32))
-    out = rng.integers(0, 2**32, size=int(length / HASH_SECONDS), dtype=np.uint64).astype(
-        np.uint32
-    )
+    out = rng.integers(0, 2**32, size=int(length / HASH_SECONDS), dtype=np.uint64).astype(np.uint32)
     if start == 0:
         i = int(intro_at(episode) / HASH_SECONDS)
         out[i : i + len(_INTRO)] = _INTRO
@@ -272,9 +272,12 @@ def test_switch_off_hides_segments_and_cancels_job(client: TestClient, tmp_path:
     guid = episode_guid(ids["show"], 1, 1)
     assert client.get(f"/MediaSegments/{guid}", params={"ApiKey": token}).json()["Items"] == []
     # 不传字段不改动（老客户端）；重新打开立即恢复（结果保留着）
-    assert client.put(f"/api/v1/libraries/{ids['tv']}", json=payload).json()["data"][
-        "detect_media_segments"
-    ] is False
+    assert (
+        client.put(f"/api/v1/libraries/{ids['tv']}", json=payload).json()["data"][
+            "detect_media_segments"
+        ]
+        is False
+    )
     client.put(f"/api/v1/libraries/{ids['tv']}", json={**payload, "detect_media_segments": True})
     assert len(start_session(client, ids["files"][0])["segments"]) == 2
 
@@ -340,3 +343,75 @@ def test_clearing_fingerprint_cache_recomputes_on_next_analysis(
     call(client, _expire)
     outcome = call(client, skip_segments.analyze_season, ids["show"], 1)
     assert outcome.fingerprinted == 5 and outcome.with_intro == 5
+
+
+class _Ctx:
+    """最小的作业上下文替身：只实现 analyze_season 在作业里会用到的两个方法。"""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def raise_if_cancelled(self) -> None:
+        return None
+
+    async def update_progress(self, **kwargs) -> None:
+        self.messages.append(str(kwargs.get("message")))
+
+
+def test_library_backfill_pauses_while_someone_is_watching(
+    client: TestClient, tmp_path: Path, monkeypatch
+) -> None:
+    """整库回填读的是和播放同一份磁盘：有人在看片（未暂停的会话）就先等，暂停 / 放完后继续。"""
+    ids = call(client, _seed, tmp_path)
+    monkeypatch.setattr(skip_segments, "_QUIET_POLL_S", 0.05)
+    device = ClientInfo(name="测试播放器", device_id="dev-1")
+    unit = (ids["show"], 1, 1)
+    ctx = _Ctx()
+
+    async def scenario():
+        activity.reset()
+        activity.report_progress(
+            "dev-1", member_id=0, client=device, unit=unit, position_ms=1000, paused=False
+        )
+        assert skip_segments.playback_active()
+        task = asyncio.create_task(
+            skip_segments.analyze_season(ids["show"], 1, context=ctx, polite=True)
+        )
+        await asyncio.sleep(0.8)
+        paused_all_along = not task.done() and not list((tmp_path / "fp").glob("*.fp"))
+        # 用户按了暂停：不再算「在看」，回填放行
+        activity.report_progress(
+            "dev-1", member_id=0, client=device, unit=unit, position_ms=1000, paused=True
+        )
+        outcome = await asyncio.wait_for(task, 60)
+        activity.reset()
+        return paused_all_along, outcome
+
+    paused_all_along, outcome = call(client, scenario)
+    assert paused_all_along, "有人在看片时不该读盘算指纹"
+    assert outcome.fingerprinted == 5 and outcome.analyzed
+    assert any("有人正在看片" in m for m in ctx.messages)
+
+
+def test_item_job_and_ingest_never_wait_for_playback(client: TestClient, tmp_path: Path) -> None:
+    """入库与开播提队的条目作业不让路：只读一集刚下载好的文件 / 本来就因为开播才排。"""
+    ids = call(client, _seed, tmp_path)
+    device = ClientInfo(name="测试播放器", device_id="dev-2")
+
+    async def scenario():
+        activity.reset()
+        activity.report_progress(
+            "dev-2",
+            member_id=0,
+            client=device,
+            unit=(ids["show"], 1, 1),
+            position_ms=0,
+            paused=False,
+        )
+        try:
+            return await asyncio.wait_for(skip_segments.analyze_season(ids["show"], 1), 60)
+        finally:
+            activity.reset()
+
+    outcome = call(client, scenario)
+    assert outcome.fingerprinted == 5 and outcome.analyzed
