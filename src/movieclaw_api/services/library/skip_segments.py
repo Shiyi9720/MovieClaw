@@ -419,6 +419,10 @@ async def _run_detection(episodes: list[dict[str, Any]]) -> dict[str, Any]:
     集数放大：两两比对的次数与集数成正比，几百集的日更剧在 NAS 上要几分钟。
     """
     timeout = _DETECT_BASE_TIMEOUT_S + _DETECT_TIMEOUT_PER_EPISODE_S * len(episodes)
+    # 子进程继承当前的模块搜索路径：应用内更新的 overlay 是父进程启动时才加进 sys.path 的，
+    # 不显式传下去，子进程只看得到镜像里那份旧代码（甚至找不到本模块）。
+    # 与 video_cues 的 worker 同款写法
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
     async with _slot("detect"):
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -427,6 +431,7 @@ async def _run_detection(episodes: list[dict[str, Any]]) -> dict[str, Any]:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         try:
             out, err = await asyncio.wait_for(

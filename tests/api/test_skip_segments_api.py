@@ -8,6 +8,7 @@ ffmpeg 的 chromaprint 用替身（按文件路径生成可复现的合成指纹
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 from functools import partial
@@ -237,6 +238,16 @@ def test_season_analysis_feeds_session_and_jellyfin(client: TestClient, tmp_path
         f"/MediaSegments/{guid}", params={"ApiKey": token, "includeSegmentTypes": "Outro"}
     ).json()
     assert [i["Type"] for i in only_outro["Items"]] == ["Outro"]
+    # 查询键任意大小写（ASP.NET 的 query 不区分大小写），多个类型逗号分隔
+    for key in ("includesegmenttypes", "IncludeSegmentTypes"):
+        both = client.get(
+            f"/MediaSegments/{guid}", params={"ApiKey": token, key: "Intro,Outro"}
+        ).json()
+        assert [i["Type"] for i in both["Items"]] == ["Intro", "Outro"], key
+        only_intro = client.get(
+            f"/MediaSegments/{guid}", params={"ApiKey": token, key: "Intro"}
+        ).json()
+        assert [i["Type"] for i in only_intro["Items"]] == ["Intro"], key
     # 特别篇没识别：空 QueryResult
     special = episode_guid(ids["show"], 0, 1)
     assert client.get(f"/MediaSegments/{special}", params={"ApiKey": token}).json()["Items"] == []
@@ -629,3 +640,24 @@ def test_stale_clients_do_not_count_as_watching(client: TestClient, tmp_path: Pa
         activity.reset()
 
     call(client, scenario)
+
+
+def test_detection_subprocess_inherits_parents_module_search_path(
+    client: TestClient, tmp_path: Path, monkeypatch
+) -> None:
+    """应用内更新的 overlay 是父进程启动后才加进 sys.path 的：识别子进程必须显式继承，
+    否则在 overlay 布局里它只看得到镜像里那份旧代码（甚至找不到本模块）。"""
+    overlay = str(tmp_path / "overlay-src")
+    monkeypatch.syspath_prepend(overlay)
+    captured: dict = {}
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    response = call(client, skip_segments._run_detection, [])
+    assert response["results"] == {} and response["unreadable"] == []
+    assert captured["env"] is not None
+    assert overlay in captured["env"]["PYTHONPATH"].split(os.pathsep)
