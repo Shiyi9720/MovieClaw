@@ -24,11 +24,12 @@ struct SourceUpstreamStatus: Error, Sendable {
 /// 按会话的取源路径记（`/sessions/{id}/source`、`/clips/{i}`），同一次播放里的每一轮都能命中；
 /// 换一次播放会话就是另一条路径，不会串。
 ///
-/// 同一块正在取时，后来的请求等同一个结果，不重复取。容量满了按最久未用淘汰，先淘汰
-/// 「过路」的块：一个请求顺序读出十几 MB 之后取的块（转码主读），只用一次；起转那几下跳读
-/// 取的块（文件头、文件尾、索引）留到最后——seek 重启的新一轮要的正是它们。
+/// 同一块正在取时，后来的请求等同一个结果，不重复取。两类块各有份额、各自按最久未用淘汰，
+/// 互不挤占：起转那几下跳读取的块（文件头、文件尾、索引——seek 重启的新一轮要的正是它们），
+/// 与「过路」块（一个请求顺序读出十几 MB 之后取的，转码主读，只用一次）。只有一个总量时，
+/// 前者攒满了会让后者刚取回就被挤掉，主读一秒断一次（2026-10-01 实测）。
 actor SourceBlockCache {
-    static let shared = SourceBlockCache(capacityBytes: 128 * 1024 * 1024)
+    static let shared = SourceBlockCache(probeBytes: 128 * 1024 * 1024, streamBytes: 64 * 1024 * 1024)
     static let blockSize = 256 * 1024
 
     struct Key: Hashable, Sendable {
@@ -44,26 +45,37 @@ actor SourceBlockCache {
     private struct Entry {
         let data: Data
         var lastUse: UInt64
-        /// 过路块（转码主读顺序取的）：容量满了先淘汰
+        /// 过路块（转码主读顺序取的）
         let transient: Bool
     }
 
-    private let capacityBlocks: Int
+    /// 一次在途的取数：覆盖从 `first` 起的 `count` 块
+    private struct Pending {
+        let task: Task<SourceFetchResult, Error>
+        let first: Int
+        let count: Int
+    }
+
+    private let probeCapacity: Int
+    private let streamCapacity: Int
+    private var probeCount = 0
+    private var streamCount = 0
     private var blocks: [Key: Entry] = [:]
     private var infos: [String: Info] = [:]
-    private var inflight: [Key: Task<Void, Error>] = [:]
+    private var inflight: [Key: Pending] = [:]
     private var tick: UInt64 = 0
 
-    init(capacityBytes: Int) {
-        capacityBlocks = max(8, capacityBytes / Self.blockSize)
+    init(probeBytes: Int, streamBytes: Int) {
+        probeCapacity = max(4, probeBytes / Self.blockSize)
+        streamCapacity = max(4, streamBytes / Self.blockSize)
     }
 
     func info(_ resource: String) -> Info? {
         infos[resource]
     }
 
-    /// 缓存里的一块（顺带记一次使用）；没有返回 nil。文件最后一块可能不满。
-    func block(_ resource: String, _ index: Int) -> Data? {
+    /// 缓存里的一块（顺带记一次使用），不去取；没有返回 nil。文件最后一块可能不满。
+    func cached(_ resource: String, _ index: Int) -> Data? {
         let key = Key(resource: resource, index: index)
         guard var entry = blocks[key] else { return nil }
         tick += 1
@@ -87,21 +99,66 @@ actor SourceBlockCache {
         return nil
     }
 
-    /// 保证第 `index` 块在缓存里：已缓存立即返回；正在取就等那一次；否则从它起一次取至多
-    /// `count` 块（碰到已缓存或在取的块、文件尾就截断）。
-    func ensure(
+    /// 一次取数（覆盖从 `first` 起的若干块）。拿着它的人随时能从结果里切出要的块，不依赖缓存还留着：
+    /// 容量紧时刚取回的块可能马上被挤掉，同一请求里接着要的块不该因此重取（曾一份数据取了六遍）。
+    struct FetchRun: Sendable {
+        let first: Int
+        /// 要了几块（文件尾可能不满）
+        let count: Int
+        let task: Task<SourceFetchResult, Error>
+
+        func covers(_ index: Int) -> Bool {
+            index >= first && index < first + count
+        }
+
+        /// 结果里第 `index` 块；取失败或这一段没覆盖到返回 nil。
+        func block(_ index: Int) async -> Data? {
+            guard index >= first, let result = try? await task.value else { return nil }
+            let offset = result.data.startIndex + (index - first) * SourceBlockCache.blockSize
+            guard offset < result.data.endIndex else { return nil }
+            return Data(result.data[offset..<min(offset + SourceBlockCache.blockSize, result.data.endIndex)])
+        }
+    }
+
+    /// 覆盖第 `index` 块的那次取数：正在取就是那一次；没缓存也没在取就从它起取至多 `count` 块
+    /// （碰到已缓存或在取的块、文件尾截断）；已经缓存了返回 nil（用 ``cached(_:_:)``）。
+    func run(
         _ resource: String,
         index: Int,
         count: Int,
         transient: Bool = false,
         fetch: @escaping @Sendable (_ start: Int64, _ end: Int64) async throws -> SourceFetchResult
-    ) async throws {
+    ) -> FetchRun? {
         let key = Key(resource: resource, index: index)
-        if blocks[key] != nil { return }
-        if let pending = inflight[key] {
-            try await pending.value
-            return
+        if blocks[key] != nil { return nil }
+        let pending = inflight[key] ?? startFetch(resource, index: index, count: count, transient: transient, fetch: fetch)
+        return FetchRun(first: pending.first, count: pending.count, task: pending.task)
+    }
+
+    /// 第 `index` 块的数据：缓存里有直接给；否则等覆盖它的那次取数（见 ``run``）。
+    func block(
+        _ resource: String,
+        index: Int,
+        count: Int,
+        transient: Bool = false,
+        fetch: @escaping @Sendable (_ start: Int64, _ end: Int64) async throws -> SourceFetchResult
+    ) async throws -> Data {
+        if let data = cached(resource, index) { return data }
+        guard let run = run(resource, index: index, count: count, transient: transient, fetch: fetch) else {
+            return try await block(resource, index: index, count: count, transient: transient, fetch: fetch)
         }
+        _ = try await run.task.value
+        guard let data = await run.block(index) else { throw URLError(.badServerResponse) }
+        return data
+    }
+
+    private func startFetch(
+        _ resource: String,
+        index: Int,
+        count: Int,
+        transient: Bool,
+        fetch: @escaping @Sendable (_ start: Int64, _ end: Int64) async throws -> SourceFetchResult
+    ) -> Pending {
         var run = 1
         while run < count, firstMissing(resource, from: index + run, limit: index + run + 1) == index + run {
             run += 1
@@ -113,17 +170,21 @@ actor SourceBlockCache {
             end = min(end, size - 1)
         }
         let keys = (0..<run).map { Key(resource: resource, index: index + $0) }
-        // 取回来先落进缓存、再算这一次完成：等同一块的请求醒来时一定读得到。
-        // 这个 Task 继承本 actor 的隔离，网络等待期间不占着 actor。
-        let pending = Task<Void, Error> { [start, end] in
+        // 这个 Task 继承本 actor 的隔离：网络等待期间不占着 actor；取回后先落进缓存、清掉在取
+        // 标记，再算完成——等同一块的请求醒来时缓存与在取表都已一致
+        let task = Task<SourceFetchResult, Error> { [start, end] in
+            defer { self.clearInflight(keys) }
             let result = try await fetch(start, end)
             self.store(result, resource: resource, first: index, transient: transient)
+            return result
         }
+        let pending = Pending(task: task, first: index, count: run)
         for item in keys { inflight[item] = pending }
-        defer {
-            for item in keys { inflight[item] = nil }
-        }
-        try await pending.value
+        return pending
+    }
+
+    private func clearInflight(_ keys: [Key]) {
+        for item in keys { inflight[item] = nil }
     }
 
     private func store(_ result: SourceFetchResult, resource: String, first: Int, transient: Bool) {
@@ -133,26 +194,37 @@ actor SourceBlockCache {
         var index = first
         while offset < data.endIndex {
             let end = min(offset + Self.blockSize, data.endIndex)
+            let key = Key(resource: resource, index: index)
+            if let old = blocks.removeValue(forKey: key) {
+                count(old.transient, -1)
+            }
             tick += 1
-            blocks[Key(resource: resource, index: index)] = Entry(
-                data: Data(data[offset..<end]),
-                lastUse: tick,
-                transient: transient
-            )
+            blocks[key] = Entry(data: Data(data[offset..<end]), lastUse: tick, transient: transient)
+            count(transient, 1)
             offset = end
             index += 1
         }
-        while blocks.count > capacityBlocks,
-              let oldest = blocks.min(by: { evictsBefore($0.value, $1.value) })?.key
-        {
-            blocks.removeValue(forKey: oldest)
-        }
+        evict(transient: transient)
     }
 
-    /// 淘汰顺序：过路块在前，同类里最久未用的在前。
-    private func evictsBefore(_ lhs: Entry, _ rhs: Entry) -> Bool {
-        if lhs.transient != rhs.transient { return lhs.transient }
-        return lhs.lastUse < rhs.lastUse
+    private func count(_ transient: Bool, _ delta: Int) {
+        if transient { streamCount += delta } else { probeCount += delta }
+    }
+
+    /// 这一类超了份额就按最久未用淘汰这一类的块。
+    private func evict(transient: Bool) {
+        let capacity = transient ? streamCapacity : probeCapacity
+        while (transient ? streamCount : probeCount) > capacity {
+            var oldest: (key: Key, lastUse: UInt64)?
+            for (key, entry) in blocks where entry.transient == transient {
+                if oldest == nil || entry.lastUse < oldest!.lastUse {
+                    oldest = (key, entry.lastUse)
+                }
+            }
+            guard let oldest else { return }
+            blocks.removeValue(forKey: oldest.key)
+            count(transient, -1)
+        }
     }
 }
 
@@ -177,8 +249,8 @@ final class SourceReadProxy: @unchecked Sendable {
     static let firstRunBlocks = 1
     static let runGrowth = 4
     static let maxRunBlocks = 32
-    /// 一个请求顺序读过这么多之后取的块算「过路」（转码主读），缓存满了先淘汰
-    static let transientAfterBytes: Int64 = 16 * 1024 * 1024
+    /// 一个请求顺序读过这么多之后取的块算「过路」（转码主读），记进过路块的份额
+    static let defaultTransientAfterBytes: Int64 = 16 * 1024 * 1024
 
     /// 所有任务共用：seek 重启的新一轮直接用上一轮留下的长连接。
     static let session: URLSession = {
@@ -215,6 +287,7 @@ final class SourceReadProxy: @unchecked Sendable {
     /// NAS 的 scheme://host:port（ffmpeg 原本要连的那个）
     let origin: URL
     let cache: SourceBlockCache
+    let transientAfterBytes: Int64
     private let queue: DispatchQueue
     private let listener: NWListener
     private let lock = NSLock()
@@ -224,10 +297,16 @@ final class SourceReadProxy: @unchecked Sendable {
     private var connections: [ObjectIdentifier: SourceConnection] = [:]
     private var stats = Stats()
 
-    init(jobID: String, origin: URL, cache: SourceBlockCache = .shared) throws {
+    init(
+        jobID: String,
+        origin: URL,
+        cache: SourceBlockCache = .shared,
+        transientAfterBytes: Int64 = SourceReadProxy.defaultTransientAfterBytes
+    ) throws {
         self.jobID = jobID
         self.origin = origin
         self.cache = cache
+        self.transientAfterBytes = transientAfterBytes
         queue = DispatchQueue(label: "com.movieclaw.transcoder.source.\(jobID)")
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: 0)!)
@@ -597,14 +676,51 @@ private final class SourceConnection: @unchecked Sendable {
         func grow() {
             run = min(run * SourceReadProxy.runGrowth, SourceReadProxy.maxRunBlocks)
         }
-
-        var position = start
-        if await cache.block(resource, Int(position / blockSize)) == nil {
-            try await cache.ensure(resource, index: Int(position / blockSize), count: run, fetch: fetch)
-            grow()
+        /// 一个请求顺序读过 16 MiB 之后的块算过路块（转码主读）
+        func isTransient(_ index: Int) -> Bool {
+            Int64(index) * blockSize - start >= proxy.transientAfterBytes
         }
+        /// 这个请求手里攥着的取数（当前段与预取段）：按块读时先从它们里切，再看缓存，最后才去取
+        var held: [SourceBlockCache.FetchRun] = []
+        /// 取第 `index` 块：手里有、缓存有直接给；要等网络的才把下一次的取量放大
+        func load(_ index: Int) async throws -> Data {
+            held.removeAll { $0.first + $0.count <= index }
+            for run in held where run.covers(index) {
+                if let data = await run.block(index) { return data }
+            }
+            if let data = await cache.cached(resource, index) { return data }
+            guard let run = await cache.run(resource, index: index, count: run, transient: isTransient(index), fetch: fetch) else {
+                return try await load(index)
+            }
+            held.append(run)
+            grow()
+            _ = try await run.task.value
+            guard let data = await run.block(index) else { throw URLError(.badServerResponse) }
+            return data
+        }
+
+        /// `from` 起第一块：手里没有、缓存里没有、也没人在取（预取从这里开始）
+        func nextMissing(from: Int, limit: Int) async -> Int? {
+            var cursor = from
+            while cursor < limit {
+                if let covering = held.first(where: { $0.covers(cursor) }) {
+                    cursor = covering.first + covering.count
+                    continue
+                }
+                guard let missing = await cache.firstMissing(resource, from: cursor, limit: limit) else { return nil }
+                if held.contains(where: { $0.covers(missing) }) {
+                    cursor = missing
+                    continue
+                }
+                return missing
+            }
+            return nil
+        }
+
+        let firstIndex = Int(start / blockSize)
+        var data = try await load(firstIndex)
         guard let info = await cache.info(resource) else { throw URLError(.badServerResponse) }
-        guard position < info.size else {
+        guard start < info.size else {
             try await respond(status: 416, reason: "Range Not Satisfiable", extraHeaders: ["Content-Range: bytes */\(info.size)"])
             return
         }
@@ -612,40 +728,25 @@ private final class SourceConnection: @unchecked Sendable {
         var head = "HTTP/1.1 206 Partial Content\r\n"
         head += "Content-Type: \(info.contentType ?? "application/octet-stream")\r\n"
         head += "Accept-Ranges: bytes\r\n"
-        head += "Content-Range: bytes \(position)-\(last)/\(info.size)\r\n"
-        head += "Content-Length: \(last - position + 1)\r\n"
+        head += "Content-Range: bytes \(start)-\(last)/\(info.size)\r\n"
+        head += "Content-Length: \(last - start + 1)\r\n"
         head += "Cache-Control: no-store\r\nConnection: close\r\n\r\n"
         try await send(Data(head.utf8))
         headerSent = true
 
         let lastBlock = Int(last / blockSize)
-        var misses = 0
-        while position <= last {
+        var position = start
+        var index = firstIndex
+        while true {
             try Task.checkCancellation()
-            let index = Int(position / blockSize)
-            guard let data = await cache.block(resource, index) else {
-                // 一次取回后又被挤出缓存（极端情况下），连着几次就别空转了
-                misses += 1
-                if misses > 3 { throw URLError(.cannotLoadFromNetwork) }
-                try await cache.ensure(
-                    resource,
-                    index: index,
-                    count: run,
-                    transient: Int64(index) * blockSize - start >= SourceReadProxy.transientAfterBytes,
-                    fetch: fetch
-                )
-                grow()
-                continue
-            }
-            misses = 0
             // 预取：ffmpeg 已经读到第二块往后（顺序读），下一个缺的块在这一段之内就提前去取
-            if index > Int(start / blockSize),
-               let next = await cache.firstMissing(resource, from: index + 1, limit: min(lastBlock + 1, index + 1 + run))
+            if index > firstIndex,
+               let next = await nextMissing(from: index + 1, limit: min(lastBlock + 1, index + 1 + run))
             {
-                let count = run
+                if let ahead = await cache.run(resource, index: next, count: run, transient: isTransient(next), fetch: fetch) {
+                    held.append(ahead)
+                }
                 grow()
-                let transient = Int64(next) * blockSize - start >= SourceReadProxy.transientAfterBytes
-                Task { try? await cache.ensure(resource, index: next, count: count, transient: transient, fetch: fetch) }
             }
             let blockStart = Int64(index) * blockSize
             let from = data.startIndex + Int(position - blockStart)
@@ -654,6 +755,9 @@ private final class SourceConnection: @unchecked Sendable {
             try await send(Data(data[from..<to]))
             proxy.record { $0.blocksServed += 1 }
             position += Int64(to - from)
+            guard position <= last else { return }
+            index += 1
+            data = try await load(index)
         }
     }
 

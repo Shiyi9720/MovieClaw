@@ -32,7 +32,7 @@ final class SourceReadProxyTests: XCTestCase {
         let payload = Self.payload(count: blockSize * 3)
         let upstream = try await FakeSource(payload: payload)
         defer { upstream.stop() }
-        let cache = SourceBlockCache(capacityBytes: 16 * 1024 * 1024)
+        let cache = SourceBlockCache(probeBytes: 16 * 1024 * 1024, streamBytes: 16 * 1024 * 1024)
         let (proxy, local) = try await startProxy(upstream: upstream, cache: cache)
         defer { proxy.stop() }
 
@@ -54,26 +54,58 @@ final class SourceReadProxyTests: XCTestCase {
         XCTAssertEqual(upstream.requestCount, afterFirst)
     }
 
-    func testStreamingBlocksAreEvictedBeforeProbeBlocks() async throws {
-        // 容量 8 块：起转跳读取的 2 块（文件头、文件尾）+ 主读顺序取的 10 块过路块
-        let cache = SourceBlockCache(capacityBytes: blockSize * 8)
-        let size = Int64(blockSize * 100)
-        let fetch: @Sendable (Int64, Int64) async throws -> SourceFetchResult = { start, end in
-            SourceFetchResult(data: Data(count: Int(end - start + 1)), size: size, contentType: nil)
-        }
-        try await cache.ensure("r", index: 0, count: 1, fetch: fetch)
-        try await cache.ensure("r", index: 99, count: 1, fetch: fetch)
+    func testProbeAndStreamingBlocksHaveSeparateQuotas() async throws {
+        // 起转跳读的块（文件头、文件尾）与主读的过路块各 4 块份额：过路块再多也挤不掉头尾，
+        // 头尾攒满了也挤不掉刚取回的过路块（只有一个总量时主读一秒断一次）
+        let cache = SourceBlockCache(probeBytes: blockSize * 4, streamBytes: blockSize * 4)
+        let fetch = Self.zeroFetch(size: Int64(blockSize * 100))
+        _ = try await cache.block("r", index: 0, count: 1, fetch: fetch)
+        _ = try await cache.block("r", index: 99, count: 1, fetch: fetch)
         for index in stride(from: 10, to: 20, by: 2) {
-            try await cache.ensure("r", index: index, count: 2, transient: true, fetch: fetch)
+            _ = try await cache.block("r", index: index, count: 2, transient: true, fetch: fetch)
         }
-        let head = await cache.block("r", 0)
-        let tail = await cache.block("r", 99)
-        let oldestStreaming = await cache.block("r", 10)
-        let newestStreaming = await cache.block("r", 19)
+        let head = await cache.cached("r", 0)
+        let tail = await cache.cached("r", 99)
+        let oldestStreaming = await cache.cached("r", 10)
+        let newestStreaming = await cache.cached("r", 19)
         XCTAssertNotNil(head, "文件头留着给 seek 重启")
         XCTAssertNotNil(tail, "文件尾留着给 seek 重启")
-        XCTAssertNil(oldestStreaming, "过路块先淘汰")
+        XCTAssertNil(oldestStreaming, "过路块超了份额先淘汰自己最旧的")
         XCTAssertNotNil(newestStreaming)
+    }
+
+    func testFetchedBlockIsReturnedEvenIfEvictedRightAway() async throws {
+        // 一次取 8 块、份额只有 4 块：第一块落进缓存就被挤掉，请求它的人照样拿到数据
+        let cache = SourceBlockCache(probeBytes: blockSize * 4, streamBytes: blockSize * 4)
+        let fetch = Self.zeroFetch(size: Int64(blockSize * 100))
+        let data = try await cache.block("r", index: 0, count: 8, transient: true, fetch: fetch)
+        XCTAssertEqual(data.count, blockSize)
+        let evicted = await cache.cached("r", 0)
+        XCTAssertNil(evicted)
+    }
+
+    private static func zeroFetch(size: Int64) -> @Sendable (Int64, Int64) async throws -> SourceFetchResult {
+        { start, end in
+            SourceFetchResult(data: Data(count: Int(end - start + 1)), size: size, contentType: nil)
+        }
+    }
+
+    func testLongSequentialReadFetchesEachBlockOnce() async throws {
+        // 转码主读：一个请求一路顺序读到底，缓存（各 1 MiB）远小于文件（12 MiB）。
+        // 每块只向 NAS 要一次，字节一个不差（曾经刚取回的块被挤掉、主读一秒断一次）
+        let payload = Data((0..<(blockSize * 48)).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ $0 >> 9) })
+        let upstream = try await FakeSource(payload: payload)
+        defer { upstream.stop() }
+        let cache = SourceBlockCache(probeBytes: blockSize * 4, streamBytes: blockSize * 4)
+        let proxy = try SourceReadProxy(
+            jobID: "stream", origin: upstream.origin, cache: cache, transientAfterBytes: Int64(blockSize * 2)
+        )
+        let local = try await proxy.start()
+        defer { proxy.stop() }
+
+        let data = try await read(local, path: upstream.path, start: 0, end: nil)
+        XCTAssertEqual(data, payload)
+        XCTAssertLessThanOrEqual(proxy.currentStats.blocksFetched, 48)
     }
 
     func testUpstreamErrorsAreForwardedAsIs() async throws {
@@ -121,7 +153,7 @@ final class SourceReadProxyTests: XCTestCase {
 
     private func startProxy(
         upstream: FakeSource,
-        cache: SourceBlockCache = SourceBlockCache(capacityBytes: 16 * 1024 * 1024)
+        cache: SourceBlockCache = SourceBlockCache(probeBytes: 16 * 1024 * 1024, streamBytes: 16 * 1024 * 1024)
     ) async throws -> (SourceReadProxy, URL) {
         let proxy = try SourceReadProxy(jobID: "test", origin: upstream.origin, cache: cache)
         return (proxy, try await proxy.start())
