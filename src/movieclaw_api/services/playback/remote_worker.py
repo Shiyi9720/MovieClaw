@@ -93,12 +93,16 @@ class WorkerCapabilities:
     #: Worker 按 4 秒栅格切段，每 0.5 秒一个片段分块回传。旧版 Worker 只认 HLS 产物名，
     #: 只派整段落盘的任务给它。
     progressive_segments: bool = False
+    #: Worker 的 ffmpeg 认的取源选项（``ffmpeg_args.remote_read_options`` 会用到的那几个）
+    read_options: tuple[str, ...] = ()
 
     @property
     def video_caps(self) -> WorkerVideoCaps:
         """命令装配要的那部分（见 ``ffmpeg_args.WorkerVideoCaps``）。"""
         return WorkerVideoCaps(
-            hw_decoders=frozenset(self.hw_decoders), filters=frozenset(self.filters)
+            hw_decoders=frozenset(self.hw_decoders),
+            filters=frozenset(self.filters),
+            read_options=frozenset(self.read_options),
         )
 
 
@@ -279,6 +283,12 @@ class RemoteWorkerRegistry:
         with self._lock:
             connection = self._workers.get(worker_id)
             return connection is not None and self._is_fresh(connection)
+
+    def video_caps(self, worker_id: str | None) -> WorkerVideoCaps | None:
+        """某台在线 Worker 申报的视频能力（原盘清单按它给每段剪辑加取源选项）。"""
+        with self._lock:
+            connection = self._workers.get(worker_id) if worker_id else None
+            return connection.capabilities.video_caps if connection is not None else None
 
     def snapshot(self) -> list[dict[str, Any]]:
         """返回不含令牌的状态，供管理员诊断页使用。"""
@@ -662,6 +672,7 @@ class RemoteWorkerRegistry:
             hw_decoders=names("hw_decoders") or _DEFAULT_HW_DECODERS,
             filters=names("filters") or (),
             progressive_segments=raw.get("progressive_segments") is True,
+            read_options=names("read_options") or (),
         )
 
     @staticmethod

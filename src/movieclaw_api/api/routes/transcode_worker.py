@@ -47,6 +47,7 @@ from movieclaw_api.services.playback.disc_source import disc_source_for_file
 from movieclaw_api.services.playback.ffmpeg_args import (
     REMOTE_IO_TIMEOUT_US,
     REMOTE_RECONNECT_OPTIONS,
+    remote_read_options,
 )
 from movieclaw_api.services.playback.remote_signing import verify_remote_grant
 from movieclaw_api.services.playback.remote_worker import (
@@ -526,9 +527,20 @@ async def transcode_disc_source(
     if disc is None:
         raise NotFoundException("这个远程转码会话的源不是可读的原盘")
     token_query = quote(token or "", safe="")
+    playback_session = get_session_manager().get(session_id)
+    caps = (
+        get_remote_worker_registry().video_caps(playback_session.remote_worker_id)
+        if playback_session is not None
+        else None
+    )
     body = disc.concat_list(
         entry=lambda index, _clip: f"clips/{index}?token={token_query}",
-        options=(("rw_timeout", str(REMOTE_IO_TIMEOUT_US)), *REMOTE_RECONNECT_OPTIONS),
+        options=(
+            ("rw_timeout", str(REMOTE_IO_TIMEOUT_US)),
+            *REMOTE_RECONNECT_OPTIONS,
+            # 每段剪辑打开时不倒着读文件尾估时长、探测阶段按块要（Worker 的 ffmpeg 认才加）
+            *remote_read_options(caps),
+        ),
     )
     return Response(
         content=body,

@@ -780,3 +780,46 @@ def test_registry_reads_progressive_capability():
     assert parse({**base, "progressive_segments": True}).progressive_segments
     assert not parse(base).progressive_segments  # 旧版 Worker 没声明：整段落盘
     assert not parse({**base, "progressive_segments": "yes"}).progressive_segments
+
+
+def test_remote_read_options_only_go_to_workers_that_know_them():
+    """取源选项（docs/design/transcode-latency.md §6）只加 Worker 的 ffmpeg 认得的：
+    未知选项会让 ffmpeg 直接退出。"""
+    from movieclaw_api.services.playback.ffmpeg_args import WorkerVideoCaps
+
+    def command(read_options: frozenset[str]) -> list[str]:
+        return build_hls_command(
+            _transcode_plan(),
+            source_path="http://10.1.1.5:3000/api/source?token=source",
+            session_dir=Path("/data/transcodes/session-a"),
+            start_number=3,
+            hw_backend="videotoolbox",
+            output_base_url="http://10.1.1.5:3000/api/artifacts",
+            output_url_suffix="?token=artifact",
+            worker_caps=WorkerVideoCaps(read_options=read_options),
+        ).argv
+
+    legacy = command(frozenset())
+    assert "-skip_estimate_duration_from_pts" not in legacy
+    assert "-initial_request_size" not in legacy
+
+    argv = command(
+        frozenset({"skip_estimate_duration_from_pts", "multiple_requests", "initial_request_size"})
+    )
+    source = argv.index("-i")
+    for flag in ("-skip_estimate_duration_from_pts", "-multiple_requests", "-initial_request_size"):
+        assert flag in argv[:source], f"{flag} 必须是输入选项"
+    assert argv[argv.index("-initial_request_size") + 1] == str(1024 * 1024)
+
+    # 只认一半：按块要的两项必须成对，缺一项就都不加
+    partial = command(frozenset({"skip_estimate_duration_from_pts", "multiple_requests"}))
+    assert "-skip_estimate_duration_from_pts" in partial
+    assert "-multiple_requests" not in partial
+
+
+def test_registry_reads_read_options_capability():
+    parse = RemoteWorkerRegistry._parse_capabilities
+    base = {"backends": ["videotoolbox"], "encoders": ["h264_videotoolbox"]}
+    caps = parse({**base, "read_options": ["multiple_requests", "initial_request_size"]})
+    assert caps.video_caps.read_options == frozenset({"multiple_requests", "initial_request_size"})
+    assert parse(base).video_caps.read_options == frozenset()

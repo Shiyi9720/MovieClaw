@@ -9,6 +9,9 @@ struct WorkerCapabilities: Sendable {
     var filters: [String] = []
     /// 这台 Mac 的 VideoToolbox 能硬解的片源编码（ffmpeg 编码名）。
     var hwDecoders: [String] = []
+    /// ffmpeg 认得的取源选项（``CapabilityProbe/readOptions``）：NAS 只给认得的加，
+    /// 未知选项会让 ffmpeg 直接退出。
+    var readOptions: [String] = []
 }
 
 enum CapabilityProbe {
@@ -31,13 +34,35 @@ enum CapabilityProbe {
         }
         // 滤镜清单拿不到不影响接单：NAS 当它没有 Metal 滤镜，走 CPU 滤镜的老路
         let filterOutput = (try? execute(ffmpegPath, arguments: ["-hide_banner", "-filters"])) ?? ""
+        // 同理：选项清单拿不到就一个都不申报，NAS 照旧装命令
+        let helpOutput = (try? execute(ffmpegPath, arguments: ["-hide_banner", "-h", "full"])) ?? ""
         return WorkerCapabilities(
             ffmpegVersion: version,
             encoders: encoders,
             backends: backends,
             filters: parseFilters(filterOutput).filter(metalFilters.contains),
-            hwDecoders: hardwareDecoders(ffmpegMajorVersion: majorVersion(of: version))
+            hwDecoders: hardwareDecoders(ffmpegMajorVersion: majorVersion(of: version)),
+            readOptions: parseReadOptions(helpOutput)
         )
+    }
+
+    /// NAS 取源时可能加的输入选项（docs/design/transcode-latency.md §6）：MPEG-TS 打开时不倒着读文件尾
+    /// 估时长、探测阶段按块要并复用连接。`multiple_requests` / `initial_request_size` 是较新的
+    /// ffmpeg 才有的 HTTP 选项（jellyfin-ffmpeg 8.1 有），所以要先问 ffmpeg 自己。
+    static let readOptions: [String] = [
+        "skip_estimate_duration_from_pts", "multiple_requests", "initial_request_size",
+    ]
+
+    /// 从 `ffmpeg -h full` 的输出里挑出认得的取源选项。选项行形如 `  -multiple_requests <boolean> …`。
+    static func parseReadOptions(_ output: String) -> [String] {
+        let declared = Set(
+            output.split(separator: "\n").compactMap { line -> String? in
+                let trimmed = line.drop(while: { $0 == " " })
+                guard trimmed.hasPrefix("-") else { return nil }
+                return trimmed.dropFirst().split(separator: " ", maxSplits: 1).first.map(String.init)
+            }
+        )
+        return readOptions.filter(declared.contains)
     }
 
     /// NAS 装命令时用得上的 Metal 滤镜（jellyfin-ffmpeg 自带）：GPU 缩放、HDR→SDR

@@ -256,6 +256,37 @@ class WorkerVideoCaps:
 
     hw_decoders: frozenset[str] = frozenset()
     filters: frozenset[str] = frozenset()
+    #: Worker 的 ffmpeg 认的取源选项（见 ``remote_read_options``）。旧版 Worker 不申报，
+    #: 当它一个都不认：未知选项会让 ffmpeg 直接退出，宁可少省一点也不能把任务弄挂。
+    read_options: frozenset[str] = frozenset()
+
+
+#: 远程取源时探测阶段每个请求要多少字节（ffmpeg http 的 ``initial_request_size``）。
+#: 开放式 Range（bytes=X-）下 ffmpeg 读完文件头就掐断连接，NAS 却已经推出去十几 MB——
+#: 一次起转要来回读三遍文件头、两遍文件尾，白读约 40 MB（网络挂载的媒体盘尤其贵）。
+#: 按 1 MB 一块要，读多少给多少；探测完之后的顺序读照旧开放式（每块都要一次往返，
+#: 高码率片顺序读时按块要会拖慢吞吐）。
+REMOTE_PROBE_REQUEST_BYTES = 1024 * 1024
+
+
+def remote_read_options(caps: WorkerVideoCaps | None) -> tuple[tuple[str, str], ...]:
+    """远程取源时额外加的输入选项（docs/design/transcode-latency.md §6），只加 Worker 申报认得的。
+
+    - ``skip_estimate_duration_from_pts``：MPEG-TS（原盘 m2ts、广电录像）打开时 ffmpeg 会从文件尾
+      倒着读、越读越多地找每条流的最后一个时间戳来估时长——原盘实测十七个请求、六百多毫秒，可时长
+      NAS 早就知道（原盘清单里每段都写了 duration）。对 MKV / MP4 不起作用，无害；
+    - ``multiple_requests`` + ``initial_request_size``：探测阶段按块要、复用同一条连接
+      （见上面常量）。
+    """
+    if caps is None:
+        return ()
+    options: list[tuple[str, str]] = []
+    if "skip_estimate_duration_from_pts" in caps.read_options:
+        options.append(("skip_estimate_duration_from_pts", "1"))
+    if {"multiple_requests", "initial_request_size"} <= caps.read_options:
+        options.append(("multiple_requests", "1"))
+        options.append(("initial_request_size", str(REMOTE_PROBE_REQUEST_BYTES)))
+    return tuple(options)
 
 
 #: VideoToolbox 命令的三种形态（见 ``_videotoolbox_mode``）。
@@ -527,6 +558,10 @@ def build_hls_command(
         # 只重试网络错误，不重试 HTTP 4xx——会话已结束时源地址返回 404，该停就停。
         for key, value in REMOTE_RECONNECT_OPTIONS:
             argv += [f"-{key}", value]
+        if input_format != "concat":
+            # 原盘清单里每段剪辑各自带（见 transcode_worker 的清单接口），这里只管单个源文件
+            for key, value in remote_read_options(worker_caps):
+                argv += [f"-{key}", value]
     if input_format == "concat":
         # -safe 0：清单里是绝对路径（默认的 safe 模式只认相对路径）
         argv += ["-f", "concat", "-safe", "0"]

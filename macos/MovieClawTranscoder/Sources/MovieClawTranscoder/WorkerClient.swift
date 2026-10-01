@@ -328,6 +328,9 @@ actor WorkerClient {
                 // 能边产出边送分片（docs/design/transcode-latency.md §5）：NAS 让 ffmpeg 输出分片化
                 // MP4，这边切段、每 0.5 秒一块回传。旧版服务端忽略这个字段，照旧派整段落盘的任务
                 "progressive_segments": !configuration.labFlags.contains("no-progressive"),
+                // ffmpeg 认得的取源选项：NAS 按它给取源加「不倒着读估时长、探测阶段按块要」
+                "read_options": configuration.labFlags.contains("no-read-options")
+                    ? [] : capabilities.readOptions,
             ],
         ]
         do {
