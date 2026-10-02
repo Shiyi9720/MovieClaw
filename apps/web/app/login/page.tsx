@@ -3,8 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { Route } from "next";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
-import { LockIcon, UserIcon } from "@/components/icons";
+import { CheckIcon, ChevronDownIcon, LockIcon, UserIcon } from "@/components/icons";
 import {
   WelcomeCard,
   WelcomeError,
@@ -69,7 +70,7 @@ export default function LoginPage() {
   const [adding, setAdding] = useState(false);
   const [returning, setReturning] = useState(false);
   const [ready, setReady] = useState(false);
-  // 公开演示站（docs/design/demo-site.md）：登录卡片里列出可一键填入的演示账号
+  // 公开演示站（docs/design/demo-site.md）：身份菜单提供可一键填入的演示账号
   const [demo, setDemo] = useState<DemoSite | null>(null);
   useEffect(() => {
     setAdding(isAddingAccount());
@@ -174,12 +175,24 @@ function LoginCard({
         adding
           ? "登录另一个账号；之后可在用户菜单里一键切换，不用再输密码。"
           : demo
-            ? demo.notice || "这是公开演示站，点下方任一演示账号即可填入。"
+            ? demo.notice || "这是公开演示站，选择演示身份即可填入账号。"
             : "使用你在这台服务器上的账号进入。"
       }
       onClose={onClose}
     >
       <form onSubmit={submit} className="space-y-4">
+        {demo && demo.accounts.length > 0 && (
+          <DemoAccountPicker
+            accounts={demo.accounts}
+            selected={username.trim()}
+            disabled={busy}
+            onPick={(account) => {
+              setUsername(account.username);
+              setPassword(account.password);
+              setError(null);
+            }}
+          />
+        )}
         <WelcomeFields>
           <WelcomeField
             ref={usernameRef}
@@ -218,63 +231,91 @@ function LoginCard({
           {busy ? "正在登录…" : adding ? "添加并切换" : "登录"}
         </WelcomeSubmit>
       </form>
-      {demo && demo.accounts.length > 0 && (
-        <DemoAccountList
-          accounts={demo.accounts}
-          selected={username.trim()}
-          onPick={(account) => {
-            setUsername(account.username);
-            setPassword(account.password);
-            setError(null);
-          }}
-        />
-      )}
     </WelcomeCard>
   );
 }
 
 /**
- * 公开演示站的账号清单：点一行把账号密码填进表单（不自动提交，访客看得见自己用的是
- * 哪个角色）。账号密码本就公开在这里，所以直接明文展示，方便在 App 里照着输。
+ * 演示身份选择：折叠菜单让小屏登录卡片保持紧凑，展开时说明各角色的可见范围。
+ * 选择只填表单、不自动登录；当前身份的公开凭据留在一行提示里，方便在 App 中照着输。
+ * 复用 Radix 的单选菜单处理焦点、键盘与弹层避让，不额外实现一套下拉交互。
  */
-function DemoAccountList({
+function DemoAccountPicker({
   accounts,
   selected,
+  disabled,
   onPick,
 }: {
   accounts: DemoAccount[];
   selected: string;
+  disabled: boolean;
   onPick: (account: DemoAccount) => void;
 }) {
+  const current = accounts.find((account) => account.username === selected);
   return (
-    <div className="mt-5">
-      <p className="mb-2 px-1 text-sub text-[var(--text-muted)]">演示账号 · 点一下自动填入</p>
-      <ul className="divide-y divide-white/[0.08] overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.05]">
-        {accounts.map((account) => (
-          <li key={account.username}>
-            <button
-              type="button"
-              onClick={() => onPick(account)}
-              aria-pressed={selected === account.username}
-              className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left transition-colors hover:bg-white/[0.06] aria-pressed:bg-white/[0.08]"
+    <div>
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger asChild>
+          <button
+            type="button"
+            disabled={disabled}
+            aria-label="选择演示身份"
+            className="flex min-h-[50px] w-full items-center gap-3 rounded-2xl border border-white/[0.12] bg-white/[0.06] px-3.5 text-left transition-colors hover:bg-white/[0.10] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-strong)] disabled:opacity-40"
+          >
+            <UserIcon aria-hidden="true" className="size-[18px] shrink-0 text-[var(--text-muted)]" />
+            <span className="flex-1 text-body text-[var(--text)]">
+              {current?.label ?? "选择演示身份"}
+            </span>
+            {current && <span className="text-sub text-[var(--text-muted)]">切换</span>}
+            <ChevronDownIcon aria-hidden="true" className="size-4 text-[var(--text-muted)]" />
+          </button>
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            align="start"
+            sideOffset={8}
+            collisionPadding={16}
+            className="menu-surface z-[100] max-h-[var(--radix-dropdown-menu-content-available-height)] w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-2xl p-1.5"
+          >
+            <DropdownMenu.RadioGroup
+              value={current?.username ?? ""}
+              onValueChange={(value) => {
+                const account = accounts.find((item) => item.username === value);
+                if (account) onPick(account);
+              }}
             >
-              <span className="min-w-0 flex-1">
-                <span className="block text-body text-[var(--text)]">{account.label}</span>
-                {account.description && (
-                  <span className="line-clamp-2 block text-sub text-[var(--text-faint)]">
-                    {account.description}
+              {accounts.map((account) => (
+                <DropdownMenu.RadioItem
+                  key={account.username}
+                  value={account.username}
+                  className="flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2.5 outline-none data-[highlighted]:bg-white/[0.08] data-[state=checked]:bg-white/[0.05]"
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-body text-[var(--text)]">{account.label}</span>
+                    {account.description && (
+                      <span className="mt-0.5 line-clamp-2 text-sub leading-snug text-[var(--text-muted)]">
+                        {account.description}
+                      </span>
+                    )}
                   </span>
-                )}
-              </span>
-              <span className="shrink-0 text-right font-mono text-sub leading-snug text-[var(--text-muted)]">
-                {account.username}
-                <br />
-                {account.password}
-              </span>
-            </button>
-          </li>
-        ))}
-      </ul>
+                  <span className="size-4 shrink-0 text-[var(--text)]">
+                    <DropdownMenu.ItemIndicator>
+                      <CheckIcon aria-hidden="true" className="size-4" />
+                    </DropdownMenu.ItemIndicator>
+                  </span>
+                </DropdownMenu.RadioItem>
+              ))}
+            </DropdownMenu.RadioGroup>
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
+      <p aria-live="polite" className="mt-2 px-1 text-sub leading-relaxed text-[var(--text-muted)]">
+        {current ? (
+          <>账号 <span className="font-mono">{current.username}</span> · 密码 <span className="font-mono">{current.password}</span></>
+        ) : (
+          "无需注册，选择身份即可自动填入账号密码"
+        )}
+      </p>
     </div>
   );
 }
