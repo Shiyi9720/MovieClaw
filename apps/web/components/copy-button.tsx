@@ -24,7 +24,8 @@ export async function copyText(text: string): Promise<void> {
   textarea.style.position = "fixed";
   textarea.style.left = "-9999px";
   textarea.style.opacity = "0";
-  document.body.appendChild(textarea);
+  // 原生模态 dialog 外的元素不可交互，兼容复制用的文本框必须放在当前弹窗内。
+  (document.activeElement?.closest("dialog[open]") ?? document.body).appendChild(textarea);
   textarea.select();
   textarea.setSelectionRange(0, text.length);
   let copied = false;

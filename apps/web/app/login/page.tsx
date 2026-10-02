@@ -3,9 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { Route } from "next";
-import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
-import { CheckIcon, ChevronDownIcon, LockIcon, UserIcon } from "@/components/icons";
+import { LockIcon, UserIcon, XIcon } from "@/components/icons";
 import { CopyButton } from "@/components/copy-button";
 import {
   WelcomeCard,
@@ -71,7 +70,7 @@ export default function LoginPage() {
   const [adding, setAdding] = useState(false);
   const [returning, setReturning] = useState(false);
   const [ready, setReady] = useState(false);
-  // 公开演示站（docs/design/demo-site.md）：身份菜单提供可一键填入的演示账号
+  // 公开演示站（docs/design/demo-site.md）：信息弹窗提供可一键填入的演示账号
   const [demo, setDemo] = useState<DemoSite | null>(null);
   useEffect(() => {
     setAdding(isAddingAccount());
@@ -182,18 +181,6 @@ function LoginCard({
       onClose={onClose}
     >
       <form onSubmit={submit} className="space-y-4">
-        {demo && demo.accounts.length > 0 && (
-          <DemoAccountPicker
-            accounts={demo.accounts}
-            selected={username.trim()}
-            disabled={busy}
-            onPick={(account) => {
-              setUsername(account.username);
-              setPassword(account.password);
-              setError(null);
-            }}
-          />
-        )}
         <WelcomeFields>
           <WelcomeField
             ref={usernameRef}
@@ -218,15 +205,29 @@ function LoginCard({
             enterKeyHint="go"
           />
         </WelcomeFields>
-        <label className="flex cursor-pointer items-center gap-2 px-1 text-sub text-[var(--text-muted)]">
-          <input
-            type="checkbox"
-            checked={remember}
-            onChange={(e) => setRemember(e.target.checked)}
-            className="size-3.5 accent-[var(--accent-strong)]"
-          />
-          30 天内记住我
-        </label>
+        <div className="flex flex-wrap items-center justify-between gap-x-2">
+          <label className="flex cursor-pointer items-center gap-2 px-1 text-sub text-[var(--text-muted)]">
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
+              className="size-3.5 accent-[var(--accent-strong)]"
+            />
+            30 天内记住我
+          </label>
+          {demo && demo.accounts.length > 0 && (
+            <DemoLoginInfo
+              accounts={demo.accounts}
+              selected={username.trim()}
+              disabled={busy}
+              onPick={(account) => {
+                setUsername(account.username);
+                setPassword(account.password);
+                setError(null);
+              }}
+            />
+          )}
+        </div>
         <WelcomeError message={error} />
         <WelcomeSubmit busy={busy} disabled={busy || !username.trim() || !password}>
           {busy ? "正在登录…" : adding ? "添加并切换" : "登录"}
@@ -237,12 +238,11 @@ function LoginCard({
 }
 
 /**
- * 演示身份选择：折叠菜单让小屏登录卡片保持紧凑，展开时说明各角色的可见范围。
- * 选择只填表单、不自动登录；App 登录信息常驻，公开密码不必等选身份后才显示。
- * 复用复制按钮的剪贴板兼容路径，照顾 iOS 和未开放 Clipboard API 的浏览器。
- * 复用 Radix 的单选菜单处理焦点、键盘与弹层避让，不额外实现一套下拉交互。
+ * 公开演示凭据集中在弹窗：登录卡片只保留入口，手机上不再被身份和复制信息撑高。
+ * 原生 dialog 的顶层显示、焦点约束与关闭后焦点恢复，避免玻璃卡片的布局和软键盘干扰。
+ * 在弹窗里切换身份仅用于查看和复制；明确点击「填入网页登录」才更新表单，不自动提交。
  */
-function DemoAccountPicker({
+function DemoLoginInfo({
   accounts,
   selected,
   disabled,
@@ -253,98 +253,109 @@ function DemoAccountPicker({
   disabled: boolean;
   onPick: (account: DemoAccount) => void;
 }) {
-  const current = accounts.find((account) => account.username === selected);
-  // 只提示 bootstrap 公开的凭据；未选身份时，仅在各账号密码一致时提前展示。
-  const publicPassword = current?.password ?? (
-    accounts.every((account) => account.password === accounts[0].password) ? accounts[0].password : null
-  );
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [infoUsername, setInfoUsername] = useState(accounts[0].username);
+  const current = accounts.find((account) => account.username === infoUsername) ?? accounts[0];
   const [serverAddress, setServerAddress] = useState("");
   useEffect(() => setServerAddress(window.location.origin), []);
+
+  const open = () => {
+    // 已选择的网页账号优先；尚未选择时，弹窗明确展示第一个公开身份及其对应凭据。
+    setInfoUsername(accounts.find((account) => account.username === selected)?.username ?? accounts[0].username);
+    dialogRef.current?.showModal();
+  };
+
   return (
-    <div>
-      <DropdownMenu.Root>
-        <DropdownMenu.Trigger asChild>
+    <>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={open}
+        aria-haspopup="dialog"
+        className="min-h-[44px] px-1 text-sub text-[var(--text-muted)] underline decoration-white/20 underline-offset-4 hover:text-[var(--text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-strong)] disabled:opacity-40"
+      >
+        演示账号 / App
+      </button>
+      <dialog
+        ref={dialogRef}
+        aria-label="App 登录信息"
+        aria-describedby="demo-login-info-description"
+        onClick={(event) => {
+          if (event.target === event.currentTarget) event.currentTarget.close();
+        }}
+        className="welcome-glass fixed inset-0 m-auto max-h-[calc(100dvh_-_2rem)] w-[calc(100%_-_2rem)] max-w-sm overflow-y-auto overscroll-contain rounded-3xl p-0 text-[var(--text)] backdrop:bg-black/60 backdrop:backdrop-blur-sm"
+      >
+        <div className="space-y-4 p-5">
+          <header className="flex items-start justify-between gap-3">
+            <div>
+              <h2 className="text-title font-semibold">App 登录信息</h2>
+              <p id="demo-login-info-description" className="mt-1 text-sub leading-relaxed text-[var(--text-muted)]">
+                无需注册，选择演示身份即可复制，或填入网页登录。
+              </p>
+            </div>
+            <button
+              type="button"
+              aria-label="关闭登录信息"
+              onClick={() => dialogRef.current?.close()}
+              className="grid size-11 shrink-0 place-items-center rounded-full hover:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent-strong)]"
+            >
+              <XIcon aria-hidden="true" className="size-4" />
+            </button>
+          </header>
+          <fieldset>
+            <legend className="mb-2 text-sub text-[var(--text-muted)]">演示身份</legend>
+            <div className="grid grid-cols-2 gap-2">
+              {accounts.map((account) => (
+                <button
+                  key={account.username}
+                  type="button"
+                  aria-pressed={current.username === account.username}
+                  onClick={() => setInfoUsername(account.username)}
+                  className="min-h-[44px] rounded-xl border border-white/10 px-2 text-sub transition-colors hover:bg-white/10 aria-pressed:border-white/30 aria-pressed:bg-white/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-strong)]"
+                >
+                  {account.label}
+                </button>
+              ))}
+            </div>
+            {current.description && (
+              <p className="mt-2 text-caption leading-relaxed text-[var(--text-muted)]">{current.description}</p>
+            )}
+          </fieldset>
+          <dl aria-live="polite" className="divide-y divide-white/[0.08] rounded-2xl border border-white/[0.08] bg-white/[0.04] px-3">
+            {[
+              { label: "账号", value: current.username },
+              { label: "密码", value: current.password },
+              { label: "服务器地址", value: serverAddress },
+            ].map(({ label, value }) => (
+              <div key={label} className="flex min-h-[56px] items-center gap-2 py-1.5">
+                <div className="min-w-0 flex-1">
+                  <dt className="text-caption text-[var(--text-muted)]">{label}</dt>
+                  <dd className="select-text break-words font-mono text-sub">{value}</dd>
+                </div>
+                {value && (
+                  <CopyButton
+                    key={value}
+                    text={value}
+                    label="复制"
+                    ariaLabel={`复制${label}`}
+                    className="min-h-[44px] shrink-0 px-2 text-caption text-[var(--text-muted)] hover:text-[var(--text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-strong)]"
+                  />
+                )}
+              </div>
+            ))}
+          </dl>
           <button
             type="button"
-            disabled={disabled}
-            aria-label="选择演示身份"
-            className="flex min-h-[50px] w-full items-center gap-3 rounded-2xl border border-white/[0.12] bg-white/[0.06] px-3.5 text-left transition-colors hover:bg-white/[0.10] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-strong)] disabled:opacity-40"
+            onClick={() => {
+              onPick(current);
+              dialogRef.current?.close();
+            }}
+            className="flex min-h-[44px] w-full items-center justify-center rounded-full bg-[var(--accent-strong)] text-body font-semibold text-black/85 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-strong)]"
           >
-            <UserIcon aria-hidden="true" className="size-[18px] shrink-0 text-[var(--text-muted)]" />
-            <span className="flex-1 text-body text-[var(--text)]">
-              {current?.label ?? "选择演示身份"}
-            </span>
-            {current && <span className="text-sub text-[var(--text-muted)]">切换</span>}
-            <ChevronDownIcon aria-hidden="true" className="size-4 text-[var(--text-muted)]" />
+            填入网页登录
           </button>
-        </DropdownMenu.Trigger>
-        <DropdownMenu.Portal>
-          <DropdownMenu.Content
-            align="start"
-            sideOffset={8}
-            collisionPadding={16}
-            className="menu-surface z-[100] max-h-[var(--radix-dropdown-menu-content-available-height)] w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-2xl p-1.5"
-          >
-            <DropdownMenu.RadioGroup
-              value={current?.username ?? ""}
-              onValueChange={(value) => {
-                const account = accounts.find((item) => item.username === value);
-                if (account) onPick(account);
-              }}
-            >
-              {accounts.map((account) => (
-                <DropdownMenu.RadioItem
-                  key={account.username}
-                  value={account.username}
-                  className="flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2.5 outline-none data-[highlighted]:bg-white/[0.08] data-[state=checked]:bg-white/[0.05]"
-                >
-                  <span className="min-w-0 flex-1">
-                    <span className="block text-body text-[var(--text)]">{account.label}</span>
-                    {account.description && (
-                      <span className="mt-0.5 line-clamp-2 text-sub leading-snug text-[var(--text-muted)]">
-                        {account.description}
-                      </span>
-                    )}
-                  </span>
-                  <span className="size-4 shrink-0 text-[var(--text)]">
-                    <DropdownMenu.ItemIndicator>
-                      <CheckIcon aria-hidden="true" className="size-4" />
-                    </DropdownMenu.ItemIndicator>
-                  </span>
-                </DropdownMenu.RadioItem>
-              ))}
-            </DropdownMenu.RadioGroup>
-          </DropdownMenu.Content>
-        </DropdownMenu.Portal>
-      </DropdownMenu.Root>
-      <section aria-label="iOS / App 登录信息" className="mt-3 rounded-2xl border border-white/[0.08] bg-white/[0.04] px-3">
-        <h3 className="pt-2.5 text-caption text-[var(--text-muted)]">iOS / App 登录信息</h3>
-        <dl aria-live="polite" className="divide-y divide-white/[0.06]">
-          {[
-            { label: "账号", value: current?.username },
-            { label: "密码", value: publicPassword },
-            { label: "服务器地址", value: serverAddress },
-          ].map(({ label, value }) => (
-            <div key={label} className="flex min-h-[44px] items-center gap-2 py-1">
-              <div className="min-w-0 flex-1">
-                <dt className="text-caption text-[var(--text-muted)]">{label}</dt>
-                <dd className="select-text break-all font-mono text-sub text-[var(--text)]">
-                  {value || (label === "账号" ? "选择上方演示身份" : "选择身份后显示")}
-                </dd>
-              </div>
-              {value && (
-                <CopyButton
-                  key={value}
-                  text={value}
-                  label="复制"
-                  ariaLabel={`复制${label}`}
-                  className="min-h-[44px] shrink-0 px-2 text-caption text-[var(--text-muted)] hover:text-[var(--text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-strong)]"
-                />
-              )}
-            </div>
-          ))}
-        </dl>
-      </section>
-    </div>
+        </div>
+      </dialog>
+    </>
   );
 }
