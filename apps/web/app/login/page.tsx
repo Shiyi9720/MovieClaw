@@ -6,6 +6,7 @@ import type { Route } from "next";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
 import { CheckIcon, ChevronDownIcon, LockIcon, UserIcon } from "@/components/icons";
+import { CopyButton } from "@/components/copy-button";
 import {
   WelcomeCard,
   WelcomeError,
@@ -237,7 +238,8 @@ function LoginCard({
 
 /**
  * 演示身份选择：折叠菜单让小屏登录卡片保持紧凑，展开时说明各角色的可见范围。
- * 选择只填表单、不自动登录；当前身份的公开凭据留在一行提示里，方便在 App 中照着输。
+ * 选择只填表单、不自动登录；App 登录信息常驻，公开密码不必等选身份后才显示。
+ * 复用复制按钮的剪贴板兼容路径，照顾 iOS 和未开放 Clipboard API 的浏览器。
  * 复用 Radix 的单选菜单处理焦点、键盘与弹层避让，不额外实现一套下拉交互。
  */
 function DemoAccountPicker({
@@ -252,6 +254,12 @@ function DemoAccountPicker({
   onPick: (account: DemoAccount) => void;
 }) {
   const current = accounts.find((account) => account.username === selected);
+  // 只提示 bootstrap 公开的凭据；未选身份时，仅在各账号密码一致时提前展示。
+  const publicPassword = current?.password ?? (
+    accounts.every((account) => account.password === accounts[0].password) ? accounts[0].password : null
+  );
+  const [serverAddress, setServerAddress] = useState("");
+  useEffect(() => setServerAddress(window.location.origin), []);
   return (
     <div>
       <DropdownMenu.Root>
@@ -309,13 +317,34 @@ function DemoAccountPicker({
           </DropdownMenu.Content>
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
-      <p aria-live="polite" className="mt-2 px-1 text-sub leading-relaxed text-[var(--text-muted)]">
-        {current ? (
-          <>账号 <span className="font-mono">{current.username}</span> · 密码 <span className="font-mono">{current.password}</span></>
-        ) : (
-          "无需注册，选择身份即可自动填入账号密码"
-        )}
-      </p>
+      <section aria-label="iOS / App 登录信息" className="mt-3 rounded-2xl border border-white/[0.08] bg-white/[0.04] px-3">
+        <h3 className="pt-2.5 text-caption text-[var(--text-muted)]">iOS / App 登录信息</h3>
+        <dl aria-live="polite" className="divide-y divide-white/[0.06]">
+          {[
+            { label: "账号", value: current?.username },
+            { label: "密码", value: publicPassword },
+            { label: "服务器地址", value: serverAddress },
+          ].map(({ label, value }) => (
+            <div key={label} className="flex min-h-[44px] items-center gap-2 py-1">
+              <div className="min-w-0 flex-1">
+                <dt className="text-caption text-[var(--text-muted)]">{label}</dt>
+                <dd className="select-text break-all font-mono text-sub text-[var(--text)]">
+                  {value || (label === "账号" ? "选择上方演示身份" : "选择身份后显示")}
+                </dd>
+              </div>
+              {value && (
+                <CopyButton
+                  key={value}
+                  text={value}
+                  label="复制"
+                  ariaLabel={`复制${label}`}
+                  className="min-h-[44px] shrink-0 px-2 text-caption text-[var(--text-muted)] hover:text-[var(--text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent-strong)]"
+                />
+              )}
+            </div>
+          ))}
+        </dl>
+      </section>
     </div>
   );
 }

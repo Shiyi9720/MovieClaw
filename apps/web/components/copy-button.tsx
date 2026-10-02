@@ -49,11 +49,14 @@ export async function copyText(text: string): Promise<void> {
 export function CopyButton({
   text,
   label,
+  ariaLabel,
   className = "",
 }: {
   text: string;
   /** 文字标签（如「复制」）。不传则纯图标，无障碍名由 aria-label 承担 */
   label?: string;
+  /** 紧凑按钮可只显示「复制」，用独立读屏名说明复制的是哪个字段 */
+  ariaLabel?: string;
   className?: string;
 }) {
   const [copied, setCopied] = useState(false);
@@ -66,7 +69,7 @@ export function CopyButton({
   return (
     <button
       type="button"
-      aria-label={label ? undefined : copied ? "已复制" : "复制"}
+      aria-label={ariaLabel ? (copied ? "已复制" : ariaLabel) : label ? undefined : copied ? "已复制" : "复制"}
       onClick={(event) => {
         event.stopPropagation();
         void copyText(text)
